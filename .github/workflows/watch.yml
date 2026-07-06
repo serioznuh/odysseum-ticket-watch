@@ -1,0 +1,77 @@
+# Ticket watcher: one daily full check + a lightweight reminder pass every
+# 15 minutes (state-only, no scraping) so the 24h/2h/15min pre-sale reminders
+# can actually fire on time.
+#
+# NOTE on private repos: the 15-min pass bills ~1 GitHub Actions minute per
+# run (~2900 min/month), above the 2000-min free tier. Either make the repo
+# public (free), or relax to "*/30" / "0 * * * *" — reminders then arrive up
+# to 30/60 min later than the configured offsets.
+name: ticket-watch
+
+on:
+  schedule:
+    - cron: "23 7 * * *"    # daily full check — 09:23 Paris in summer, 08:23 in winter
+    - cron: "*/15 * * * *"  # reminder pass (exits fast when nothing is due)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check, remind, or test (test = send a Telegram test message)"
+        default: "check"
+      dry_run:
+        description: "log alerts instead of sending"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write  # to persist state/state.json back to the repo
+
+concurrency:
+  group: ticket-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Decide mode
+        id: mode
+        run: |
+          MODE=remind
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODE="${{ inputs.mode }}"
+          elif [ "${{ github.event.schedule }}" = "23 7 * * *" ]; then
+            MODE=check
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+
+      - name: Run watcher (${{ steps.mode.outputs.mode }})
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ steps.mode.outputs.mode }}" = "test" ]; then
+            python -m watcher --test-telegram
+          else
+            python -m watcher --mode "${{ steps.mode.outputs.mode }}" ${{ inputs.dry_run == true && '--dry-run' || '' }}
+          fi
+
+      - name: Persist state
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          if [ -n "$(git status --porcelain state/state.json)" ]; then
+            git config user.name "ticket-watch-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add state/state.json
+            git commit -m "state: $(date -u +%FT%TZ) [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push
+          fi

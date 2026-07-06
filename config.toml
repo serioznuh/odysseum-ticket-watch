@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# odysseum-ticket-watch configuration
+# Target: Dune : Troisième partie @ Pathé Odysseum (Montpellier), IMAX 70 mm
+# ---------------------------------------------------------------------------
+
+[film]
+# Slug of the film on pathe.fr (from the film page URL).
+primary_slug = "dune-troisieme-partie-50828"
+title = "Dune : Troisième partie"
+page_url = "https://www.pathe.fr/films/dune-troisieme-partie-50828"
+# Used to ignore the release date when it shows up in news articles.
+release_date = "2026-12-16"
+# Regexes (single-quoted = TOML literal strings) matched against the
+# normalised (lowercase, accent-stripped) "slug title" of EVERY show in the
+# Pathé catalogue. They catch dedicated event listings such as
+# "Dune : Troisième partie : Projection IMAX 70mm" — Pathé created exactly
+# such a separate listing for L'Odyssée (l-odyssee-projection-imax-70mm-54413).
+match_patterns = [
+    'dune.{0,16}troisieme',
+    'dune.{0,16}part(ie)?[ .:-]*(three|iii|3)\b',
+    'dune[ .:-]{0,4}3\b',
+]
+
+[cinema]
+# Slug from /api/cinemas (verified): Pathé Odysseum, tags ["imax", "4dx"].
+slug = "cinema-pathe-odysseum"
+name = "Pathé Odysseum"
+city = "Montpellier"
+page_url = "https://www.pathe.fr/cinemas/cinema-pathe-odysseum"
+
+[reminders]
+# Minutes before the sale opening at which to remind (plus an automatic
+# "should be open NOW" ping at opening time).
+offsets_minutes = [1440, 120, 15]
+
+[news]
+# Low/medium-confidence external leads (press often knows before ticketing).
+enabled = true
+max_age_days = 10
+max_alerts_per_run = 3
+google_news_queries = [
+    # French press: Dune + sale/format keywords
+    "https://news.google.com/rss/search?q=%22dune%22+(r%C3%A9servations+OR+billets+OR+%22mise+en+vente%22+OR+pr%C3%A9ventes+OR+%2270mm%22)&hl=fr&gl=FR&ceid=FR:fr",
+    # English press: Dune Part Three + tickets/IMAX keywords
+    "https://news.google.com/rss/search?q=%22dune%3A+part+three%22+(tickets+OR+%22on+sale%22+OR+%2270mm%22+OR+imax)&hl=en-US&gl=US&ceid=US:en",
+]
+# Optional additional pages scanned with the same phrase detector
+# (plain-HTTP fetch; note that some sites, e.g. imax.com, block bots).
+extra_pages = []
+
+[alerts]
+# Send a "watcher alive" summary if nothing was alerted for N days (0 = off).
+heartbeat_days = 7
+# Alert after N consecutive failed Pathé checks (watcher is blind).
+failure_streak_threshold = 3
+
+[general]
+state_file = "state/state.json"
