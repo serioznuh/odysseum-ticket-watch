@@ -1,17 +1,20 @@
-# Ticket watcher: one daily full check + a lightweight reminder pass every
-# 15 minutes (state-only, no scraping) so the 24h/2h/15min pre-sale reminders
-# can actually fire on time.
+# Cloud half of the watcher: reminder passes + supervision.
+#
+# The daily Pathé check runs on a home machine via scripts/local-check.sh
+# (launchd), NOT here: Akamai blocks www.pathe.fr/api from GitHub's
+# datacenter IPs (verified 2026-07-06 — 403 on every request that succeeds
+# from a residential IP). The local check pushes state/state.json back to
+# this repo; this workflow reads it to fire the 24h/2h/15min pre-sale
+# reminders, and alerts if the local check stops running (stale state).
 #
 # NOTE on private repos: the 15-min pass bills ~1 GitHub Actions minute per
-# run (~2900 min/month), above the 2000-min free tier. Either make the repo
-# public (free), or relax to "*/30" / "0 * * * *" — reminders then arrive up
-# to 30/60 min later than the configured offsets.
+# run (~2900 min/month), above the 2000-min free tier. Keep the repo public
+# (free), or relax to "*/30".
 name: ticket-watch
 
 on:
   schedule:
-    - cron: "23 7 * * *"    # daily full check — 09:23 Paris in summer, 08:23 in winter
-    - cron: "*/15 * * * *"  # reminder pass (exits fast when nothing is due)
+    - cron: "*/15 * * * *"  # reminder + supervision pass (exits fast when nothing is due)
   workflow_dispatch:
     inputs:
       mode:
@@ -48,8 +51,6 @@ jobs:
           MODE=remind
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             MODE="${{ inputs.mode }}"
-          elif [ "${{ github.event.schedule }}" = "23 7 * * *" ]; then
-            MODE=check
           fi
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
 

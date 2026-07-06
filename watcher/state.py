@@ -128,6 +128,17 @@ def due_reminders(state: dict, offsets_minutes: list[int], now: datetime) -> lis
     return []
 
 
+def is_check_stale(state: dict, hours: int, now: datetime) -> bool:
+    """True when the last successful Pathé check is older than `hours`.
+
+    Never stale before the first successful check (setup phase).
+    """
+    if hours <= 0:
+        return False
+    last = detect.parse_iso(state.get("last_check_ok"))
+    return last is not None and (now - detect.as_aware(last)) > timedelta(hours=hours)
+
+
 def mark_reminder(state: dict, target_iso: str, offset: int | str, offsets_minutes: list[int]) -> None:
     """Mark `offset` sent; also skip any larger (earlier) offsets already in the past."""
     sent = set(state.setdefault("reminders_sent", {}).get(target_iso, []))

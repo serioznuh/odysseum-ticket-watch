@@ -188,6 +188,27 @@ def run(argv: list[str] | None = None) -> int:
         if notify.send_telegram(cfg, text, dry_run=args.dry_run):
             state_mod.mark_reminder(st, r["target"], r["offset"], cfg.reminder_offsets_minutes)
 
+    # Supervision (both modes): the daily Pathé check runs on a different
+    # machine than the cloud reminder pass — alert if it stopped reporting.
+    if state_mod.is_check_stale(st, cfg.stale_check_hours, now):
+        key = f"stale:{st.get('last_check_ok')}"
+        if not state_mod.already_sent(st, key):
+            stale = Finding(
+                kind="WATCHER_ERROR",
+                key=key,
+                confidence="high",
+                title="No successful Pathé check recently",
+                lines=[
+                    f"Last successful check: {detect.fmt_dt(detect.parse_iso(st.get('last_check_ok')))}.",
+                    f"Threshold: {cfg.stale_check_hours}h — the daily check job seems to have stopped"
+                    " (machine off/asleep for days, launchd job unloaded, or git push failing).",
+                    "Cloud reminders still run, but new Pathé signals are NOT being watched.",
+                ],
+                url=cfg.film_page_url,
+            )
+            if notify.send_telegram(cfg, notify.render_finding(stale), dry_run=args.dry_run):
+                state_mod.mark_sent(st, key, now)
+
     if args.dry_run:
         log.info("dry-run: state NOT saved (%s)", state_path)
     else:

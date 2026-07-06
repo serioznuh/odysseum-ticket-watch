@@ -142,6 +142,16 @@ def test_open_ping_after_target_once_with_grace():
     assert due_reminders(st2, OFFSETS, NOW) == []
 
 
+def test_is_check_stale():
+    st = fresh_state()
+    assert state_mod.is_check_stale(st, 72, NOW) is False  # never checked -> setup phase
+    st["last_check_ok"] = iso_in(timedelta(hours=-10))
+    assert state_mod.is_check_stale(st, 72, NOW) is False
+    st["last_check_ok"] = iso_in(timedelta(hours=-80))
+    assert state_mod.is_check_stale(st, 72, NOW) is True
+    assert state_mod.is_check_stale(st, 0, NOW) is False  # disabled
+
+
 def test_reminders_stop_when_tickets_available():
     st = fresh_state()
     st["sale_target"] = iso_in(timedelta(minutes=10))

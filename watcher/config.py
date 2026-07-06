@@ -36,6 +36,7 @@ class Config:
     # [alerts]
     heartbeat_days: int
     failure_streak_threshold: int
+    stale_check_hours: int
     # [general]
     state_file: str
     # environment
@@ -82,6 +83,7 @@ def load_config(path: str | Path) -> Config:
         extra_pages=list(news.get("extra_pages", [])),
         heartbeat_days=int(alerts.get("heartbeat_days", 7)),
         failure_streak_threshold=int(alerts.get("failure_streak_threshold", 3)),
+        stale_check_hours=int(alerts.get("stale_check_hours", 72)),
         state_file=general.get("state_file", "state/state.json"),
         telegram_token=os.environ.get("TELEGRAM_BOT_TOKEN") or None,
         telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID") or None,

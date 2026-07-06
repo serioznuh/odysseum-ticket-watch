@@ -85,42 +85,49 @@ python -m watcher --mode remind            # reminders only (no network except T
 `--dry-run` never sends and never writes state, so a later real run will send
 everything the dry run showed. Logs go to stderr; add `--verbose` for debug.
 
-### 4. Deploy with GitHub Actions
+### 4. Deploy (hybrid: local check + cloud reminders)
+
+**Why hybrid:** Akamai blocks `www.pathe.fr/api` from GitHub's datacenter IPs
+(verified: 403 from an Actions runner, 200 from a residential IP with the
+same code). So the parts are split along that line:
+
+| Where | What | Why |
+|---|---|---|
+| **Your Mac** (launchd, daily 09:30) | `scripts/local-check.sh` — Pathé + news check, pushes `state/state.json` to GitHub | needs a residential IP |
+| **GitHub Actions** (every 15 min) | reminder pass reading the shared state, plus supervision | needs 24/7 uptime, no Pathé access required |
+
+Cloud setup:
 
 ```bash
-git init && git add . && git commit -m "ticket watcher"
 gh repo create odysseum-ticket-watch --public --source . --push
 gh secret set TELEGRAM_BOT_TOKEN
 gh secret set TELEGRAM_CHAT_ID
 ```
 
-The workflow ([.github/workflows/watch.yml](.github/workflows/watch.yml)) runs:
+Local daily check (launchd — unlike cron it runs the job on the next wake if
+the Mac was asleep at 09:30; only a powered-off Mac skips a day):
 
-- a **daily full check** at 07:23 UTC (09:23 Paris in summer), and
-- a **reminder pass every 15 min** — state-only, so the 24h/2h/15min ladder can
-  fire between daily checks. It sends nothing unless a reminder is due.
-
-State is persisted by committing `state/state.json` back to the repo, which
-also keeps the scheduled workflow from being auto-disabled after 60 days of
-repo inactivity. Trigger a manual run (Actions → ticket-watch → Run workflow)
-to verify the setup; use `dry_run` for a safe first run.
-
-> **Private repo?** The 15-min pass costs ~2900 free-tier minutes/month.
-> Make the repo public (state contains no secrets), or relax the cron to
-> `*/30` or hourly — see the comment in the workflow.
-
-> **Caution:** GitHub's cron is best-effort (runs can lag several minutes at
-> busy times), and datacenter IPs are more likely to be challenged by Akamai
-> than home IPs. If checks start failing you'll get a ⚠️ Telegram alert after
-> 3 consecutive failures — fall back to running locally (see below).
-
-### Alternative: run locally via cron (no GitHub needed)
-
-```cron
-# crontab -e   (Mac must be awake)
-23 9 * * *    cd ~/Projects/odysseum-ticket-watch && .venv/bin/python -m watcher --mode check  >> watch.log 2>&1
-*/15 * * * *  cd ~/Projects/odysseum-ticket-watch && .venv/bin/python -m watcher --mode remind >> watch.log 2>&1
+```bash
+mkdir -p logs ~/Library/LaunchAgents
+cp scripts/com.odysseum.ticket-watch.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.odysseum.ticket-watch.plist
+launchctl kickstart gui/$(id -u)/com.odysseum.ticket-watch   # run once now to test
 ```
+
+Safety nets, so the system never dies silently:
+
+- if the **local check** stops pushing for >72 h (`stale_check_hours`), the
+  cloud pass sends a ⚠️ alert;
+- if Pathé starts failing from the Mac too, a ⚠️ alert fires after 3
+  consecutive failures;
+- a weekly 💤 heartbeat confirms the whole loop is alive.
+
+State is shared by committing `state/state.json` (no secrets in it), which
+also keeps the scheduled workflow from being auto-disabled after 60 days of
+repo inactivity.
+
+> **Private repo?** The 15-min cloud pass costs ~2900 free-tier minutes/month.
+> Keep the repo public (free), or relax the cron to `*/30`.
 
 ## Configuration
 

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Daily Pathé check at 09:30. Unlike cron, launchd runs the job on the
+     next wake if the Mac was asleep at 09:30 (skipped only if powered off).
+     Install:
+       cp scripts/com.odysseum.ticket-watch.plist ~/Library/LaunchAgents/
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.odysseum.ticket-watch.plist
+     Adjust the two absolute paths if the repo lives elsewhere. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.odysseum.ticket-watch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/serhii.afanasiev/Documents/Projects/odysseum-ticket-watch/scripts/local-check.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/serhii.afanasiev/Documents/Projects/odysseum-ticket-watch/logs/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/serhii.afanasiev/Documents/Projects/odysseum-ticket-watch/logs/launchd.log</string>
+</dict>
+</plist>

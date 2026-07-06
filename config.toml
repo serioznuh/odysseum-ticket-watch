@@ -53,6 +53,9 @@ extra_pages = []
 heartbeat_days = 7
 # Alert after N consecutive failed Pathé checks (watcher is blind).
 failure_streak_threshold = 3
+# Alert (from the cloud reminder pass) if the last successful Pathé check is
+# older than this — catches the local daily check dying silently (0 = off).
+stale_check_hours = 72
 
 [general]
 state_file = "state/state.json"
