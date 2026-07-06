@@ -2,10 +2,17 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Daily Pathé check at 09:30. Unlike cron, launchd runs the job on the
      next wake if the Mac was asleep at 09:30 (skipped only if powered off).
-     Install:
+
+     IMPORTANT: the job must run from a clone OUTSIDE ~/Documents (and other
+     TCC-protected folders like Desktop/Downloads) — macOS blocks launchd
+     agents there with "Operation not permitted". Setup:
+       git clone https://github.com/<you>/odysseum-ticket-watch.git ~/.ticket-watch
+       cp .env ~/.ticket-watch/ && cd ~/.ticket-watch
+       python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+       mkdir -p logs ~/Library/LaunchAgents
        cp scripts/com.odysseum.ticket-watch.plist ~/Library/LaunchAgents/
        launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.odysseum.ticket-watch.plist
-     Adjust the two absolute paths if the repo lives elsewhere. -->
+     Adjust the absolute paths below if your username/location differ. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -13,7 +20,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/serhii.afanasiev/Documents/Projects/odysseum-ticket-watch/scripts/local-check.sh</string>
+        <string>/Users/serhii.afanasiev/.ticket-watch/scripts/local-check.sh</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
@@ -23,8 +30,8 @@
         <integer>30</integer>
     </dict>
     <key>StandardOutPath</key>
-    <string>/Users/serhii.afanasiev/Documents/Projects/odysseum-ticket-watch/logs/launchd.log</string>
+    <string>/Users/serhii.afanasiev/.ticket-watch/logs/launchd.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/serhii.afanasiev/Documents/Projects/odysseum-ticket-watch/logs/launchd.log</string>
+    <string>/Users/serhii.afanasiev/.ticket-watch/logs/launchd.log</string>
 </dict>
 </plist>
