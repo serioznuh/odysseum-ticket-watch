@@ -40,7 +40,7 @@ enabled = true
 # "medium" = only items that also carry an explicit future date next to sale
 #            wording — quieter, but you may miss "tickets just went on sale"
 #            headlines that lack a date.
-min_confidence = "low"
+min_confidence = "medium"
 max_age_days = 10
 max_alerts_per_run = 3
 google_news_queries = [
