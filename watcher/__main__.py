@@ -140,12 +140,12 @@ def run(argv: list[str] | None = None) -> int:
                 st["failure_streak"] >= cfg.failure_streak_threshold
                 and not st.get("error_alerted")
             ):
+                err = build_error_finding(cfg, st["failure_streak"], str(e), now)
                 if notify.send_telegram(
                     cfg,
-                    notify.render_finding(
-                        build_error_finding(cfg, st["failure_streak"], str(e), now)
-                    ),
+                    notify.render_finding(err),
                     dry_run=args.dry_run,
+                    silent=notify.is_silent(cfg, err.kind),
                 ):
                     st["error_alerted"] = True
                     sent_any = True
@@ -170,7 +170,12 @@ def run(argv: list[str] | None = None) -> int:
                 log.debug("suppressed duplicate alert %s", f.key)
                 continue
             log.info("alert [%s] %s (key=%s)", f.kind, f.title, f.key)
-            if notify.send_telegram(cfg, notify.render_finding(f), dry_run=args.dry_run):
+            if notify.send_telegram(
+                cfg,
+                notify.render_finding(f),
+                dry_run=args.dry_run,
+                silent=notify.is_silent(cfg, f.kind),
+            ):
                 state_mod.mark_sent(st, f.key, now)
                 sent_any = True
 
@@ -178,7 +183,12 @@ def run(argv: list[str] | None = None) -> int:
             state_mod.update_from_snapshot(st, snap, cfg, now)
             if not sent_any and heartbeat_due(st, now, cfg.heartbeat_days):
                 hb = build_heartbeat(cfg, snap, st, now)
-                if notify.send_telegram(cfg, notify.render_finding(hb), dry_run=args.dry_run):
+                if notify.send_telegram(
+                    cfg,
+                    notify.render_finding(hb),
+                    dry_run=args.dry_run,
+                    silent=notify.is_silent(cfg, hb.kind),
+                ):
                     st["last_heartbeat"] = now.isoformat()
 
     # Reminders run in both modes.
@@ -206,7 +216,12 @@ def run(argv: list[str] | None = None) -> int:
                 ],
                 url=cfg.film_page_url,
             )
-            if notify.send_telegram(cfg, notify.render_finding(stale), dry_run=args.dry_run):
+            if notify.send_telegram(
+                cfg,
+                notify.render_finding(stale),
+                dry_run=args.dry_run,
+                silent=notify.is_silent(cfg, stale.kind),
+            ):
                 state_mod.mark_sent(st, key, now)
 
     if args.dry_run:

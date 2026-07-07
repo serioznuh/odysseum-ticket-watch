@@ -61,6 +61,9 @@ failure_streak_threshold = 3
 # Alert (from the cloud reminder pass) if the last successful Pathé check is
 # older than this — catches the local daily check dying silently (0 = off).
 stale_check_hours = 72
+# Alert kinds delivered WITHOUT sound/vibration. Everything else buzzes;
+# reminders and the "open now" ping always buzz.
+silent_kinds = ["HEARTBEAT", "NEWS_LEAD", "RECOVERED"]
 
 [general]
 state_file = "state/state.json"

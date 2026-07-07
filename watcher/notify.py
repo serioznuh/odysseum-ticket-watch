@@ -28,6 +28,15 @@ ICONS = {
 
 OFFSET_LABELS = {1440: "24 hours", 120: "2 hours", 15: "15 minutes"}
 
+# Kinds delivered without sound/vibration by default; the phone buzzes for
+# everything else (sale dates, tickets, reminders, failures). Reminders and
+# the "open now" ping are always loud. Override via [alerts] silent_kinds.
+DEFAULT_SILENT_KINDS = ["HEARTBEAT", "NEWS_LEAD", "RECOVERED"]
+
+
+def is_silent(cfg: Any, kind: str) -> bool:
+    return kind in getattr(cfg, "silent_kinds", DEFAULT_SILENT_KINDS)
+
 
 def render_finding(f: Finding) -> str:
     icon = ICONS.get(f.kind, "ℹ️")
@@ -62,10 +71,16 @@ def render_reminder(offset: int | str, target_iso: str, cfg: Any) -> str:
     )
 
 
-def send_telegram(cfg: Any, text: str, *, dry_run: bool) -> bool:
+def send_telegram(cfg: Any, text: str, *, dry_run: bool, silent: bool = False) -> bool:
     """Send one message. Returns True on success (always True in dry-run)."""
     if dry_run:
-        log.info("[dry-run] would send Telegram message:\n%s\n%s\n%s", "-" * 60, text, "-" * 60)
+        log.info(
+            "[dry-run] would send Telegram message%s:\n%s\n%s\n%s",
+            " (silent)" if silent else "",
+            "-" * 60,
+            text,
+            "-" * 60,
+        )
         return True
     if not (cfg.telegram_token and cfg.telegram_chat_id):
         log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — cannot send")
@@ -77,6 +92,7 @@ def send_telegram(cfg: Any, text: str, *, dry_run: bool) -> bool:
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
+        "disable_notification": silent,
     }
     for attempt in range(2):
         try:

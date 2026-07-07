@@ -17,7 +17,9 @@ and it can watch any film/cinema on pathe.fr by editing [config.toml](config.tom
 
 Every alert carries the source URL, detected format (IMAX 70 mm / IMAX /
 other), cinema and a confidence level. Each distinct finding is sent **once**,
-deduplicated forever via `state/state.json`.
+deduplicated forever via `state/state.json`. News leads, heartbeats and
+recovery notes arrive **silently**; sale dates, tickets, reminders and
+failures buzz (tune via `alerts.silent_kinds`).
 
 ## How it works
 
@@ -122,6 +124,7 @@ Mac skips a day. Both halves commit `state/state.json`, so run
 | `alerts.heartbeat_days` | `7` | 💤 "alive" summary when nothing was alerted for N days. `0` = off. |
 | `alerts.failure_streak_threshold` | `3` | ⚠️ after N consecutive failed Pathé checks. |
 | `alerts.stale_check_hours` | `72` | Cloud pass ⚠️ when the last successful check is older than this (local job died). `0` = off. |
+| `alerts.silent_kinds` | `["HEARTBEAT", "NEWS_LEAD", "RECOVERED"]` | Alert kinds delivered silently (no sound/vibration). Everything else buzzes; reminders and the 🟢 "open now" ping always buzz. |
 | `general.state_file` | `state/state.json` | Dedup/reminder state location. |
 
 Secrets are env-only (never in config.toml): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
