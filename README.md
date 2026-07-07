@@ -33,7 +33,11 @@ requires a film match too.
 - 📍 `CINEMA_LISTED` — film on the Odysseum programme, not bookable yet
 - 🚨 `TICKETS_AVAILABLE` — bookable sessions exist at Odysseum (fallback if no advance date was ever published; re-alerts when a *new format* appears, e.g. IMAX 70 mm sessions added after standard ones)
 - ⏰ reminders — 24 h / 2 h / 15 min before the sale opening, plus 🟢 at opening time
-- 📰 `NEWS_LEAD` — external press match (no reminders are scheduled from news alone)
+- 📰 `NEWS_LEAD` — external press match; requires sale wording, or format
+  keywords together with a venue mention (Pathé/cinema/city/France), so bare
+  "IMAX 70mm trailer" SEO spam is ignored. Quieter still: set
+  `news.min_confidence = "medium"` (date-carrying leads only) or
+  `news.enabled = false`. No reminders are scheduled from news alone.
 - ⚠️/✅ watcher error / recovery, 💤 weekly heartbeat ("still alive, nothing new")
 
 Every alert includes: source URL, detected format (IMAX 70 mm / IMAX / other),

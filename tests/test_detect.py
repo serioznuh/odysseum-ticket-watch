@@ -32,6 +32,7 @@ class Cfg:
     cinema_name = "Pathé Odysseum"
     cinema_city = "Montpellier"
     cinema_page_url = "https://www.pathe.fr/cinemas/cinema-pathe-odysseum"
+    news_min_confidence = "low"
     news_max_age_days = 10
     news_max_alerts_per_run = 3
 
@@ -255,10 +256,36 @@ def test_news_lead_with_future_date_is_medium():
 
 
 def test_news_release_date_only_stays_low():
-    items = [news_item("Dune : Troisième partie en IMAX 70 mm au cinéma le 16 décembre 2026")]
+    items = [news_item("Dune : Troisième partie en IMAX 70 mm au Pathé Odysseum le 16 décembre 2026")]
     findings = detect.analyze_news(items, Cfg, fresh_state(), NOW)
     assert len(findings) == 1
     assert findings[0].confidence == "low"
+
+
+def test_news_format_only_trailer_spam_is_dropped():
+    # Real-world false positive: SEO spam trailer pages match the film and
+    # format keywords but say nothing about sales and mention no venue.
+    items = [news_item("DUNE: PART THREE | Official IMAX 70MM Trailer (2026) 4K David Attenborough Wife")]
+    assert detect.analyze_news(items, Cfg, fresh_state(), NOW) == []
+
+
+def test_news_format_with_venue_is_kept():
+    items = [news_item("Le Pathé Odysseum projettera Dune 3 en IMAX 70mm")]
+    findings = detect.analyze_news(items, Cfg, fresh_state(), NOW)
+    assert len(findings) == 1
+    assert findings[0].confidence == "low"
+
+
+def test_news_min_confidence_medium():
+    class MediumCfg(Cfg):
+        news_min_confidence = "medium"
+
+    low_item = news_item("Le Pathé Odysseum projettera Dune 3 en IMAX 70mm", url="https://example.com/lo")
+    medium_item = news_item(
+        "Dune 3 : réservations ouvertes le 5 novembre", url="https://example.com/med"
+    )
+    findings = detect.analyze_news([low_item, medium_item], MediumCfg, fresh_state(), NOW)
+    assert [f.confidence for f in findings] == ["medium"]
 
 
 def test_news_requires_sale_phrase():

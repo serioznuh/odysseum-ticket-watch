@@ -278,7 +278,10 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
 
 # --------------------------------------------------------------------------- phrases & dates (news layer)
 
-STRONG_PHRASES = [
+# Phrases that talk about the ticket sale itself. Bare ticket nouns are
+# included: in film news they are reliably sale-related, and SEO trailer spam
+# never uses them (it says "trailer", "4K", "IMAX 70mm" — format words only).
+SALE_PHRASES = [
     "reservez vos places",
     "reservations ouvertes",
     "les reservations sont ouvertes",
@@ -290,28 +293,39 @@ STRONG_PHRASES = [
     "billetterie ouverte",
     "prevente",
     "preventes",
+    "reservation",
+    "reservations",
+    "billet",
+    "billets",
+    "billetterie",
     "tickets available",
     "tickets on sale",
     "on sale",
     "advance tickets",
     "booking open",
     "book tickets",
-    "imax 70mm",
-    "imax 70 mm",
-    "70mm",
-    "70 mm",
-    "1.43",
+    "ticket",
+    "tickets",
 ]
+
+# Format keywords are relevant but far too generic alone — every trailer
+# re-upload says "IMAX 70mm". For news they only count next to a venue word.
+FORMAT_PHRASES = ["imax 70mm", "imax 70 mm", "70mm", "70 mm", "1.43"]
 
 # Weak phrases only count next to a sale-context word, so a release-date line
 # like "au cinéma à partir du 16 décembre 2026" is NOT a signal.
 WEAK_PHRASES = ["a partir du", "des le "]
-CONTEXT_WORDS = ["reservation", "billet", "vente", "ticket", "sale", "booking", "prevente", "imax"]
+CONTEXT_WORDS = ["reservation", "billet", "vente", "ticket", "sale", "booking", "prevente"]
 
 
-def phrase_hits(text: str) -> list[str]:
+def _match_phrases(t: str, phrases: list[str]) -> set[str]:
+    return {p for p in phrases if re.search(rf"\b{re.escape(p)}\b", t)}
+
+
+def sale_phrase_hits(text: str) -> list[str]:
+    """Sale wording, incl. weak date-intro phrases near a sale-context word."""
     t = norm(text)
-    hits = {p for p in STRONG_PHRASES if re.search(rf"\b{re.escape(p)}\b", t)}
+    hits = _match_phrases(t, SALE_PHRASES)
     for w in WEAK_PHRASES:
         for m in re.finditer(re.escape(w), t):
             window = t[max(0, m.start() - 60): m.end() + 60]
@@ -319,6 +333,15 @@ def phrase_hits(text: str) -> list[str]:
                 hits.add(w.strip())
                 break
     return sorted(hits)
+
+
+def format_phrase_hits(text: str) -> list[str]:
+    return sorted(_match_phrases(norm(text), FORMAT_PHRASES))
+
+
+def phrase_hits(text: str) -> list[str]:
+    """All sale + format phrase hits (for display and page scanning)."""
+    return sorted(set(sale_phrase_hits(text)) | set(format_phrase_hits(text)))
 
 
 MONTHS = {
@@ -394,7 +417,9 @@ def extract_dates(text: str, today: date) -> list[date]:
 def analyze_news(items: list[dict], cfg: Any, state: dict, now: datetime) -> list[Finding]:
     """Classify news/page items into low/medium-confidence leads.
 
-    An item must match a film pattern AND at least one sale/format phrase.
+    An item must match a film pattern AND carry sale wording; format keywords
+    alone ("IMAX 70mm" — every trailer re-upload has them) only count when
+    the item also mentions the venue/market (Pathé / cinema / city / France).
     Dates equal to the film's release date are not treated as sale dates.
     """
     findings: list[Finding] = []
@@ -403,6 +428,11 @@ def analyze_news(items: list[dict], cfg: Any, state: dict, now: datetime) -> lis
         release = date.fromisoformat(cfg.release_date) if cfg.release_date else None
     except ValueError:
         release = None
+    venue_words = {"pathe", "france"}
+    venue_words.update(norm(cfg.cinema_name).split())
+    venue_words.update(norm(cfg.cinema_city).split())
+    venue_words.discard("")
+    only_medium = getattr(cfg, "news_min_confidence", "low") == "medium"
 
     for item in items:
         url = (item.get("url") or "").strip()
@@ -412,9 +442,15 @@ def analyze_news(items: list[dict], cfg: Any, state: dict, now: datetime) -> lis
         hay = norm(text)
         if not any(re.search(p, hay) for p in cfg.match_patterns):
             continue
-        hits = phrase_hits(text)
-        if not hits:
+        sale_hits = sale_phrase_hits(text)
+        fmt_hits = format_phrase_hits(text)
+        if not sale_hits and not fmt_hits:
             continue
+        if not sale_hits and not any(
+            re.search(rf"\b{re.escape(v)}\b", hay) for v in venue_words
+        ):
+            continue  # format-keyword-only match without venue context = noise
+        hits = sorted(set(sale_hits) | set(fmt_hits))
         dates = extract_dates(text, now.date())
         sale_dates = [d for d in dates if d != release and d >= now.date()]
 
@@ -432,7 +468,9 @@ def analyze_news(items: list[dict], cfg: Any, state: dict, now: datetime) -> lis
             if (now - pub).days > cfg.news_max_age_days:
                 continue
 
-        confidence = "medium" if sale_dates else "low"
+        confidence = "medium" if (sale_dates and sale_hits) else "low"
+        if only_medium and confidence == "low":
+            continue
         lines = [
             f"Headline: {(item.get('title') or '').strip()}",
             f"Source: {item.get('source') or 'web'}"

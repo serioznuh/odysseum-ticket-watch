@@ -36,6 +36,11 @@ offsets_minutes = [1440, 120, 15]
 [news]
 # Low/medium-confidence external leads (press often knows before ticketing).
 enabled = true
+# "low"  = sale wording, or format keywords (70mm/IMAX) with a venue mention.
+# "medium" = only items that also carry an explicit future date next to sale
+#            wording — quieter, but you may miss "tickets just went on sale"
+#            headlines that lack a date.
+min_confidence = "low"
 max_age_days = 10
 max_alerts_per_run = 3
 google_news_queries = [

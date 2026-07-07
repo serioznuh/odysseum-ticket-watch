@@ -29,6 +29,7 @@ class Config:
     reminder_offsets_minutes: list[int]
     # [news]
     news_enabled: bool
+    news_min_confidence: str
     news_max_age_days: int
     news_max_alerts_per_run: int
     google_news_queries: list[str]
@@ -77,6 +78,7 @@ def load_config(path: str | Path) -> Config:
             reverse=True,
         ),
         news_enabled=bool(news.get("enabled", True)),
+        news_min_confidence=str(news.get("min_confidence", "low")),
         news_max_age_days=int(news.get("max_age_days", 10)),
         news_max_alerts_per_run=int(news.get("max_alerts_per_run", 3)),
         google_news_queries=list(news.get("google_news_queries", [])),
