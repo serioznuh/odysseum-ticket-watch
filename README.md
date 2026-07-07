@@ -104,9 +104,11 @@ The agent fires every 15 minutes and decides whether a check is due
 every 2 h in the last week before an announced opening, every 30 min in the
 last 48 h, every firing from 4 h before until 6 h after the opening (new
 sessions appear right then), then every 6 h once tickets are bookable.
-Everything else is a ~2 s no-op. Failed runs retry at the next firing;
-missed firings coalesce on wake. Both halves commit `state/state.json`, so
-run `git pull --rebase` before editing any working copy.
+Everything else is a zero-network no-op (~0.5 s of local CPU; the guard
+reads only locally-written state, and git sync happens on runs that actually
+checked). Failed runs retry at the next firing; missed firings coalesce on
+wake. Both halves commit `state/state.json`, so run `git pull --rebase`
+before editing any working copy.
 
 ## Configuration reference (config.toml)
 
