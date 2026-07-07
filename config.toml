@@ -65,5 +65,15 @@ stale_check_hours = 72
 # reminders and the "open now" ping always buzz.
 silent_kinds = ["HEARTBEAT", "NEWS_LEAD", "RECOVERED"]
 
+[cadence]
+# Adaptive check frequency (local launchd job fires every 15 min; these set
+# how stale the last successful check may be before a new one runs — the
+# 15-min firing interval is the effective floor).
+baseline_hours = 4.0          # nothing announced yet
+within_week_hours = 2.0       # sale opening within 7 days
+final_48h_hours = 0.5         # sale opening within 48 h
+opening_window_minutes = 15   # from 4 h before to 6 h after the opening
+after_tickets_hours = 6.0     # tickets already bookable (watch for new waves)
+
 [general]
 state_file = "state/state.json"

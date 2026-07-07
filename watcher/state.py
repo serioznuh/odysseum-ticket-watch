@@ -128,6 +128,28 @@ def due_reminders(state: dict, offsets_minutes: list[int], now: datetime) -> lis
     return []
 
 
+def adaptive_staleness_hours(state: dict, cfg: Any, now: datetime) -> float:
+    """Allowed staleness of the last successful check before checking again.
+
+    War-room curve around an announced sale opening: tightens as the target
+    approaches, stays tight from 4 h before until 6 h after (sessions appear
+    right at opening), then relaxes once tickets are known to be bookable.
+    The launchd firing interval (15 min) is the effective floor.
+    """
+    target = detect.parse_iso(state.get("sale_target"))
+    if target is not None:
+        hours_to_target = (detect.as_aware(target) - now).total_seconds() / 3600
+        if -6 <= hours_to_target <= 4:
+            return cfg.cadence_opening_window_minutes / 60
+        if 0 < hours_to_target <= 48:
+            return cfg.cadence_final_48h_hours
+        if 0 < hours_to_target <= 7 * 24:
+            return cfg.cadence_within_week_hours
+    if state.get("tickets_available"):
+        return cfg.cadence_after_tickets_hours
+    return cfg.cadence_baseline_hours
+
+
 def is_check_fresh(state: dict, hours: float, now: datetime) -> bool:
     """True when the last successful Pathé check is newer than `hours`.
 

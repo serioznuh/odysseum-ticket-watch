@@ -35,7 +35,7 @@ datacenter IPs (verified: 403 from Actions, 200 from a home IP, same code):
 
 | Where | What | Why |
 |---|---|---|
-| your Mac — launchd, 09:30 daily + 15:00 retry | full Pathé + news check; pushes `state/state.json` | needs a residential IP |
+| your Mac — launchd, adaptive cadence | full Pathé + news check; pushes `state/state.json` | needs a residential IP |
 | GitHub Actions — every 15 min | reminder ladder + supervision, reading the shared state | needs 24/7 uptime; no Pathé access required |
 
 Safety nets so it never dies silently: ⚠️ if the local check hasn't succeeded
@@ -99,10 +99,14 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.odysseum.ticket-watc
 launchctl kickstart gui/$(id -u)/com.odysseum.ticket-watch            # run once now to test
 ```
 
-launchd runs a missed job on the next wake, and the 15:00 slot retries when
-the morning run failed — it exits instantly if data is already fresher than
-5 h. Only a Mac that's off all day skips entirely. Both halves commit
-`state/state.json`, so run `git pull --rebase` before editing any working copy.
+The agent fires every 15 minutes and decides whether a check is due
+(**adaptive cadence**, see `[cadence]` config): roughly every 4 h normally,
+every 2 h in the last week before an announced opening, every 30 min in the
+last 48 h, every firing from 4 h before until 6 h after the opening (new
+sessions appear right then), then every 6 h once tickets are bookable.
+Everything else is a ~2 s no-op. Failed runs retry at the next firing;
+missed firings coalesce on wake. Both halves commit `state/state.json`, so
+run `git pull --rebase` before editing any working copy.
 
 ## Configuration reference (config.toml)
 
@@ -126,6 +130,11 @@ the morning run failed — it exits instantly if data is already fresher than
 | `alerts.failure_streak_threshold` | `3` | ⚠️ after N consecutive failed Pathé checks. |
 | `alerts.stale_check_hours` | `72` | Cloud pass ⚠️ when the last successful check is older than this (local job died). `0` = off. |
 | `alerts.silent_kinds` | `["HEARTBEAT", "NEWS_LEAD", "RECOVERED"]` | Alert kinds delivered silently (no sound/vibration). Everything else buzzes; reminders and the 🟢 "open now" ping always buzz. |
+| `cadence.baseline_hours` | `4.0` | Check frequency while nothing is announced. |
+| `cadence.within_week_hours` | `2.0` | …when the sale opening is ≤ 7 days away. |
+| `cadence.final_48h_hours` | `0.5` | …when it's ≤ 48 h away. |
+| `cadence.opening_window_minutes` | `15` | …from 4 h before to 6 h after the opening (every launchd firing). |
+| `cadence.after_tickets_hours` | `6.0` | …once tickets are bookable (still watching for new waves/formats). |
 | `general.state_file` | `state/state.json` | Dedup/reminder state location. |
 
 Secrets are env-only (never in config.toml): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.

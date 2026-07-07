@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Daily Pathé check at 09:30, with a 15:00 retry slot. Unlike cron,
-     launchd runs a missed job on the next wake (skipped only if powered
-     off). The script exits instantly when the last successful check is
-     fresher than 5 h, so the retry slot (and wake catch-up double-fires)
-     cost nothing when the morning run succeeded.
+<!-- Fires the check script every 15 minutes; the script's adaptive guard
+     decides whether a new Pathé check is actually due (≈4 h baseline,
+     every 15 min around an announced sale opening) and exits instantly
+     otherwise, so most firings are ~2 s no-ops. Missed firings during
+     sleep coalesce into one on wake; failed runs retry at the next firing.
 
      IMPORTANT: the job must run from a clone OUTSIDE ~/Documents (and other
      TCC-protected folders like Desktop/Downloads) — macOS blocks launchd
@@ -25,21 +25,8 @@
         <string>/bin/bash</string>
         <string>/Users/serhii.afanasiev/.ticket-watch/scripts/local-check.sh</string>
     </array>
-    <key>StartCalendarInterval</key>
-    <array>
-        <dict>
-            <key>Hour</key>
-            <integer>9</integer>
-            <key>Minute</key>
-            <integer>30</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>15</integer>
-            <key>Minute</key>
-            <integer>0</integer>
-        </dict>
-    </array>
+    <key>StartInterval</key>
+    <integer>900</integer>
     <key>StandardOutPath</key>
     <string>/Users/serhii.afanasiev/.ticket-watch/logs/launchd.log</string>
     <key>StandardErrorPath</key>

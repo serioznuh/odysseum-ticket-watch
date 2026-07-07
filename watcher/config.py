@@ -39,6 +39,12 @@ class Config:
     failure_streak_threshold: int
     stale_check_hours: int
     silent_kinds: list[str]
+    # [cadence]
+    cadence_baseline_hours: float
+    cadence_within_week_hours: float
+    cadence_final_48h_hours: float
+    cadence_opening_window_minutes: float
+    cadence_after_tickets_hours: float
     # [general]
     state_file: str
     # environment
@@ -53,6 +59,7 @@ def load_config(path: str | Path) -> Config:
     reminders = raw.get("reminders", {})
     news = raw.get("news", {})
     alerts = raw.get("alerts", {})
+    cadence = raw.get("cadence", {})
     general = raw.get("general", {})
 
     if "primary_slug" not in film:
@@ -91,6 +98,11 @@ def load_config(path: str | Path) -> Config:
             str(k).upper()
             for k in alerts.get("silent_kinds", ["HEARTBEAT", "NEWS_LEAD", "RECOVERED"])
         ],
+        cadence_baseline_hours=float(cadence.get("baseline_hours", 4.0)),
+        cadence_within_week_hours=float(cadence.get("within_week_hours", 2.0)),
+        cadence_final_48h_hours=float(cadence.get("final_48h_hours", 0.5)),
+        cadence_opening_window_minutes=float(cadence.get("opening_window_minutes", 15)),
+        cadence_after_tickets_hours=float(cadence.get("after_tickets_hours", 6.0)),
         state_file=general.get("state_file", "state/state.json"),
         telegram_token=os.environ.get("TELEGRAM_BOT_TOKEN") or None,
         telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID") or None,

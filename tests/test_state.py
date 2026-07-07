@@ -142,6 +142,43 @@ def test_open_ping_after_target_once_with_grace():
     assert due_reminders(st2, OFFSETS, NOW) == []
 
 
+class CadenceCfg:
+    cadence_baseline_hours = 4.0
+    cadence_within_week_hours = 2.0
+    cadence_final_48h_hours = 0.5
+    cadence_opening_window_minutes = 15
+    cadence_after_tickets_hours = 6.0
+
+
+def test_adaptive_staleness_tiers():
+    st = fresh_state()
+    assert state_mod.adaptive_staleness_hours(st, CadenceCfg, NOW) == 4.0  # nothing known
+
+    st["sale_target"] = iso_in(timedelta(days=10))
+    assert state_mod.adaptive_staleness_hours(st, CadenceCfg, NOW) == 4.0  # too far out
+
+    st["sale_target"] = iso_in(timedelta(days=3))
+    assert state_mod.adaptive_staleness_hours(st, CadenceCfg, NOW) == 2.0
+
+    st["sale_target"] = iso_in(timedelta(hours=20))
+    assert state_mod.adaptive_staleness_hours(st, CadenceCfg, NOW) == 0.5
+
+    st["sale_target"] = iso_in(timedelta(hours=2))
+    assert state_mod.adaptive_staleness_hours(st, CadenceCfg, NOW) == 0.25  # opening window
+
+    st["sale_target"] = iso_in(timedelta(hours=-3))
+    assert state_mod.adaptive_staleness_hours(st, CadenceCfg, NOW) == 0.25  # sessions appear now
+
+    st["sale_target"] = iso_in(timedelta(hours=-10))
+    assert state_mod.adaptive_staleness_hours(st, CadenceCfg, NOW) == 4.0  # window over, no tickets
+
+    st["tickets_available"] = True
+    assert state_mod.adaptive_staleness_hours(st, CadenceCfg, NOW) == 6.0  # relaxed
+
+    st["sale_target"] = iso_in(timedelta(hours=2))
+    assert state_mod.adaptive_staleness_hours(st, CadenceCfg, NOW) == 0.25  # proximity wins
+
+
 def test_is_check_fresh():
     st = fresh_state()
     assert state_mod.is_check_fresh(st, 5, NOW) is False  # never checked yet

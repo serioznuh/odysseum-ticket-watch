@@ -9,10 +9,12 @@ cd "$(dirname "$0")/.."
 source .env
 git pull --rebase --quiet origin main || true
 
-# The launchd job fires at 09:30 and again at 15:00 as a retry; the guard
-# makes any slot exit instantly when data is already fresher than 5 h.
-# To force a full check, run `.venv/bin/python -m watcher --mode check`.
-.venv/bin/python -m watcher --mode check --skip-if-checked-within 5
+# The launchd job fires every 15 min; --adaptive-cadence decides whether a
+# new check is due (≈4 h baseline, tightening to every firing around the
+# announced sale opening) and exits instantly otherwise. Failed runs are
+# retried at the next firing. To force a full check right now, run
+# `.venv/bin/python -m watcher --mode check`.
+.venv/bin/python -m watcher --mode check --adaptive-cadence
 
 if [ -n "$(git status --porcelain state/state.json)" ]; then
   git add state/state.json

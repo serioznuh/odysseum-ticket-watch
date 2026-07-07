@@ -31,7 +31,7 @@ def build_error_finding(cfg, streak: int, error: str, now: datetime) -> Finding:
         confidence="high",
         title="Watcher cannot reach the Pathé API",
         lines=[
-            f"{streak} consecutive daily checks have failed.",
+            f"{streak} consecutive checks have failed.",
             f"Last error: {error[:300]}",
             "Possible causes: Akamai bot protection extended to /api, API redesign, network issue.",
             "The watcher is currently BLIND — check the GitHub Actions logs, or run it locally.",
@@ -95,7 +95,13 @@ def run(argv: list[str] | None = None) -> int:
         type=float,
         default=0,
         metavar="HOURS",
-        help="check mode: exit at once when the last successful check is newer than this (for retry slots)",
+        help="check mode: exit at once when the last successful check is newer than this (fixed threshold)",
+    )
+    parser.add_argument(
+        "--adaptive-cadence",
+        action="store_true",
+        help="check mode: compute the freshness threshold from the sale-target proximity"
+        " (war-room mode near the opening); reminders are left to the cloud pass",
     )
     parser.add_argument("--test-telegram", action="store_true", help="send a test message and exit")
     parser.add_argument("--verbose", action="store_true")
@@ -131,17 +137,20 @@ def run(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    if (
-        args.mode == "check"
-        and args.skip_if_checked_within > 0
-        and state_mod.is_check_fresh(st, args.skip_if_checked_within, now)
-    ):
-        log.info(
-            "last successful check (%s) is newer than %.1fh — retry slot not needed, exiting",
-            st.get("last_check_ok"),
-            args.skip_if_checked_within,
-        )
-        return 0
+    if args.mode == "check":
+        threshold = args.skip_if_checked_within
+        if args.adaptive_cadence:
+            threshold = state_mod.adaptive_staleness_hours(st, cfg, now)
+        if threshold > 0 and state_mod.is_check_fresh(st, threshold, now):
+            log.info(
+                "last successful check (%s) is newer than %.2fh%s — nothing to do, exiting",
+                st.get("last_check_ok"),
+                threshold,
+                " [adaptive tier]" if args.adaptive_cadence else "",
+            )
+            return 0
+        if args.adaptive_cadence:
+            log.info("adaptive cadence tier: check when older than %.2fh — running", threshold)
 
     sent_any = False
 
@@ -155,8 +164,11 @@ def run(argv: list[str] | None = None) -> int:
         except Exception as e:  # noqa: BLE001 — any fetch failure is handled the same way
             log.exception("Pathé check failed")
             st["failure_streak"] = st.get("failure_streak", 0) + 1
+            # With adaptive cadence, retries come every 15 min — require both
+            # a failure streak AND 6h without success before crying wolf.
             if (
                 st["failure_streak"] >= cfg.failure_streak_threshold
+                and not state_mod.is_check_fresh(st, 6.0, now)
                 and not st.get("error_alerted")
             ):
                 err = build_error_finding(cfg, st["failure_streak"], str(e), now)
@@ -210,16 +222,20 @@ def run(argv: list[str] | None = None) -> int:
                 ):
                     st["last_heartbeat"] = now.isoformat()
 
-    # Reminders run in both modes.
-    for r in state_mod.due_reminders(st, cfg.reminder_offsets_minutes, now):
+    # Reminders and supervision are owned by the cloud pass; adaptive local
+    # runs skip them so two writers never race on the same state keys.
+    due = [] if args.adaptive_cadence else state_mod.due_reminders(
+        st, cfg.reminder_offsets_minutes, now
+    )
+    for r in due:
         text = notify.render_reminder(r["offset"], r["target"], cfg)
         log.info("reminder due: %s before %s", r["offset"], r["target"])
         if notify.send_telegram(cfg, text, dry_run=args.dry_run):
             state_mod.mark_reminder(st, r["target"], r["offset"], cfg.reminder_offsets_minutes)
 
-    # Supervision (both modes): the daily Pathé check runs on a different
-    # machine than the cloud reminder pass — alert if it stopped reporting.
-    if state_mod.is_check_stale(st, cfg.stale_check_hours, now):
+    # Supervision: alert when the Pathé check (running on another machine
+    # than the cloud reminder pass) stopped reporting.
+    if not args.adaptive_cadence and state_mod.is_check_stale(st, cfg.stale_check_hours, now):
         key = f"stale:{st.get('last_check_ok')}"
         if not state_mod.already_sent(st, key):
             stale = Finding(
