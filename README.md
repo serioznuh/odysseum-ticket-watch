@@ -35,7 +35,7 @@ datacenter IPs (verified: 403 from Actions, 200 from a home IP, same code):
 
 | Where | What | Why |
 |---|---|---|
-| your Mac — launchd, daily 09:30 | full Pathé + news check; pushes `state/state.json` | needs a residential IP |
+| your Mac — launchd, 09:30 daily + 15:00 retry | full Pathé + news check; pushes `state/state.json` | needs a residential IP |
 | GitHub Actions — every 15 min | reminder ladder + supervision, reading the shared state | needs 24/7 uptime; no Pathé access required |
 
 Safety nets so it never dies silently: ⚠️ if the local check hasn't succeeded
@@ -99,9 +99,10 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.odysseum.ticket-watc
 launchctl kickstart gui/$(id -u)/com.odysseum.ticket-watch            # run once now to test
 ```
 
-launchd runs a missed 09:30 job on the next wake; only a fully powered-off
-Mac skips a day. Both halves commit `state/state.json`, so run
-`git pull --rebase` before editing any working copy.
+launchd runs a missed job on the next wake, and the 15:00 slot retries when
+the morning run failed — it exits instantly if data is already fresher than
+5 h. Only a Mac that's off all day skips entirely. Both halves commit
+`state/state.json`, so run `git pull --rebase` before editing any working copy.
 
 ## Configuration reference (config.toml)
 

@@ -142,6 +142,16 @@ def test_open_ping_after_target_once_with_grace():
     assert due_reminders(st2, OFFSETS, NOW) == []
 
 
+def test_is_check_fresh():
+    st = fresh_state()
+    assert state_mod.is_check_fresh(st, 5, NOW) is False  # never checked yet
+    st["last_check_ok"] = iso_in(timedelta(hours=-2))
+    assert state_mod.is_check_fresh(st, 5, NOW) is True   # morning run succeeded -> retry skips
+    st["last_check_ok"] = iso_in(timedelta(hours=-6))
+    assert state_mod.is_check_fresh(st, 5, NOW) is False  # morning run missed -> retry runs
+    assert state_mod.is_check_fresh(st, 0, NOW) is False  # guard disabled
+
+
 def test_is_check_stale():
     st = fresh_state()
     assert state_mod.is_check_stale(st, 72, NOW) is False  # never checked -> setup phase

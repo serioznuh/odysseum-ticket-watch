@@ -128,6 +128,18 @@ def due_reminders(state: dict, offsets_minutes: list[int], now: datetime) -> lis
     return []
 
 
+def is_check_fresh(state: dict, hours: float, now: datetime) -> bool:
+    """True when the last successful Pathé check is newer than `hours`.
+
+    Used by retry slots to exit instantly when the primary run already
+    succeeded. False when there has never been a successful check.
+    """
+    if hours <= 0:
+        return False
+    last = detect.parse_iso(state.get("last_check_ok"))
+    return last is not None and (now - detect.as_aware(last)) < timedelta(hours=hours)
+
+
 def is_check_stale(state: dict, hours: int, now: datetime) -> bool:
     """True when the last successful Pathé check is older than `hours`.
 

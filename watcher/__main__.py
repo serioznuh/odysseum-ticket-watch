@@ -90,6 +90,13 @@ def run(argv: list[str] | None = None) -> int:
     parser.add_argument("--state", default=None, help="override state file path")
     parser.add_argument("--mode", choices=["check", "remind"], default="check")
     parser.add_argument("--dry-run", action="store_true", help="print alerts instead of sending; do not save state")
+    parser.add_argument(
+        "--skip-if-checked-within",
+        type=float,
+        default=0,
+        metavar="HOURS",
+        help="check mode: exit at once when the last successful check is newer than this (for retry slots)",
+    )
     parser.add_argument("--test-telegram", action="store_true", help="send a test message and exit")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--version", action="version", version=__version__)
@@ -123,6 +130,18 @@ def run(argv: list[str] | None = None) -> int:
             "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set (or use --dry-run)."
         )
         return 1
+
+    if (
+        args.mode == "check"
+        and args.skip_if_checked_within > 0
+        and state_mod.is_check_fresh(st, args.skip_if_checked_within, now)
+    ):
+        log.info(
+            "last successful check (%s) is newer than %.1fh — retry slot not needed, exiting",
+            st.get("last_check_ok"),
+            args.skip_if_checked_within,
+        )
+        return 0
 
     sent_any = False
 
