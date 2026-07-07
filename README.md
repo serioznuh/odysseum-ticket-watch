@@ -1,106 +1,76 @@
 # odysseum-ticket-watch
 
-Telegram watcher that detects **in advance** when tickets for *Dune : Troisième
-partie* go on sale at **Pathé Odysseum (Montpellier)** — France's first and only
-IMAX 70 mm (1.43:1) screen — and reminds you before the sale opens.
+A small Telegram watcher that tells you **in advance** when tickets for
+*Dune : Troisième partie* go on sale at **Pathé Odysseum** (Montpellier) —
+France's only IMAX 70 mm / 1.43:1 screen — then counts you down to the
+opening so you're ready the minute seats exist. It never auto-buys tickets,
+and it can watch any film/cinema on pathe.fr by editing [config.toml](config.toml).
 
-It does **not** scrape HTML and does **not** auto-buy tickets.
+## What it sends you
+
+- 🎟️ **Sale opening announced** — Pathé published the date/time sales open (the key early signal); 🔁 if that datetime changes
+- ⏰ **Reminders** — 24 h / 2 h / 15 min before the opening, plus 🟢 "sales should be open NOW"
+- 🆕 **New listing** — a matching catalogue entry appeared (Pathé creates dedicated event pages for 70 mm runs, each with its own sale opening)
+- 📍 **Listed at your cinema** (not bookable yet) → 🚨 **Tickets bookable NOW**, with formats, session dates and a direct booking link
+- 📰 **News lead** — early press hint via Google News (low/medium confidence, strictly filtered — see configuration)
+- ⚠️ watcher failure / ✅ recovery / 💤 weekly "still alive" heartbeat
+
+Every alert carries the source URL, detected format (IMAX 70 mm / IMAX /
+other), cinema and a confidence level. Each distinct finding is sent **once**,
+deduplicated forever via `state/state.json`.
 
 ## How it works
 
-Pathé's website is protected by Akamai Bot Manager (plain HTTP GET of any page
-returns 403), but its public JSON API is open and, crucially, contains the
-advance signal we want as a structured field:
+pathe.fr pages are bot-protected, but Pathé's public JSON API is open and
+publishes `salesOpeningDatetime` *before* sales start — a structured advance
+signal, so there is no HTML scraping and no guessing from "Réserver" buttons.
+The daily check reads the catalogue, your cinema's programme and its bookable
+sessions (endpoints documented in [watcher/pathe.py](watcher/pathe.py)), plus
+Google News RSS for press leaks.
 
-| Signal | Endpoint | Meaning |
-|---|---|---|
-| `salesOpeningDatetime` | `/api/shows`, `/api/show/{slug}` | **Future** date/time when Pathé opens ticket sales (e.g. `2026-11-05T08:00:00+01:00`). This is what powers the "Ouverture des ventes le …" banner on their site. |
-| new catalogue listing | `/api/shows` | Pathé creates *dedicated event listings* for 70 mm runs (they did for L'Odyssée: `l-odyssee-projection-imax-70mm-54413`). Any new listing matching the film patterns is alerted. |
-| cinema programme | `/api/cinema/cinema-pathe-odysseum/shows` | The film appears at Odysseum, with `bookable`/`isBookable` flags. |
-| bookable sessions | `/api/show/{slug}/showtimes/cinema-pathe-odysseum` | Actual sessions with `tags` (`imax`, …), auditorium and direct booking links — the "tickets are on sale now" proof. |
-| news leads | Google News RSS (fr + en) | Press announcements (ticket waves are often announced globally before French ticketing opens). Phrase + film matching, low/medium confidence. |
-
-Detection never relies on a generic "Réserver maintenant" button. Pathé
-signals come from structured API fields; text-phrase matching ("réservations
-ouvertes", "mise en vente", "IMAX 70mm", …) is only applied to news items and
-requires a film match too.
-
-**Alert types** (each sent once, deduplicated forever via `state/state.json`):
-
-- 🎟️ `SALE_DATE` — a future sale opening was published → immediate alert + reminder ladder
-- 🔁 `SALE_DATE_CHANGED` — the published opening moved
-- 🆕 `NEW_LISTING` — new Pathé catalogue entry matching the film (e.g. "… : Projection IMAX 70mm")
-- 📍 `CINEMA_LISTED` — film on the Odysseum programme, not bookable yet
-- 🚨 `TICKETS_AVAILABLE` — bookable sessions exist at Odysseum (fallback if no advance date was ever published; re-alerts when a *new format* appears, e.g. IMAX 70 mm sessions added after standard ones)
-- ⏰ reminders — 24 h / 2 h / 15 min before the sale opening, plus 🟢 at opening time
-- 📰 `NEWS_LEAD` — external press match; requires sale wording, or format
-  keywords together with a venue mention (Pathé/cinema/city/France), so bare
-  "IMAX 70mm trailer" SEO spam is ignored. Quieter still: set
-  `news.min_confidence = "medium"` (date-carrying leads only) or
-  `news.enabled = false`. No reminders are scheduled from news alone.
-- ⚠️/✅ watcher error / recovery, 💤 weekly heartbeat ("still alive, nothing new")
-
-Every alert includes: source URL, detected format (IMAX 70 mm / IMAX / other),
-cinema, and confidence (HIGH = Pathé API, MEDIUM = news with explicit future
-date, LOW = news phrase match).
-
-## Setup
-
-Requires **Python 3.9+** (tested on macOS system Python 3.9.6; CI uses 3.12).
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python -m pytest -q          # run the test suite
-```
-
-### 1. Create the Telegram bot
-
-1. In Telegram, talk to [@BotFather](https://t.me/BotFather) → `/newbot` → pick a
-   name/username → copy the **bot token** (`123456789:AA...`).
-2. Open a chat with your new bot and send it any message (bots cannot message
-   you first).
-3. Get your **chat id**:
-   ```bash
-   curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | python3 -m json.tool
-   # → result[0].message.chat.id  (e.g. 123456789)
-   ```
-
-### 2. Environment variables
-
-| Variable | Value |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | token from BotFather |
-| `TELEGRAM_CHAT_ID` | your chat id |
-
-### 3. Run locally
-
-```bash
-export TELEGRAM_BOT_TOKEN="123456789:AA..."
-export TELEGRAM_CHAT_ID="123456789"
-
-python -m watcher --test-telegram          # send a test message
-python -m watcher --mode check --dry-run   # full check, alerts logged, state untouched
-python -m watcher --mode check             # full check, alerts sent, state saved
-python -m watcher --mode remind            # reminders only (no network except Telegram)
-```
-
-`--dry-run` never sends and never writes state, so a later real run will send
-everything the dry run showed. Logs go to stderr; add `--verbose` for debug.
-
-### 4. Deploy (hybrid: local check + cloud reminders)
-
-**Why hybrid:** Akamai blocks `www.pathe.fr/api` from GitHub's datacenter IPs
-(verified: 403 from an Actions runner, 200 from a residential IP with the
-same code). So the parts are split along that line:
+The runtime is **hybrid**, because Akamai blocks Pathé's API from GitHub's
+datacenter IPs (verified: 403 from Actions, 200 from a home IP, same code):
 
 | Where | What | Why |
 |---|---|---|
-| **Your Mac** (launchd, daily 09:30) | `scripts/local-check.sh` — Pathé + news check, pushes `state/state.json` to GitHub | needs a residential IP |
-| **GitHub Actions** (every 15 min) | reminder pass reading the shared state, plus supervision | needs 24/7 uptime, no Pathé access required |
+| your Mac — launchd, daily 09:30 | full Pathé + news check; pushes `state/state.json` | needs a residential IP |
+| GitHub Actions — every 15 min | reminder ladder + supervision, reading the shared state | needs 24/7 uptime; no Pathé access required |
 
-Cloud setup:
+Safety nets so it never dies silently: ⚠️ if the local check hasn't succeeded
+for 72 h, ⚠️ after 3 consecutive Pathé failures, 💤 weekly heartbeat.
+
+## Setup
+
+Requires Python 3.9+.
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m pytest -q        # optional: run the test suite
+```
+
+**1. Telegram bot** — talk to [@BotFather](https://t.me/BotFather) → `/newbot`
+→ copy the token. Open your new bot's chat, send it any message, then:
+
+```bash
+curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | python3 -m json.tool
+# your chat id is at result[..].message.chat.id
+```
+
+**2. Secrets** — provide `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` as
+environment variables (locally: a git-ignored `.env` file with `export` lines).
+
+**3. Try it:**
+
+```bash
+source .env
+.venv/bin/python -m watcher --test-telegram          # sends a hello message
+.venv/bin/python -m watcher --mode check --dry-run   # full check; logs alerts, sends nothing, state untouched
+.venv/bin/python -m watcher --mode check             # real run: alerts sent, state saved
+```
+
+## Deploy
+
+**Cloud half** (reminders + supervision):
 
 ```bash
 gh repo create odysseum-ticket-watch --public --source . --push
@@ -108,39 +78,55 @@ gh secret set TELEGRAM_BOT_TOKEN
 gh secret set TELEGRAM_CHAT_ID
 ```
 
-Local daily check (launchd — unlike cron it runs the job on the next wake if
-the Mac was asleep at 09:30; only a powered-off Mac skips a day):
+Keep the repo public — on a private repo the 15-min pass costs ~2900
+free-tier Actions minutes/month (or relax the cron to `*/30` in
+[watch.yml](.github/workflows/watch.yml)). To verify: Actions → *ticket-watch*
+→ Run workflow with mode `test` — you should get a Telegram message.
+
+**Local half** (the daily Pathé check). The clone must live **outside
+`~/Documents`/`~/Desktop`** — macOS blocks launchd agents there
+("Operation not permitted"):
 
 ```bash
+git clone https://github.com/<you>/odysseum-ticket-watch.git ~/.ticket-watch
+cp .env ~/.ticket-watch/ && cd ~/.ticket-watch
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 mkdir -p logs ~/Library/LaunchAgents
-cp scripts/com.odysseum.ticket-watch.plist ~/Library/LaunchAgents/
+cp scripts/com.odysseum.ticket-watch.plist ~/Library/LaunchAgents/    # fix the absolute paths inside if yours differ
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.odysseum.ticket-watch.plist
-launchctl kickstart gui/$(id -u)/com.odysseum.ticket-watch   # run once now to test
+launchctl kickstart gui/$(id -u)/com.odysseum.ticket-watch            # run once now to test
 ```
 
-Safety nets, so the system never dies silently:
+launchd runs a missed 09:30 job on the next wake; only a fully powered-off
+Mac skips a day. Both halves commit `state/state.json`, so run
+`git pull --rebase` before editing any working copy.
 
-- if the **local check** stops pushing for >72 h (`stale_check_hours`), the
-  cloud pass sends a ⚠️ alert;
-- if Pathé starts failing from the Mac too, a ⚠️ alert fires after 3
-  consecutive failures;
-- a weekly 💤 heartbeat confirms the whole loop is alive.
+## Configuration reference (config.toml)
 
-State is shared by committing `state/state.json` (no secrets in it), which
-also keeps the scheduled workflow from being auto-disabled after 60 days of
-repo inactivity.
+| Key | Default | What it does |
+|---|---|---|
+| `film.primary_slug` | *(required)* | Film slug, taken from its pathe.fr URL. |
+| `film.title` | slug | Display name used in alerts. |
+| `film.page_url` | derived from slug | Link shown in alerts and reminders. |
+| `film.release_date` | `""` | `YYYY-MM-DD`. News mentioning this date isn't mistaken for a sale date. |
+| `film.match_patterns` | *(see file)* | Regexes (matched on lowercase, accent-stripped slug+title) that catch extra listings, e.g. a dedicated "… : Projection IMAX 70mm" event page. |
+| `cinema.slug` | *(required)* | Cinema slug from `https://www.pathe.fr/api/cinemas`. |
+| `cinema.name`, `cinema.city` | slug, `""` | Shown in alerts; also used as venue words for news filtering. |
+| `reminders.offsets_minutes` | `[1440, 120, 15]` | When to remind before the sale opening. The 🟢 "open now" ping always fires at opening time. |
+| `news.enabled` | `true` | `false` switches the news channel off entirely. Pathé API alerts (sale date, listings, sessions) are unaffected. |
+| `news.min_confidence` | `"low"` | `"low"`: sale wording (réservations, billets, tickets, on sale…), or format keywords (70mm/IMAX) together with a venue mention. `"medium"`: only leads with sale wording **and** an explicit future date — quieter, but a dateless "tickets just went on sale" headline would be dropped. |
+| `news.max_age_days` | `10` | Ignore news older than this. |
+| `news.max_alerts_per_run` | `3` | Cap on news alerts per check. |
+| `news.google_news_queries` | *(see file)* | Google News RSS search URLs to scan. |
+| `news.extra_pages` | `[]` | Extra URLs scanned with the same phrase rules. |
+| `alerts.heartbeat_days` | `7` | 💤 "alive" summary when nothing was alerted for N days. `0` = off. |
+| `alerts.failure_streak_threshold` | `3` | ⚠️ after N consecutive failed Pathé checks. |
+| `alerts.stale_check_hours` | `72` | Cloud pass ⚠️ when the last successful check is older than this (local job died). `0` = off. |
+| `general.state_file` | `state/state.json` | Dedup/reminder state location. |
 
-> **Private repo?** The 15-min cloud pass costs ~2900 free-tier minutes/month.
-> Keep the repo public (free), or relax the cron to `*/30`.
+Secrets are env-only (never in config.toml): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
 
-## Configuration
-
-Everything lives in [config.toml](config.toml) — film slug and match patterns,
-cinema slug, reminder offsets, news feeds, heartbeat cadence. To watch another
-film, change `[film]`; to watch another cinema, change `[cinema]` (slugs come
-from `https://www.pathe.fr/api/cinemas` or the pathe.fr URL).
-
-## Example Telegram messages
+## Example alerts
 
 ```
 🎟️ Ticket sale opening announced
@@ -149,19 +135,7 @@ Sales open: Thu 05 Nov 2026, 08:00 (Paris time)
 Watched cinema: Pathé Odysseum, Montpellier
 Format of this listing: IMAX 70 mm (1.43:1)
 Confidence: HIGH — official Pathé API field salesOpeningDatetime.
-Note: opening time is national; popular IMAX 70 mm seats can sell out in minutes.
 🔗 https://www.pathe.fr/evenements/dune-troisieme-partie-projection-imax-70mm-...
-```
-
-```
-🚨 Tickets are bookable NOW
-Listing: Dune : Troisième partie
-Cinema: Pathé Odysseum, Montpellier
-Formats bookable: IMAX 70 mm (1.43:1): 14 session(s); IMAX: 22 session(s)
-Session dates: 2026-12-16 → 2026-12-27 (36 sessions)
-Book (IMAX 70 mm (1.43:1)): https://s.pathe.fr/fr/.../booking
-Confidence: HIGH — sessions returned by the Pathé booking API for this cinema.
-🔗 https://www.pathe.fr/films/dune-troisieme-partie-50828
 ```
 
 ```
@@ -173,25 +147,13 @@ Be ready: sign in on pathe.fr, save a payment method.
 👉 https://www.pathe.fr/films/dune-troisieme-partie-50828
 ```
 
-```
-📰 News lead: possible ticket-sale info
-Headline: Dune 3 : les réservations IMAX 70mm ouvriront le 5 novembre
-Source: BoxOffice Pro, published 2026-10-28
-Matched phrases: imax 70mm, reservations
-Date(s) mentioned (possible sale date): 05 Nov 2026
-Confidence: MEDIUM — external lead, verify on Pathé. No reminders are scheduled from news alone.
-🔗 https://news.google.com/...
-```
-
 ## Notes & limitations
 
-- **Pathé "Ma liste"**: adding the film to your Pathé wishlist (with marketing
-  emails + app push enabled) gets you Pathé's own release/booking notifications.
-  Timing isn't documented and there's no cinema/format targeting — enable it as
-  a *backup*, this watcher remains the precise/early channel.
-- The first IMAX 70 mm ticket wave for Dune 3 (April 2026) was global, sold via
-  imax.com/US chains, and sold out in hours. French/Odysseum ticketing goes
-  through Pathé — exactly what this watcher monitors; the news layer covers any
-  further global waves.
-- If Pathé redesigns the API or extends bot protection to `/api`, the watcher
-  alerts you after 3 failed daily checks instead of failing silently.
+- Pathé's own "Ma liste" wishlist notifications are a reasonable **backup**
+  (release/booking pushes, timing undocumented, no format targeting) — this
+  watcher remains the precise/early channel.
+- If Pathé redesigns the API or extends bot protection, you get a ⚠️ alert
+  after 3 failed checks instead of silence.
+- Context: the first global IMAX 70 mm ticket wave for Dune 3 (April 2026,
+  not France) sold out within hours — when the Odysseum opening is announced,
+  expect minutes, not days.
