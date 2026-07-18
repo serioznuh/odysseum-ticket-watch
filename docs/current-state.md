@@ -18,7 +18,8 @@ supervision alerts (failure streak, stale state, weekly heartbeat).
   network on idle firings). Runs from a residential IP because Akamai blocks
   Pathé's API from GitHub's datacenter IPs.
 - **Cloud half** — `.github/workflows/watch.yml` cron `*/15`: reminder ladder +
-  supervision only, reading shared state; never calls Pathé.
+  supervision only, reading shared state; the scheduled pass never calls Pathé
+  (a manual `check` dispatch would, but is 403'd from datacenter IPs).
 - **Shared state** — `state/state.json`, committed to `main` by both halves
   (`[skip ci]`); serves as dedup memory and reminder bookkeeping.
 - **Code** — Python package `watcher/` (`pathe.py` API client, `news.py`,
