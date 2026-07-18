@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 from datetime import datetime, timedelta
 
@@ -24,7 +25,26 @@ from .detect import TZ_PARIS, Finding
 log = logging.getLogger("watcher")
 
 
+def summarize_pathe_error(error: str) -> tuple[str, int | None]:
+    """Turn httpx's multiline status message into a concise alert line."""
+    status = re.search(
+        r"(?:Client|Server) error '(\d{3}) ([^']+)' for url '([^']+)'", error
+    )
+    if status:
+        return f"HTTP {status.group(1)} {status.group(2)} from {status.group(3)}", int(
+            status.group(1)
+        )
+    return " ".join(error.split())[:300], None
+
+
 def build_error_finding(cfg, streak: int, error: str, now: datetime) -> Finding:
+    summary, status = summarize_pathe_error(error)
+    guidance = (
+        "Pathé rejected the current network/IP. Disable any VPN or proxy, then wait for"
+        " the next automatic retry."
+        if status == 403
+        else "Possible causes: Pathé API change or a local/network outage."
+    )
     return Finding(
         kind="WATCHER_ERROR",
         key=f"error:{now:%Y-%m-%d}",
@@ -32,9 +52,10 @@ def build_error_finding(cfg, streak: int, error: str, now: datetime) -> Finding:
         title="Watcher cannot reach the Pathé API",
         lines=[
             f"{streak} consecutive checks have failed.",
-            f"Last error: {error[:300]}",
-            "Possible causes: Akamai bot protection extended to /api, API redesign, network issue.",
-            "The watcher is currently BLIND — check the GitHub Actions logs, or run it locally.",
+            f"Last error: {summary}",
+            guidance,
+            "The watcher is currently BLIND. Local checks retry every 15 min; details:"
+            " ~/.ticket-watch/logs/launchd.log",
         ],
         url=cfg.film_page_url,
     )
