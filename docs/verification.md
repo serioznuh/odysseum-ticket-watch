@@ -7,10 +7,11 @@ Use the lowest-risk verification that proves the change.
 Use for docs, tests, or local logic changes:
 
 ```bash
+.venv/bin/ruff check .
 .venv/bin/python -m pytest -q
 ```
 
-Expected current result: **42 passed**. No linter is configured yet (OTW-02).
+Expected current result: Ruff reports no errors and pytest reports **44 passed**.
 
 ## Watcher behavior check
 
