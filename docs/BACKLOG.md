@@ -15,10 +15,26 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 |----|-------|----------|--------|---------|------|
 | OTW-01 | Docs-contract test in CI | P2 | S | Infra, tooling & docs | [ ] |
 | OTW-02 | Add a linter (ruff) | P2 | S | Infra, tooling & docs | [ ] |
+| OTW-03 | 403 alert VPN wording wrong on manual CI dispatch | P3 | S | Bugs | [ ] |
 
 ## 1. Critical — security & breakage
 
 ## 2. Bugs
+
+### OTW-03 · 403 alert VPN wording wrong on manual CI dispatch
+**Priority:** P3 · **Effort:** S
+**Problem:** The 403 error alert (`watcher/__main__.py`, `summarize_pathe_error` /
+ERROR alert body) says "Disable any VPN or proxy" and points at
+`~/.ticket-watch/logs/launchd.log`. Correct for the local Mac, but a manually
+dispatched `check` run on GitHub Actions also gets 403 (datacenter IP, per
+AGENTS.md) — there the VPN advice misattributes the cause and the log path
+doesn't exist. Rare, owner-only path; the failure-streak gate makes it unlikely
+to ever fire from a one-off dispatch (review note, PR #3).
+**Fix:** Detect CI (e.g. `GITHUB_ACTIONS` env) and swap the hint text to
+"GitHub datacenter IPs are blocked by Pathé — run the check locally", dropping
+the launchd log pointer.
+**Done when:** the ERROR alert body differs between local and CI contexts, with
+a unit test covering both.
 
 ## 3. Features
 
