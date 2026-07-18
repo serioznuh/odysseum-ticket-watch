@@ -14,7 +14,7 @@ Stack: Python 3.9+ stdlib + `httpx`, no framework. Package `watcher/` (entry:
 
 - Tests: `.venv/bin/python -m pytest -q` (currently 42 passing; no linter configured)
 - Manual run: `source .env && .venv/bin/python -m watcher --mode check --dry-run`
-- Telegram smoke test: `.venv/bin/python -m watcher --test-telegram`
+- Telegram smoke test: `source .env && .venv/bin/python -m watcher --test-telegram`
 - Secrets are env-only: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — locally in a
   git-ignored `.env` (export lines), in CI as repo secrets. Never in config.toml.
 
@@ -28,7 +28,8 @@ Core facts agents need before editing:
   can't run from `~/Documents` (macOS TCC). Changes reach production via
   `git pull` there; pushing to `main` is deploying.
 - Pathé's API is **blocked from GitHub datacenter IPs** (Akamai 403). Anything
-  touching `www.pathe.fr` must run locally; the cloud pass must never call it.
+  touching `www.pathe.fr` runs locally; the scheduled cloud pass is remind-only
+  and never calls Pathé (a manual `check` dispatch would, and gets 403'd).
 - Both halves **commit `state/state.json` to `main`** (`[skip ci]`). Always
   `git pull --rebase` before committing; never rewrite pushed history.
 - The adaptive-cadence guard in `scripts/local-check.sh` must stay **before**
@@ -59,13 +60,16 @@ Use the lowest-risk check that proves the change — details in
 
 ## Conventions
 
-- Alert kinds are dedup keys in `state/state.json` — renaming a kind re-sends
-  every past alert of that kind. Never rename without a state migration.
-- New alert types default to silent (`alerts.silent_kinds`) unless they are
-  time-critical; reminders and "open now" always buzz.
+- Alert dedup is keyed on `Finding.key` (values like `sale:…`, `new_show:…`),
+  not `kind`. Changing a key's format re-sends every past alert of that shape —
+  never change it without a state migration.
+- Alert kinds buzz by default; only kinds in `alerts.silent_kinds` (default
+  HEARTBEAT, NEWS_LEAD, RECOVERED) are silent. A new non-urgent kind must be
+  added there or it will notify loudly.
 - News matching stays strict (sale wording required; format keywords need a
   venue mention) — loosening it needs user approval.
-- Times shown to the user are Paris time; state timestamps are UTC ISO-8601.
+- Times shown to the user are Paris time; state timestamps are Paris-local
+  ISO-8601 (offset-aware, e.g. `+02:00`).
 - Keep dependencies minimal (`httpx`, `pytest`, `tomli` back-compat only);
   Python 3.9 compatibility is required (the local Mac may run system Python).
 

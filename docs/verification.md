@@ -18,7 +18,7 @@ Use when detection, news filtering, alert text, or cadence logic changes:
 
 ```bash
 source .env
-.venv/bin/python -m watcher --mode check --dry-run   # logs alerts, sends nothing, state untouched
+.venv/bin/python -m watcher --mode check --dry-run   # logs alerts, sends nothing, does not save state
 ```
 
 Needs network access to `www.pathe.fr` — run from a residential IP (it is
@@ -31,7 +31,7 @@ noisy one).
 A real send reaches the user's phone:
 
 ```bash
-.venv/bin/python -m watcher --test-telegram
+source .env && .venv/bin/python -m watcher --test-telegram
 ```
 
 ## Scheduling / deploy checks — needs user approval
