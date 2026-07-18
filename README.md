@@ -39,7 +39,9 @@ datacenter IPs (verified: 403 from Actions, 200 from a home IP, same code):
 | GitHub Actions — every 15 min | reminder ladder + supervision, reading the shared state | needs 24/7 uptime; no Pathé access required |
 
 Safety nets so it never dies silently: ⚠️ if the local check hasn't succeeded
-for 72 h, ⚠️ after 3 consecutive Pathé failures, 💤 weekly heartbeat.
+for 72 h, ⚠️ after 3 consecutive Pathé failures, 💤 weekly heartbeat. A 403
+failure calls out VPN/proxy egress explicitly and points to the local launchd log;
+checks retry automatically every 15 min until the connection recovers.
 
 ## Setup
 
