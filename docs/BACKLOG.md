@@ -14,7 +14,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | ID | Title | Priority | Effort | Section | Done |
 |----|-------|----------|--------|---------|------|
 | OTW-01 | Docs-contract test in CI | P2 | S | Infra, tooling & docs | [ ] |
-| OTW-02 | Add a linter (ruff) | P2 | S | Infra, tooling & docs | [ ] |
+| OTW-02 | Add a linter (ruff) | P2 | S | Infra, tooling & docs | [x] |
 | OTW-03 | 403 alert VPN wording wrong on manual CI dispatch | P3 | S | Bugs | [ ] |
 
 ## 1. Critical — security & breakage

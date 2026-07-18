@@ -12,7 +12,8 @@ Stack: Python 3.9+ stdlib + `httpx`, no framework. Package `watcher/` (entry:
 
 ## Commands
 
-- Tests: `.venv/bin/python -m pytest -q` (currently 42 passing; no linter configured)
+- Lint: `.venv/bin/ruff check .`
+- Tests: `.venv/bin/python -m pytest -q` (currently 44 passing)
 - Manual run: `source .env && .venv/bin/python -m watcher --mode check --dry-run`
 - Telegram smoke test: `source .env && .venv/bin/python -m watcher --test-telegram`
 - Secrets are env-only: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — locally in a
@@ -42,7 +43,7 @@ Core facts agents need before editing:
 Use the lowest-risk check that proves the change — details in
 [docs/verification.md](docs/verification.md):
 
-- Any change: `.venv/bin/python -m pytest -q` must pass.
+- Any change: `.venv/bin/ruff check .` and `.venv/bin/python -m pytest -q` must pass.
 - Behavior changes: also a `--dry-run` check run; exercise the affected flow.
 - Real Telegram sends, state-file edits, launchd/plist changes, and workflow-cron
   changes require explicit user approval first.
@@ -70,7 +71,7 @@ Use the lowest-risk check that proves the change — details in
   venue mention) — loosening it needs user approval.
 - Times shown to the user are Paris time; state timestamps are Paris-local
   ISO-8601 (offset-aware, e.g. `+02:00`).
-- Keep dependencies minimal (`httpx`, `pytest`, `tomli` back-compat only);
+- Keep dependencies minimal (`httpx`, `pytest`, `ruff`, `tomli` back-compat only);
   Python 3.9 compatibility is required (the local Mac may run system Python).
 
 ## Safety
