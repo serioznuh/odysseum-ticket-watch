@@ -4,7 +4,7 @@
     "recovered:2026-07-18T1710": "2026-07-18T17:10:21.895829+02:00"
   },
   "error_alerted": true,
-  "failure_streak": 15,
+  "failure_streak": 16,
   "formats_seen": {},
   "last_check_ok": "2026-07-20T21:24:22.640750+02:00",
   "last_heartbeat": "2026-07-20T13:11:51.262489+02:00",
