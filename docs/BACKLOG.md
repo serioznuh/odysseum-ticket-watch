@@ -18,6 +18,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-03 | 403 alert VPN wording wrong on manual CI dispatch | P3 | S | Bugs | [ ] |
 | OTW-04 | Cinesa alert: include session times + booking link | P2 | S | Features | [ ] |
 | OTW-05 | Confirm Cinesa token behaviour with screen locked/asleep | P2 | S | Infra, tooling & docs | [ ] |
+| OTW-06 | Pathé failure_streak churns state; baseline can lose an alert | P2 | S | Bugs | [ ] |
 
 ## 1. Critical — security & breakage
 
@@ -37,6 +38,30 @@ to ever fire from a one-off dispatch (review note, PR #3).
 the launchd log pointer.
 **Done when:** the ERROR alert body differs between local and CI contexts, with
 a unit test covering both.
+
+### OTW-06 · Pathé failure_streak churns state; baseline can lose an alert
+**Priority:** P2 · **Effort:** S
+**Problem:** Found while fixing the same two bugs on the newer Cinesa half
+(PR #5 review). `watcher/__main__.py`'s top-level `st["failure_streak"]`
+(Pathé) increments unconditionally on every failed check with no cap, so a
+prolonged Pathé outage rewrites `state/state.json` — and triggers a
+`local-check.sh` commit+push — on every 15-min firing, same as the Cinesa bug
+fixed in PR #5. Separately, `state_mod.update_from_snapshot` runs
+unconditionally after the Telegram send loop regardless of whether any given
+finding's send succeeded, so a failed send for a one-shot alert (e.g.
+`NEW_LISTING`) can have its underlying state already advanced before delivery
+is confirmed, and never retry. Both predate PR #5; not fixed there since it
+only touched the Cinesa half.
+**Fix:** Mirror PR #5's fixes: cap `failure_streak` at
+`cfg.failure_streak_threshold` (nothing reads a larger value); gate
+`update_from_snapshot`'s alert-affecting fields on confirmed delivery the same
+way `update_from_cinesa`'s new `advance_imax` parameter does, for whichever
+Pathé finding kinds are genuinely one-shot dedup-keyed (not the sale-date/
+sessions fields that are meant to always reflect current truth).
+**Done when:** a simulated multi-firing Pathé outage leaves state byte-identical
+after the cap, and a failed send for a one-shot Pathé alert kind retries on the
+next run instead of being silently dropped — both with regression tests
+mirroring `tests/test_cinesa.py`'s equivalents.
 
 ## 3. Features
 
