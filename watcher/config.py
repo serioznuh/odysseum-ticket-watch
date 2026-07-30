@@ -12,6 +12,8 @@ try:
 except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 
+from .notify import DEFAULT_SILENT_KINDS
+
 
 @dataclass
 class Config:
@@ -129,7 +131,7 @@ def load_config(path: str | Path) -> Config:
         stale_check_hours=int(alerts.get("stale_check_hours", 72)),
         silent_kinds=[
             str(k).upper()
-            for k in alerts.get("silent_kinds", ["HEARTBEAT", "NEWS_LEAD", "RECOVERED"])
+            for k in alerts.get("silent_kinds", DEFAULT_SILENT_KINDS)
         ],
         cadence_baseline_hours=float(cadence.get("baseline_hours", 4.0)),
         cadence_within_week_hours=float(cadence.get("within_week_hours", 2.0)),
