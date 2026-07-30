@@ -4,6 +4,15 @@
     "recovered:2026-07-18T1710": "2026-07-18T17:10:21.895829+02:00",
     "recovered:2026-07-21T1019": "2026-07-21T10:19:22.048455+02:00"
   },
+  "cinesa": {
+    "day_count": 0,
+    "error_alerted": false,
+    "failure_streak": 0,
+    "horizon": null,
+    "imax_absent_streak": 0,
+    "imax_present": null,
+    "last_change": null
+  },
   "error_alerted": false,
   "failure_streak": 0,
   "formats_seen": {},
