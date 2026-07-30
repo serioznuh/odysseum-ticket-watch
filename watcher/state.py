@@ -89,13 +89,29 @@ def mark_sent(state: dict, key: str, now: datetime) -> None:
     state.setdefault("alerts", {})[key] = now.isoformat()
 
 
-def update_from_snapshot(state: dict, snap: detect.Snapshot, cfg: Any, now: datetime) -> None:
-    """Record the snapshot as the new baseline (call after alerts were handled)."""
+def update_from_snapshot(
+    state: dict,
+    snap: detect.Snapshot,
+    cfg: Any,
+    now: datetime,
+    advance_one_shot: bool = True,
+) -> None:
+    """Record the Pathé snapshot as the new baseline (call after alerting).
+
+    `advance_one_shot=False` freezes the one-shot alert baselines (`shows_seen`
+    and `formats_seen`) while still recording sales and current ticket
+    availability: the caller passes it when a NEW_LISTING or TICKETS_AVAILABLE
+    finding was generated but not delivered, so the next run raises it again.
+    """
+    if not advance_one_shot:
+        log.info(
+            "Pathé: one-shot alert not delivered — keeping the previous listing/format baselines"
+        )
     for show in snap.matched_shows:
         slug = show.get("slug", "")
         if not slug:
             continue
-        if slug not in state["shows_seen"]:
+        if advance_one_shot and slug not in state["shows_seen"]:
             state["shows_seen"].append(slug)
         if show.get("salesOpeningDatetime"):
             state["sales"][slug] = show["salesOpeningDatetime"]
@@ -104,13 +120,15 @@ def update_from_snapshot(state: dict, snap: detect.Snapshot, cfg: Any, now: date
         entry = snap.cinema_entries.get(slug) or {}
         if days:
             summary = detect.summarize_sessions(show, days)
-            fmts = set(state["formats_seen"].get(slug, [])) | set(summary["counts"])
-            state["formats_seen"][slug] = sorted(fmts)
+            if advance_one_shot:
+                fmts = set(state["formats_seen"].get(slug, [])) | set(summary["counts"])
+                state["formats_seen"][slug] = sorted(fmts)
             state["tickets_available"] = True
         elif entry.get("isBookable") or entry.get("bookable"):
-            fmt = detect.classify_format(show.get("title"), slug)
-            fmts = set(state["formats_seen"].get(slug, [])) | {fmt}
-            state["formats_seen"][slug] = sorted(fmts)
+            if advance_one_shot:
+                fmt = detect.classify_format(show.get("title"), slug)
+                fmts = set(state["formats_seen"].get(slug, [])) | {fmt}
+                state["formats_seen"][slug] = sorted(fmts)
             state["tickets_available"] = True
 
     future = []

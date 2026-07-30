@@ -31,6 +31,8 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Shared state** — `state/state.json`, committed to `main` by both halves
   (`[skip ci]`); serves as dedup memory and reminder bookkeeping. The Cinesa
   half writes only on real change, so the 15-min cadence causes no commit churn.
+  Failure streaks stop changing at their alert threshold, and Pathé's one-shot
+  listing/format baselines advance only after the corresponding alert is delivered.
 - **Code** — Python package `watcher/` (`pathe.py` and `cinesa.py` API clients,
   `cdp.py` browser token step, `news.py`, `detect.py`, `state.py`, `notify.py`
   Telegram, `config.py`, `__main__.py` CLI); config in `config.toml`; tests in
