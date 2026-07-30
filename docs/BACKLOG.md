@@ -18,7 +18,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-03 | 403 alert VPN wording wrong on manual CI dispatch | P3 | S | Bugs | [ ] |
 | OTW-04 | Cinesa alert: include session times + booking link | P2 | S | Features | [ ] |
 | OTW-05 | Confirm Cinesa token behaviour with screen locked/asleep | P2 | S | Infra, tooling & docs | [ ] |
-| OTW-06 | Pathé failure_streak churns state; baseline can lose an alert | P2 | S | Bugs | [ ] |
+| OTW-06 | Pathé failure_streak churns state; baseline can lose an alert | P2 | S | Bugs | [x] |
 
 ## 1. Critical — security & breakage
 
