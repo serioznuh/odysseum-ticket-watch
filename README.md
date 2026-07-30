@@ -164,7 +164,7 @@ before editing any working copy.
 | `news.extra_pages` | `[]` | Extra URLs scanned with the same phrase rules. |
 | `alerts.heartbeat_days` | `7` | 💤 "alive" summary when nothing was alerted for N days. `0` = off. |
 | `alerts.failure_streak_threshold` | `3` | ⚠️ after N consecutive failed Pathé checks. |
-| `alerts.stale_check_hours` | `72` | Cloud pass ⚠️ when the last successful check is older than this (local job died). `0` = off. |
+| `alerts.stale_check_hours` | `18` | Cloud pass ⚠️ when the last successful check is older than this (local job died, or the Mac stayed shut). `0` = off. Sized from measured gaps: 4 h median, 12.9 h worst ordinary overnight — below ~16 h, normal nights trip it. |
 | `alerts.silent_kinds` | `["HEARTBEAT", "NEWS_LEAD", "RECOVERED", "CINESA_TARGET_NO_IMAX"]` | Alert kinds delivered silently (no sound/vibration). Everything else buzzes; reminders and the 🟢 "open now" ping always buzz. |
 | `cadence.baseline_hours` | `4.0` | Check frequency while nothing is announced. |
 | `cadence.within_week_hours` | `2.0` | …when the sale opening is ≤ 7 days away. |
