@@ -49,6 +49,12 @@ A single-user Telegram watcher covering **two independent targets**:
   captures the frontmost app and re-activates it after the tab is created
   (doing it any earlier just lets Chrome take focus again). Measured focus
   loss: 0–0.15 s per refresh, twice a day.
+- The token is refreshed **3 h before expiry**, not at it, and a failed refresh
+  falls back to the token still in hand. The GUI step is the only part a locked
+  or sleeping Mac can block, so one blocked attempt must not take the half
+  down — it now has ~12 firings to succeed, backed off to 30 min apart so a
+  long lock does not mean a Chrome launch every 15 min. A token that is
+  actually dead (or 401-rejected) still fails loudly rather than going quiet.
 - Verified IDs: film `HO00003228`, site `032` (Diagonal Mar), IMAX showtime
   attribute `0000000086`.
 - **The booking wall is fixed, not rolling** — observed 2026-07-29→08-25

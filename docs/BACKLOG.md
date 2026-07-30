@@ -17,7 +17,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-02 | Add a linter (ruff) | P2 | S | Infra, tooling & docs | [x] |
 | OTW-03 | 403 alert VPN wording wrong on manual CI dispatch | P3 | S | Bugs | [ ] |
 | OTW-04 | Cinesa alert: include session times + booking link | P2 | S | Features | [ ] |
-| OTW-05 | Cinesa token refresh when the Mac is asleep/locked | P2 | S | Infra, tooling & docs | [ ] |
+| OTW-05 | Confirm Cinesa token behaviour with screen locked/asleep | P2 | S | Infra, tooling & docs | [ ] |
 
 ## 1. Critical — security & breakage
 
@@ -59,19 +59,23 @@ extra call still leaves the base alert intact.
 
 ## 5. Infra, tooling & docs
 
-### OTW-05 · Cinesa token refresh when the Mac is asleep/locked
+### OTW-05 · Confirm Cinesa token behaviour with the screen locked / asleep
 **Priority:** P2 · **Effort:** S
-**Problem:** The token step (`watcher/cdp.py`) needs a real Chrome window, so it
-needs an active GUI session. Behaviour with the screen locked, or on a firing
-that coalesces right after wake, is untested — worst case the Cinesa half goes
-blind until the next unlock and only says so after
-`alerts.failure_streak_threshold` failures (~45 min).
-**Fix:** Confirm what actually happens locked vs asleep. If refresh fails there,
-refresh *proactively* while the token is still valid (e.g. under ~2 h of life
-left) so a lock window is survivable, and make the ⚠️ text name the cause.
-**Done when:** the locked-screen behaviour is documented in
-docs/current-state.md, and a token expiring during a lock no longer blinds the
-Cinesa half.
+**Problem:** The token step (`watcher/cdp.py`) needs a real Chrome window and so
+an active GUI session. The *resilience* half of this item is done: the token now
+refreshes `cinesa.token_refresh_before_hours` (3 h) before expiry and falls back
+to the cached token when a refresh fails, so a blocked attempt no longer blinds
+the Cinesa half (`watcher/cinesa.py::get_token`, tests in `tests/test_cinesa.py`).
+What is still unverified is the underlying question: **does Chrome actually
+launch and clear Cloudflare while the screen is locked?** Testing it means
+locking the owner's Mac, so it was not done unprompted.
+**Fix:** With the owner's agreement, lock the screen and run
+`.venv/bin/python -c "from watcher import cinesa; from watcher.config import
+load_config; print(len(cinesa.get_token(load_config('config.toml'), force=True)))"`
+via a delayed shell, then read the result on unlock. Asleep needs no test —
+launchd does not fire at all, and the firing coalesces on wake.
+**Done when:** the locked-screen result is recorded in docs/current-state.md,
+and if it fails there, the ⚠️ guidance text names "unlock the Mac" explicitly.
 
 ### OTW-01 · Docs-contract test in CI
 **Priority:** P2 · **Effort:** S

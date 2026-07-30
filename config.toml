@@ -105,6 +105,12 @@ target_dates = ["2026-08-26", "2026-08-27"]
 # Page loaded purely to mint a token; any Cinesa page works.
 token_url = "https://www.cinesa.es/peliculas/la-odisea/HO00003228/"
 api_base = "https://vwc.cinesa.es/WSVistaWebClient"
+# Refresh the 12 h token once it has less than this much life left, rather than
+# at expiry. The token step is the only part needing a GUI, so it is the only
+# part a locked/sleeping Mac can block; refreshing early turns one blocked
+# attempt into a multi-hour retry window, and a failed refresh keeps using the
+# token still in hand instead of taking the Cinesa half down.
+token_refresh_before_hours = 3.0
 # Both live under .cache/ and are git-ignored: the token is a credential.
 token_cache = ".cache/cinesa-token.json"
 chrome_profile = ".cache/chrome-profile"

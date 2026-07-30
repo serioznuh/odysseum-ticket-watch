@@ -7,7 +7,9 @@ import json
 import time
 from datetime import datetime
 
-from watcher import __main__ as main, cinesa, detect, notify, state as state_mod
+import pytest
+
+from watcher import __main__ as main, cdp, cinesa, detect, notify, state as state_mod
 from watcher.detect import CinesaSnapshot
 from watcher.state import DEFAULT_STATE
 
@@ -139,6 +141,97 @@ def test_saved_token_is_not_world_readable(tmp_path):
     path = tmp_path / "token.json"
     cinesa.save_token(path, make_jwt(time.time() + 3600))
     assert path.stat().st_mode & 0o077 == 0
+
+
+# ------------------------------------------------- proactive refresh (OTW-05)
+
+class TokenCfg:
+    """Only the fields get_token touches."""
+
+    cinesa_token_url = "https://www.cinesa.es/"
+    cinesa_chrome_path = "/nonexistent/Chrome"
+    cinesa_chrome_profile = "/tmp/profile"
+    cinesa_token_refresh_before_hours = 3.0
+
+    def __init__(self, cache):
+        self.cinesa_token_cache = str(cache)
+
+
+def test_fresh_token_is_reused_without_launching_chrome(tmp_path, monkeypatch):
+    cfg = TokenCfg(tmp_path / "t.json")
+    token = make_jwt(time.time() + 10 * 3600)
+    cinesa.save_token(cfg.cinesa_token_cache, token)
+    monkeypatch.setattr(
+        cinesa, "mint_token", lambda c: pytest.fail("must not launch Chrome")
+    )
+    assert cinesa.get_token(cfg) == token
+
+
+def test_refresh_starts_before_expiry_not_at_it(tmp_path, monkeypatch):
+    """The whole point of OTW-05: start trying while hours of life remain."""
+    cfg = TokenCfg(tmp_path / "t.json")
+    old = make_jwt(time.time() + 2 * 3600)          # inside the 3 h window
+    cinesa.save_token(cfg.cinesa_token_cache, old, last_attempt=0)
+    new = make_jwt(time.time() + 12 * 3600)
+    monkeypatch.setattr(cinesa, "mint_token", lambda c: new)
+
+    assert cinesa.get_token(cfg) == new
+    assert cinesa.load_cached_token(cfg.cinesa_token_cache, time.time()) == new
+
+
+def test_failed_refresh_falls_back_to_the_valid_cached_token(tmp_path, monkeypatch):
+    """A locked Mac must not take the Cinesa half down while a good token is
+    still in hand — this is the bug the proactive window exists to remove."""
+    cfg = TokenCfg(tmp_path / "t.json")
+    good = make_jwt(time.time() + 2 * 3600)
+    cinesa.save_token(cfg.cinesa_token_cache, good, last_attempt=0)
+
+    def boom(c):
+        raise cdp.CDPError("Chrome DevTools endpoint never came up")
+
+    monkeypatch.setattr(cinesa, "mint_token", boom)
+    assert cinesa.get_token(cfg) == good          # still works
+    # The attempt is recorded, so the next firing backs off instead of
+    # launching Chrome again 15 minutes later.
+    assert cinesa.read_cache(cfg.cinesa_token_cache)["last_refresh_attempt"] > 0
+
+
+def test_backoff_prevents_a_chrome_launch_every_firing(tmp_path, monkeypatch):
+    cfg = TokenCfg(tmp_path / "t.json")
+    good = make_jwt(time.time() + 2 * 3600)
+    cinesa.save_token(cfg.cinesa_token_cache, good, last_attempt=time.time() - 60)
+    monkeypatch.setattr(
+        cinesa, "mint_token", lambda c: pytest.fail("should have backed off")
+    )
+    assert cinesa.get_token(cfg) == good
+
+
+def test_dead_token_still_fails_loudly(tmp_path, monkeypatch):
+    """No fallback once the token is actually unusable — going quietly blind
+    would be worse than a ⚠️."""
+    cfg = TokenCfg(tmp_path / "t.json")
+    cinesa.save_token(cfg.cinesa_token_cache, make_jwt(time.time() - 3600))
+
+    def boom(c):
+        raise cdp.CDPError("Chrome not found")
+
+    monkeypatch.setattr(cinesa, "mint_token", boom)
+    with pytest.raises(cdp.CDPError):
+        cinesa.get_token(cfg)
+
+
+def test_rejected_token_never_falls_back_to_itself(tmp_path, monkeypatch):
+    """force=True follows a 401: the cached token is known bad, so reusing it
+    would just loop."""
+    cfg = TokenCfg(tmp_path / "t.json")
+    cinesa.save_token(cfg.cinesa_token_cache, make_jwt(time.time() + 6 * 3600))
+
+    def boom(c):
+        raise cdp.CDPError("no")
+
+    monkeypatch.setattr(cinesa, "mint_token", boom)
+    with pytest.raises(cdp.CDPError):
+        cinesa.get_token(cfg, force=True)
 
 
 # ------------------------------------------------------------------- detection

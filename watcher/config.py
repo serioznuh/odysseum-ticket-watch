@@ -59,6 +59,7 @@ class Config:
     cinesa_api_base: str
     cinesa_token_url: str
     cinesa_token_cache: str
+    cinesa_token_refresh_before_hours: float
     cinesa_chrome_path: str
     cinesa_chrome_profile: str
     # [general]
@@ -148,6 +149,9 @@ def load_config(path: str | Path) -> Config:
         ),
         cinesa_token_url=str(cinesa.get("token_url", cinesa.get("page_url", ""))),
         cinesa_token_cache=str(cinesa.get("token_cache", ".cache/cinesa-token.json")),
+        cinesa_token_refresh_before_hours=float(
+            cinesa.get("token_refresh_before_hours", 3.0)
+        ),
         cinesa_chrome_path=str(
             cinesa.get(
                 "chrome_path", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
