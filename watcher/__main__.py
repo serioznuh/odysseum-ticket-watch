@@ -82,8 +82,9 @@ def build_cinesa_error_finding(cfg, streak: int, error: str, key: str) -> Findin
     if "Chrome" in error or "CDP" in error or "challenge" in error.lower():
         guidance = (
             "The token step could not drive Chrome. Check that Google Chrome is"
-            " installed at the configured path and that the Mac is unlocked;"
-            " Cloudflare only clears for a real browser window."
+            " installed at the configured path and that the Mac is logged in and"
+            " awake — a locked screen is fine (verified), but a login window or"
+            " system sleep leaves no GUI session for a real browser window."
         )
     else:
         guidance = "Possible causes: Cinesa API change, token rejected, or a network outage."

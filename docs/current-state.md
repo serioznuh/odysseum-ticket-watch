@@ -51,11 +51,18 @@ A single-user Telegram watcher covering **two independent targets**:
   captures the frontmost app and re-activates it after the tab is created
   (doing it any earlier just lets Chrome take focus again). Measured focus
   loss: 0–0.15 s per refresh, twice a day.
+- **A locked screen does not block the token step** — measured on the owner's
+  Mac: eight mints over 13 min while locked (one with the display on, seven
+  with it asleep, on AC) each returned a fresh ~12 h token in 2.3 s, against a
+  2.5 s unlocked control. Neither the lock nor display sleep throttles the
+  challenge. What does block it is losing the GUI session: system sleep, or a
+  login window. Sleep is self-correcting — the LaunchAgent does not fire while
+  asleep and the missed firing coalesces on wake. The Mac has one internal
+  display and so no clamshell mode, meaning a closed lid is simply sleep.
 - The token is refreshed **3 h before expiry**, not at it, and a failed refresh
-  falls back to the token still in hand. The GUI step is the only part a locked
-  or sleeping Mac can block, so one blocked attempt must not take the half
-  down — it now has ~12 firings to succeed, backed off to 30 min apart so a
-  long lock does not mean a Chrome launch every 15 min. A token that is
+  falls back to the token still in hand, so one blocked attempt cannot take the
+  half down — it has ~12 firings to succeed, backed off to 30 min apart so a
+  long outage does not mean a Chrome launch every 15 min. A token that is
   actually dead (or 401-rejected) still fails loudly rather than going quiet.
 - Verified IDs: film `HO00003228`, site `032` (Diagonal Mar), IMAX showtime
   attribute `0000000086`.
