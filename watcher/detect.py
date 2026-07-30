@@ -259,7 +259,7 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                 findings.append(
                     Finding(
                         kind="TICKETS_AVAILABLE",
-                        key="tickets:%s:%s" % (slug, ",".join(sorted(new_fmts))),
+                        key="tickets:{}:{}".format(slug, ",".join(sorted(new_fmts))),
                         confidence="high",
                         title="Tickets are bookable NOW",
                         lines=lines,
@@ -362,34 +362,39 @@ def analyze_cinesa(snap: CinesaSnapshot, state: dict, cfg: Any, now: datetime) -
                     lines=[
                         f"Film: {cfg.cinesa_film_title}",
                         f"Cinema: {where}",
-                        f"IMAX is scheduled again on {len(imax)} day(s),"
-                        f" {min(imax)} → {max(imax)}.",
+                        (
+                            f"IMAX is scheduled again on {len(imax)} day(s),"
+                            f" {min(imax)} → {max(imax)}."
+                        ),
                         "Confidence: HIGH — Cinesa/Vista booking API.",
                     ],
                     url=cfg.cinesa_page_url,
                 )
             )
-        elif not imax and was_present:
-            # One confirmation required before crying wolf (see streak below).
-            if cin.get("imax_absent_streak", 0) >= 1:
-                findings.append(
-                    Finding(
-                        kind="CINESA_IMAX_GONE",
-                        key=f"cinesa_imax_gone:{now:%Y-%m-%d}",
-                        confidence="high",
-                        title="IMAX sessions have disappeared",
-                        lines=[
-                            f"Film: {cfg.cinesa_film_title}",
-                            f"Cinema: {where}",
+        # One confirmation required before crying wolf (see streak below).
+        elif not imax and was_present and cin.get("imax_absent_streak", 0) >= 1:
+            findings.append(
+                Finding(
+                    kind="CINESA_IMAX_GONE",
+                    key=f"cinesa_imax_gone:{now:%Y-%m-%d}",
+                    confidence="high",
+                    title="IMAX sessions have disappeared",
+                    lines=[
+                        f"Film: {cfg.cinesa_film_title}",
+                        f"Cinema: {where}",
+                        (
                             f"The film still has {len(days)} bookable day(s)"
-                            f" ({days[0]['date']} → {days[-1]['date']}) but none in IMAX.",
+                            f" ({days[0]['date']} → {days[-1]['date']}) but none in IMAX."
+                        ),
+                        (
                             "It has probably been moved off the IMAX screen — a later"
-                            " IMAX booking may no longer be possible.",
-                            "Confidence: HIGH — confirmed over two consecutive checks.",
-                        ],
-                        url=cfg.cinesa_page_url,
-                    )
+                            " IMAX booking may no longer be possible."
+                        ),
+                        "Confidence: HIGH — confirmed over two consecutive checks.",
+                    ],
+                    url=cfg.cinesa_page_url,
                 )
+            )
 
     return findings
 

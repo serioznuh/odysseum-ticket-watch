@@ -6,10 +6,13 @@ import base64
 import json
 import time
 from datetime import datetime
+from typing import ClassVar
 
 import pytest
 
-from watcher import __main__ as main, cdp, cinesa, detect, notify, state as state_mod
+from watcher import __main__ as main
+from watcher import cdp, cinesa, detect, notify
+from watcher import state as state_mod
 from watcher.detect import CinesaSnapshot
 from watcher.state import DEFAULT_STATE
 
@@ -29,7 +32,7 @@ class Cfg:
     cinesa_site_name = "Cinesa Diagonal Mar"
     cinesa_site_city = "Barcelona"
     cinesa_imax_attribute_id = IMAX
-    cinesa_target_dates = ["2026-08-26", "2026-08-27"]
+    cinesa_target_dates: ClassVar = ["2026-08-26", "2026-08-27"]
 
 
 def fresh_state() -> dict:

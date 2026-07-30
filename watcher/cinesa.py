@@ -161,7 +161,7 @@ def get_token(cfg: Any, *, force: bool = False) -> str:
 
     try:
         token = mint_token(cfg)
-    except Exception as e:  # noqa: BLE001 — any minting failure is handled the same way
+    except Exception as e:
         if cached and not force:
             # Still holding a usable token: stay up and try again later. Only a
             # token that is actually dead (or rejected) may fail the run.

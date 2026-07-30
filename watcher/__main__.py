@@ -18,7 +18,8 @@ import re
 import sys
 from datetime import datetime, timedelta
 
-from . import __version__, cinesa, detect, news, notify, pathe, state as state_mod
+from . import __version__, cinesa, detect, news, notify, pathe
+from . import state as state_mod
 from .config import load_config
 from .detect import TZ_PARIS, Finding
 
@@ -54,8 +55,10 @@ def build_error_finding(cfg, streak: int, error: str, now: datetime) -> Finding:
             f"{streak} consecutive checks have failed.",
             f"Last error: {summary}",
             guidance,
-            "The watcher is currently BLIND. Local checks retry every 15 min; details:"
-            " ~/.ticket-watch/logs/launchd.log",
+            (
+                "The watcher is currently BLIND. Local checks retry every 15 min; details:"
+                " ~/.ticket-watch/logs/launchd.log"
+            ),
         ],
         url=cfg.film_page_url,
     )
@@ -93,8 +96,10 @@ def build_cinesa_error_finding(cfg, streak: int, error: str, key: str) -> Findin
             f"{streak} consecutive Cinesa checks have failed.",
             f"Last error: {summary}",
             guidance,
-            f"{cfg.cinesa_film_title} @ {cfg.cinesa_site_name} is NOT being watched"
-            " right now. The Pathé half is unaffected.",
+            (
+                f"{cfg.cinesa_film_title} @ {cfg.cinesa_site_name} is NOT being watched"
+                " right now. The Pathé half is unaffected."
+            ),
         ],
         url=cfg.cinesa_page_url,
     )
@@ -133,8 +138,10 @@ def build_heartbeat(cfg, snap: detect.Snapshot, st: dict, now: datetime) -> Find
         lines += [
             "",
             f"— {cfg.cinesa_film_title} @ {cfg.cinesa_site_name} —",
-            f"Bookable through: {cin.get('horizon') or 'unknown'}"
-            f" ({cin.get('day_count') or 0} days)",
+            (
+                f"Bookable through: {cin.get('horizon') or 'unknown'}"
+                f" ({cin.get('day_count') or 0} days)"
+            ),
             "IMAX: " + {True: "scheduled", False: "NOT scheduled"}.get(imax, "unknown"),
             "Watching dates: " + (", ".join(cfg.cinesa_target_dates) or "none"),
         ]
@@ -244,7 +251,7 @@ def run(argv: list[str] | None = None) -> int:
         try:
             if pathe_due:
                 snap = pathe.fetch_snapshot(client, cfg)
-        except Exception as e:  # noqa: BLE001 — any fetch failure is handled the same way
+        except Exception as e:
             log.exception("Pathé check failed")
             st["failure_streak"] = st.get("failure_streak", 0) + 1
             # With adaptive cadence, retries come every 15 min — require both
@@ -276,7 +283,7 @@ def run(argv: list[str] | None = None) -> int:
             try:
                 items = news.fetch_news_items(client, cfg)
                 findings.extend(detect.analyze_news(items, cfg, st, now))
-            except Exception:  # noqa: BLE001 — news layer must never kill the run
+            except Exception:
                 log.exception("news check failed (non-fatal)")
 
         csnap: detect.CinesaSnapshot | None = None
@@ -285,7 +292,7 @@ def run(argv: list[str] | None = None) -> int:
             cin = st.setdefault("cinesa", {})
             try:
                 csnap = cinesa.fetch_snapshot(cfg)
-            except Exception as e:  # noqa: BLE001 — mirrors the Pathé handling
+            except Exception as e:
                 log.exception("Cinesa check failed")
                 cin["failure_streak"] = cin.get("failure_streak", 0) + 1
                 if cin["failure_streak"] >= cfg.failure_streak_threshold and not cin.get(
@@ -357,8 +364,11 @@ def run(argv: list[str] | None = None) -> int:
                 title="No successful Pathé check recently",
                 lines=[
                     f"Last successful check: {detect.fmt_dt(detect.parse_iso(st.get('last_check_ok')))}.",
-                    f"Threshold: {cfg.stale_check_hours}h — the daily check job seems to have stopped"
-                    " (machine off/asleep for days, launchd job unloaded, or git push failing).",
+                    (
+                        f"Threshold: {cfg.stale_check_hours}h — the daily check job seems to"
+                        " have stopped (machine off/asleep for days, launchd job unloaded,"
+                        " or git push failing)."
+                    ),
                     "Cloud reminders still run, but new Pathé signals are NOT being watched.",
                 ],
                 url=cfg.film_page_url,

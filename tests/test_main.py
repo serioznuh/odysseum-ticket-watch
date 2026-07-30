@@ -7,7 +7,6 @@ from datetime import datetime
 from watcher import __main__ as cli
 from watcher.detect import TZ_PARIS
 
-
 NOW = datetime(2026, 7, 18, 14, 53, tzinfo=TZ_PARIS)
 
 

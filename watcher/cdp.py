@@ -59,7 +59,7 @@ class _WebSocket:
             ).encode()
         )
         expect = base64.b64encode(
-            hashlib.sha1((key + WS_GUID).encode()).digest()  # noqa: S324 — protocol-mandated
+            hashlib.sha1((key + WS_GUID).encode()).digest()
         ).decode()
 
         buf = b""
@@ -157,7 +157,7 @@ def _frontmost_app() -> str | None:
     """Bundle path of the app that currently has focus, if it can be read."""
     try:
         asn = subprocess.run(
-            ["lsappinfo", "front"], capture_output=True, text=True, timeout=5
+            ["lsappinfo", "front"], capture_output=True, text=True, timeout=5, check=True
         ).stdout.strip()
         if not asn:
             return None
@@ -166,6 +166,7 @@ def _frontmost_app() -> str | None:
             capture_output=True,
             text=True,
             timeout=5,
+            check=True,
         ).stdout
         path = out.partition("=")[2].strip().strip('"')
         return path or None
@@ -182,6 +183,7 @@ def _restore_focus(bundle_path: str | None) -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=10,
+            check=True,
         )
 
 
@@ -217,7 +219,11 @@ def _terminate_by_profile(profile_dir: str) -> None:
     marker = f"--user-data-dir={profile_dir}"
     try:
         listing = subprocess.run(
-            ["ps", "-Ao", "pid=,command="], capture_output=True, text=True, timeout=15
+            ["ps", "-Ao", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return
@@ -233,7 +239,7 @@ def _terminate_by_profile(profile_dir: str) -> None:
 
 def _devtools(url: str, method: str = "GET", timeout: float = 5.0) -> Any:
     req = urllib.request.Request(url, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 — localhost only
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
 
