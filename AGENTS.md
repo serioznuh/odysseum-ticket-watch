@@ -33,8 +33,30 @@ Core facts agents need before editing:
   and never calls Pathé (a manual `check` dispatch would, and gets 403'd).
 - Both halves **commit `state/state.json` to `main`** (`[skip ci]`). Always
   `git pull --rebase` before committing; never rewrite pushed history.
-- The adaptive-cadence guard in `scripts/local-check.sh` must stay **before**
-  any network or git activity — idle firings are zero-network no-ops.
+- The adaptive-cadence guard in `scripts/local-check.sh` governs the **Pathé +
+  news half only** and must stay before its network/git activity. The Cinesa
+  half runs on every firing by design.
+
+### Cinesa half (second target)
+
+- `www.cinesa.es` is behind a **Cloudflare managed challenge** (403 to every
+  plain client). `vwc.cinesa.es/WSVistaWebClient` — the actual data API — is
+  **not** protected: plain `httpx` works, it only needs a bearer token.
+- That token lives 12 h and is only minted by the challenged host, so
+  `cdp.py` drives a **real headed Chrome** (offscreen, throwaway profile) to
+  read it. Headless is challenged and never settles — verified, don't "fix" it
+  by switching to headless.
+- **Never add stealth plugins, TLS impersonation, cookie replay or CAPTCHA
+  solving.** The design depends on a real browser clearing the challenge on its
+  own merits. If that stops working, the watcher must fail loudly and the
+  problem comes back to the user — escalating into evasion is out of bounds.
+- The token is a **credential**: it lives in git-ignored `.cache/`, mode 0600,
+  and must never reach `state/state.json`, logs or commits.
+- Cinesa state lives under the `cinesa` key and is written **only on real
+  change**. Never add a per-run timestamp there: at 15-min cadence it would
+  make `local-check.sh` commit and push ~96 times a day.
+- An **empty** Cinesa snapshot is treated as a blip, never as evidence — it
+  must not flip `imax_present` or fire an "IMAX gone" alert.
 - Alerts are precision-first: the user rejects noisy notifications. Bad alerts
   get fixed the same day; when in doubt, drop the alert rather than send it.
 
@@ -61,9 +83,9 @@ Use the lowest-risk check that proves the change — details in
 
 ## Conventions
 
-- Alert dedup is keyed on `Finding.key` (values like `sale:…`, `new_show:…`),
-  not `kind`. Changing a key's format re-sends every past alert of that shape —
-  never change it without a state migration.
+- Alert dedup is keyed on `Finding.key` (values like `sale:…`, `new_show:…`,
+  `cinesa_target:…`), not `kind`. Changing a key's format re-sends every past
+  alert of that shape — never change it without a state migration.
 - Alert kinds buzz by default; only kinds in `alerts.silent_kinds` (default
   HEARTBEAT, NEWS_LEAD, RECOVERED) are silent. A new non-urgent kind must be
   added there or it will notify loudly.

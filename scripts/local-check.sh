@@ -1,12 +1,14 @@
 #!/bin/bash
-# Pathé check, run from a residential IP (GitHub's datacenter IPs are
-# blocked by Akamai). Fired by the com.odysseum.ticket-watch LaunchAgent
-# every 15 min; safe to run manually too.
+# Pathé + Cinesa check, run from a residential IP (both chains block or
+# challenge datacenter IPs). Fired by the com.odysseum.ticket-watch
+# LaunchAgent every 15 min; safe to run manually too.
 #
-# Order matters: the adaptive guard runs FIRST, so idle firings touch the
-# network zero times (the guard only needs locally-written state). git sync
-# happens only on runs that actually checked, or that have unpushed backlog
-# left by an earlier offline run.
+# The adaptive guard still runs FIRST and still governs the Pathé + news
+# half (≈4 h baseline). The Cinesa half runs on EVERY firing: it is one
+# small call to an API that is neither bot-gated nor rate-limited, and the
+# point is catching a schedule release within minutes. It writes state only
+# when the schedule actually changes, so unchanged firings stay commit-free
+# and the git sync below still only fires on real news.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

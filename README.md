@@ -15,6 +15,13 @@ and it can watch any film/cinema on pathe.fr by editing [config.toml](config.tom
 - 📰 **News lead** — early press hint via Google News (low/medium confidence, strictly filtered — see configuration)
 - ⚠️ watcher failure / ✅ recovery / 💤 weekly "still alive" heartbeat
 
+From the second watch target (*La odisea* in IMAX at **Cinesa Diagonal Mar**,
+Barcelona — see [Cinesa target](#cinesa-target)):
+
+- 🎫 **A watched date opened in IMAX** — one of your `target_dates` is now bookable with IMAX on it
+- 🗓️ *(silent)* that date opened, but **without** IMAX — you still get the loud 🎫 if IMAX appears for it later
+- 📉 **IMAX disappeared** (confirmed over two checks) / 📈 **IMAX is back**
+
 Every alert carries the source URL, detected format (IMAX 70 mm / IMAX /
 other), cinema and a confidence level. Each distinct finding is sent **once**,
 deduplicated forever via `state/state.json`. News leads, heartbeats and
@@ -42,6 +49,31 @@ Safety nets so it never dies silently: ⚠️ if the local check hasn't succeede
 for 72 h, ⚠️ after 3 consecutive Pathé failures, 💤 weekly heartbeat. A 403
 failure calls out VPN/proxy egress explicitly and points to the local launchd log;
 checks retry automatically every 15 min until the connection recovers.
+
+### Cinesa target
+
+The second target watches a film that is **already showing**, so there is no
+"sale opening" to wait for: what matters is the booking calendar being extended.
+Cinesa loads its schedule up to a fixed wall and then releases more dates in
+batches (observed: the far edge stayed on 2026-08-25 while the near edge rolled
+forward a day), so you name the dates you actually want and only those buzz.
+
+Cinesa runs Vista's Omnia/Connect platform, split across two hosts:
+
+| Host | Status | Role |
+|---|---|---|
+| `www.cinesa.es` | Cloudflare managed challenge (403 to any plain client) | mints the 12 h API token |
+| `vwc.cinesa.es/WSVistaWebClient` | open — plain `httpx`, clean JSON | every actual check |
+
+Because the data API is not bot-protected, checks are cheap and run on **every**
+15-min firing — no need to guess when Cinesa publishes. Only the token needs a
+browser: [watcher/cdp.py](watcher/cdp.py) drives a **real, headed** Chrome (offscreen,
+throwaway profile, ~3 s) twice a day. Headless is challenged and never settles, so
+headed is required — and no stealth tooling or challenge-solving is used: if Chrome
+stops clearing the challenge itself, the watcher raises ⚠️ rather than working around it.
+
+**Requirements:** Google Chrome installed, and the Mac awake and logged in when a
+token refresh is due (a real browser window must be able to open).
 
 ## Setup
 
@@ -133,12 +165,24 @@ before editing any working copy.
 | `alerts.heartbeat_days` | `7` | 💤 "alive" summary when nothing was alerted for N days. `0` = off. |
 | `alerts.failure_streak_threshold` | `3` | ⚠️ after N consecutive failed Pathé checks. |
 | `alerts.stale_check_hours` | `72` | Cloud pass ⚠️ when the last successful check is older than this (local job died). `0` = off. |
-| `alerts.silent_kinds` | `["HEARTBEAT", "NEWS_LEAD", "RECOVERED"]` | Alert kinds delivered silently (no sound/vibration). Everything else buzzes; reminders and the 🟢 "open now" ping always buzz. |
+| `alerts.silent_kinds` | `["HEARTBEAT", "NEWS_LEAD", "RECOVERED", "CINESA_TARGET_NO_IMAX"]` | Alert kinds delivered silently (no sound/vibration). Everything else buzzes; reminders and the 🟢 "open now" ping always buzz. |
 | `cadence.baseline_hours` | `4.0` | Check frequency while nothing is announced. |
 | `cadence.within_week_hours` | `2.0` | …when the sale opening is ≤ 7 days away. |
 | `cadence.final_48h_hours` | `0.5` | …when it's ≤ 48 h away. |
 | `cadence.opening_window_minutes` | `15` | …from 4 h before to 6 h after the opening (every launchd firing). |
 | `cadence.after_tickets_hours` | `6.0` | …once tickets are bookable (still watching for new waves/formats). |
+| `cinesa.enabled` | `false` | Master switch for the Cinesa Diagonal Mar target. `false` skips it entirely — no API call, no browser. |
+| `cinesa.film_id` | *(required when enabled)* | Vista HO code, straight from the cinesa.es film URL (e.g. `HO00003228`). |
+| `cinesa.site_id` | *(required when enabled)* | Vista site id. Diagonal Mar is `032`; the full list is in `/api/omnia/v1/pageList?friendly=/cines/&properties=vistaCinema`. |
+| `cinesa.film_title`, `cinesa.site_name`, `cinesa.site_city` | ids, `""` | Display names used in alerts. |
+| `cinesa.page_url` | `https://www.cinesa.es/` | Link shown in alerts. |
+| `cinesa.target_dates` | `[]` | `YYYY-MM-DD` dates to watch. Each buzzes 🎫 once it is bookable **with IMAX**; bookable without IMAX is reported silently 🗓️. Invalid dates fail at startup. |
+| `cinesa.imax_attribute_id` | `"0000000086"` | Vista showtime attribute marking an IMAX session. |
+| `cinesa.token_url` | `page_url` | Page loaded purely to mint a token; any Cinesa page works. |
+| `cinesa.api_base` | `https://vwc.cinesa.es/WSVistaWebClient` | The open data host. |
+| `cinesa.token_cache` | `.cache/cinesa-token.json` | Cached 12 h token, mode 0600. **Git-ignored — it is a credential.** |
+| `cinesa.chrome_path` | macOS Chrome | Chrome binary used for the token step. |
+| `cinesa.chrome_profile` | `.cache/chrome-profile` | Throwaway profile — never your own Chrome profile. |
 | `general.state_file` | `state/state.json` | Dedup/reminder state location. |
 
 Secrets are env-only (never in config.toml): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.

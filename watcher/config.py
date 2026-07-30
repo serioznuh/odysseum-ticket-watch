@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 try:
@@ -45,6 +46,21 @@ class Config:
     cadence_final_48h_hours: float
     cadence_opening_window_minutes: float
     cadence_after_tickets_hours: float
+    # [cinesa]
+    cinesa_enabled: bool
+    cinesa_film_id: str
+    cinesa_film_title: str
+    cinesa_page_url: str
+    cinesa_site_id: str
+    cinesa_site_name: str
+    cinesa_site_city: str
+    cinesa_imax_attribute_id: str
+    cinesa_target_dates: list[str]
+    cinesa_api_base: str
+    cinesa_token_url: str
+    cinesa_token_cache: str
+    cinesa_chrome_path: str
+    cinesa_chrome_profile: str
     # [general]
     state_file: str
     # environment
@@ -61,11 +77,26 @@ def load_config(path: str | Path) -> Config:
     alerts = raw.get("alerts", {})
     cadence = raw.get("cadence", {})
     general = raw.get("general", {})
+    cinesa = raw.get("cinesa", {})
 
     if "primary_slug" not in film:
         raise ValueError("config: [film] primary_slug is required")
     if "slug" not in cinema:
         raise ValueError("config: [cinema] slug is required")
+
+    cinesa_enabled = bool(cinesa.get("enabled", False))
+    if cinesa_enabled:
+        for required in ("film_id", "site_id"):
+            if not cinesa.get(required):
+                raise ValueError(f"config: [cinesa] {required} is required when enabled")
+    target_dates = [str(d) for d in cinesa.get("target_dates", [])]
+    for value in target_dates:
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            raise ValueError(
+                f"config: [cinesa] target_dates entry {value!r} is not YYYY-MM-DD"
+            ) from None
 
     return Config(
         primary_slug=film["primary_slug"],
@@ -103,6 +134,28 @@ def load_config(path: str | Path) -> Config:
         cadence_final_48h_hours=float(cadence.get("final_48h_hours", 0.5)),
         cadence_opening_window_minutes=float(cadence.get("opening_window_minutes", 15)),
         cadence_after_tickets_hours=float(cadence.get("after_tickets_hours", 6.0)),
+        cinesa_enabled=cinesa_enabled,
+        cinesa_film_id=str(cinesa.get("film_id", "")),
+        cinesa_film_title=str(cinesa.get("film_title", cinesa.get("film_id", ""))),
+        cinesa_page_url=str(cinesa.get("page_url", "https://www.cinesa.es/")),
+        cinesa_site_id=str(cinesa.get("site_id", "")),
+        cinesa_site_name=str(cinesa.get("site_name", cinesa.get("site_id", ""))),
+        cinesa_site_city=str(cinesa.get("site_city", "")),
+        cinesa_imax_attribute_id=str(cinesa.get("imax_attribute_id", "0000000086")),
+        cinesa_target_dates=target_dates,
+        cinesa_api_base=str(
+            cinesa.get("api_base", "https://vwc.cinesa.es/WSVistaWebClient")
+        ),
+        cinesa_token_url=str(cinesa.get("token_url", cinesa.get("page_url", ""))),
+        cinesa_token_cache=str(cinesa.get("token_cache", ".cache/cinesa-token.json")),
+        cinesa_chrome_path=str(
+            cinesa.get(
+                "chrome_path", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            )
+        ),
+        cinesa_chrome_profile=str(
+            cinesa.get("chrome_profile", ".cache/chrome-profile")
+        ),
         state_file=general.get("state_file", "state/state.json"),
         telegram_token=os.environ.get("TELEGRAM_BOT_TOKEN") or None,
         telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID") or None,
