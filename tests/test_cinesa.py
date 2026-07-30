@@ -400,7 +400,10 @@ def test_cinesa_failure_alert_buzzes_and_names_the_cause():
     assert chrome.kind == "WATCHER_ERROR"
     assert chrome.kind not in notify.DEFAULT_SILENT_KINDS  # i.e. it buzzes
     body = "\n".join(chrome.lines)
-    assert "Chrome" in body and "unlocked" in body
+    # A locked screen is verified-fine (OTW-05), so the hint must not send the
+    # user off to unlock the Mac; logged-in + awake is the real requirement.
+    assert "Chrome" in body and "logged in and awake" in body
+    assert "unlocked" not in body
     assert "Pathé half is unaffected" in body
 
     generic = main.build_cinesa_error_finding(
