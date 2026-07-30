@@ -62,8 +62,10 @@ failure_streak_threshold = 3
 # older than this — catches the local daily check dying silently (0 = off).
 stale_check_hours = 72
 # Alert kinds delivered WITHOUT sound/vibration. Everything else buzzes;
-# reminders and the "open now" ping always buzz.
-silent_kinds = ["HEARTBEAT", "NEWS_LEAD", "RECOVERED"]
+# reminders and the "open now" ping always buzz. CINESA_TARGET_NO_IMAX is the
+# "your date opened, but with no IMAX on it" note — worth knowing, not worth a
+# buzz. The two IMAX drop/return kinds DO buzz: they were asked for by name.
+silent_kinds = ["HEARTBEAT", "NEWS_LEAD", "RECOVERED", "CINESA_TARGET_NO_IMAX"]
 
 [cadence]
 # Adaptive check frequency (local launchd job fires every 15 min; these set
@@ -74,6 +76,45 @@ within_week_hours = 2.0       # sale opening within 7 days
 final_48h_hours = 0.5         # sale opening within 48 h
 opening_window_minutes = 15   # from 4 h before to 6 h after the opening
 after_tickets_hours = 6.0     # tickets already bookable (watch for new waves)
+
+# ---------------------------------------------------------------------------
+# Second watch target: L'Odyssée (Nolan) in IMAX @ Cinesa Diagonal Mar,
+# Barcelona. Independent of the Pathé/Dune watch above — different chain,
+# different film, its own alert kinds and state namespace.
+#
+# Unlike Pathé, the *data* API (vwc.cinesa.es) is not bot-protected, so checks
+# are cheap and run on every launchd firing. Only the 12 h token comes from the
+# Cloudflare-challenged www.cinesa.es, via a real headed Chrome (see cdp.py).
+# ---------------------------------------------------------------------------
+[cinesa]
+enabled = true
+# Vista HO code, straight from the film page URL.
+film_id = "HO00003228"
+film_title = "La odisea (The Odyssey)"
+page_url = "https://www.cinesa.es/peliculas/la-odisea/HO00003228/"
+# Vista site id (verified via /api/omnia/v1/pageList: Diagonal Mar = "032";
+# its own listing reads "ISENSE · IMAX · VOSE").
+site_id = "032"
+site_name = "Cinesa Diagonal Mar"
+site_city = "Barcelona"
+# Showtime attribute that marks an IMAX session (verified 2026-07).
+imax_attribute_id = "0000000086"
+# The dates to watch. A date becoming bookable WITH IMAX buzzes; bookable
+# without IMAX is reported silently. Add more as plans firm up.
+target_dates = ["2026-08-26", "2026-08-27"]
+# Page loaded purely to mint a token; any Cinesa page works.
+token_url = "https://www.cinesa.es/peliculas/la-odisea/HO00003228/"
+api_base = "https://vwc.cinesa.es/WSVistaWebClient"
+# Refresh the 12 h token once it has less than this much life left, rather than
+# at expiry. The token step is the only part needing a GUI, so it is the only
+# part a locked/sleeping Mac can block; refreshing early turns one blocked
+# attempt into a multi-hour retry window, and a failed refresh keeps using the
+# token still in hand instead of taking the Cinesa half down.
+token_refresh_before_hours = 3.0
+# Both live under .cache/ and are git-ignored: the token is a credential.
+token_cache = ".cache/cinesa-token.json"
+chrome_profile = ".cache/chrome-profile"
+chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 [general]
 state_file = "state/state.json"

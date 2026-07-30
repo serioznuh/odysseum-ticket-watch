@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 
-from watcher import detect, state as state_mod
+from watcher import detect
+from watcher import state as state_mod
 from watcher.detect import Snapshot
 from watcher.state import (
     DEFAULT_STATE,

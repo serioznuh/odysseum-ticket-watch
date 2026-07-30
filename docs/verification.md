@@ -11,7 +11,7 @@ Use for docs, tests, or local logic changes:
 .venv/bin/python -m pytest -q
 ```
 
-Expected current result: Ruff reports no errors and pytest reports **44 passed**.
+Expected current result: Ruff reports no errors and pytest reports **63 passed**.
 
 ## Watcher behavior check
 
@@ -26,6 +26,24 @@ Needs network access to `www.pathe.fr` — run from a residential IP (it is
 Akamai-blocked from datacenter IPs). Read the logged alerts and confirm they
 match expectations; precision beats recall (a suppressed alert is better than a
 noisy one).
+
+With `[cinesa] enabled = true` this also exercises the Cinesa half: expect a
+`cinesa snapshot: N bookable day(s) …` line. If the cached token has expired it
+first logs `minting a new Cinesa token via headed Chrome` and a Chrome window
+opens offscreen for ~3 s — that is normal, and needs the Mac awake and logged
+in. Cinesa is Cloudflare-challenged from datacenter IPs too, so this is
+local-only as well.
+
+To exercise only the Cinesa path without touching Pathé or Telegram:
+
+```bash
+.venv/bin/python -c "
+from watcher import cinesa, detect
+from watcher.config import load_config
+cfg = load_config('config.toml'); snap = cinesa.fetch_snapshot(cfg)
+print(len(snap.days), snap.days[0]['date'], '->', snap.days[-1]['date'])
+print('IMAX days:', len(detect.imax_days(snap.days, cfg.cinesa_imax_attribute_id)))"
+```
 
 ## Telegram delivery check — needs user approval
 

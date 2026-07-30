@@ -108,6 +108,17 @@ class Snapshot:
 
 
 @dataclass
+class CinesaSnapshot:
+    """One fetch of the Cinesa booking calendar for the watched film + site.
+
+    `days` is sorted by date: [{"date": "YYYY-MM-DD", "attributes": [ids]}].
+    The last entry is the current booking horizon.
+    """
+
+    days: list[dict] = field(default_factory=list)
+
+
+@dataclass
 class Finding:
     kind: str  # SALE_DATE, SALE_DATE_CHANGED, TICKETS_AVAILABLE, NEW_LISTING, CINEMA_LISTED, NEWS_LEAD, ...
     key: str  # dedup key: one alert per key, ever
@@ -248,7 +259,7 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                 findings.append(
                     Finding(
                         kind="TICKETS_AVAILABLE",
-                        key="tickets:%s:%s" % (slug, ",".join(sorted(new_fmts))),
+                        key="tickets:{}:{}".format(slug, ",".join(sorted(new_fmts))),
                         confidence="high",
                         title="Tickets are bookable NOW",
                         lines=lines,
@@ -270,6 +281,118 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                         "Confidence: HIGH — Pathé cinema programme API.",
                     ],
                     url=url,
+                )
+            )
+
+    return findings
+
+
+# --------------------------------------------------------------------------- Cinesa analysis
+
+def imax_days(days: list[dict], imax_attribute_id: str) -> list[str]:
+    return [d["date"] for d in days if imax_attribute_id in (d.get("attributes") or [])]
+
+
+def analyze_cinesa(snap: CinesaSnapshot, state: dict, cfg: Any, now: datetime) -> list[Finding]:
+    """Target dates becoming bookable in IMAX, plus IMAX leaving/returning.
+
+    Deliberately narrow: the watched dates are the only thing that buzzes. The
+    booking horizon itself is recorded in state (and surfaces in the heartbeat)
+    but never alerts on its own — it may simply roll forward one day per day,
+    which would be pure noise.
+    """
+    findings: list[Finding] = []
+    cin = state.get("cinesa", {})
+    days = snap.days
+    known = {d["date"] for d in days}
+    imax = set(imax_days(days, cfg.cinesa_imax_attribute_id))
+    where = f"{cfg.cinesa_site_name}, {cfg.cinesa_site_city}"
+
+    # 1. A watched date became bookable.
+    for target in cfg.cinesa_target_dates:
+        if target not in known:
+            continue
+        if target in imax:
+            findings.append(
+                Finding(
+                    kind="CINESA_TARGET_DATE",
+                    key=f"cinesa_target:{cfg.cinesa_site_id}:{cfg.cinesa_film_id}:{target}",
+                    confidence="high",
+                    title="IMAX tickets open for a date you are watching",
+                    lines=[
+                        f"Film: {cfg.cinesa_film_title}",
+                        f"Cinema: {where}",
+                        f"Date now bookable: {target} — IMAX is in that day's schedule.",
+                        f"Booking horizon now runs to {days[-1]['date']}.",
+                        "Confidence: HIGH — Cinesa/Vista booking API.",
+                    ],
+                    url=cfg.cinesa_page_url,
+                )
+            )
+        else:
+            # Silent by default: the day is live but IMAX is not on it (yet).
+            findings.append(
+                Finding(
+                    kind="CINESA_TARGET_NO_IMAX",
+                    key=f"cinesa_target_noimax:{cfg.cinesa_site_id}:{cfg.cinesa_film_id}:{target}",
+                    confidence="high",
+                    title="Watched date is bookable, but not in IMAX",
+                    lines=[
+                        f"Film: {cfg.cinesa_film_title}",
+                        f"Cinema: {where}",
+                        f"Date now bookable: {target}, with no IMAX session in that day's schedule.",
+                        "You will still get a loud alert if IMAX appears for this date later.",
+                        "Confidence: HIGH — Cinesa/Vista booking API.",
+                    ],
+                    url=cfg.cinesa_page_url,
+                )
+            )
+
+    # 2. IMAX disappeared / came back. An empty snapshot is treated as a blip,
+    #    never as evidence: a transient API hiccup must not fake a drop alert.
+    was_present = cin.get("imax_present")
+    if days:
+        if imax and was_present is False:
+            findings.append(
+                Finding(
+                    kind="CINESA_IMAX_BACK",
+                    key=f"cinesa_imax_back:{now:%Y-%m-%d}",
+                    confidence="high",
+                    title="IMAX sessions are back",
+                    lines=[
+                        f"Film: {cfg.cinesa_film_title}",
+                        f"Cinema: {where}",
+                        (
+                            f"IMAX is scheduled again on {len(imax)} day(s),"
+                            f" {min(imax)} → {max(imax)}."
+                        ),
+                        "Confidence: HIGH — Cinesa/Vista booking API.",
+                    ],
+                    url=cfg.cinesa_page_url,
+                )
+            )
+        # One confirmation required before crying wolf (see streak below).
+        elif not imax and was_present and cin.get("imax_absent_streak", 0) >= 1:
+            findings.append(
+                Finding(
+                    kind="CINESA_IMAX_GONE",
+                    key=f"cinesa_imax_gone:{now:%Y-%m-%d}",
+                    confidence="high",
+                    title="IMAX sessions have disappeared",
+                    lines=[
+                        f"Film: {cfg.cinesa_film_title}",
+                        f"Cinema: {where}",
+                        (
+                            f"The film still has {len(days)} bookable day(s)"
+                            f" ({days[0]['date']} → {days[-1]['date']}) but none in IMAX."
+                        ),
+                        (
+                            "It has probably been moved off the IMAX screen — a later"
+                            " IMAX booking may no longer be possible."
+                        ),
+                        "Confidence: HIGH — confirmed over two consecutive checks.",
+                    ],
+                    url=cfg.cinesa_page_url,
                 )
             )
 

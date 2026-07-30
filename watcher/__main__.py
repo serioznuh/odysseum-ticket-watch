@@ -18,7 +18,8 @@ import re
 import sys
 from datetime import datetime, timedelta
 
-from . import __version__, detect, news, notify, pathe, state as state_mod
+from . import __version__, cinesa, detect, news, notify, pathe
+from . import state as state_mod
 from .config import load_config
 from .detect import TZ_PARIS, Finding
 
@@ -54,8 +55,10 @@ def build_error_finding(cfg, streak: int, error: str, now: datetime) -> Finding:
             f"{streak} consecutive checks have failed.",
             f"Last error: {summary}",
             guidance,
-            "The watcher is currently BLIND. Local checks retry every 15 min; details:"
-            " ~/.ticket-watch/logs/launchd.log",
+            (
+                "The watcher is currently BLIND. Local checks retry every 15 min; details:"
+                " ~/.ticket-watch/logs/launchd.log"
+            ),
         ],
         url=cfg.film_page_url,
     )
@@ -72,6 +75,47 @@ def build_recovered_finding(cfg, now: datetime) -> Finding:
     )
 
 
+def build_cinesa_error_finding(cfg, streak: int, error: str, key: str) -> Finding:
+    """Cinesa half is blind. Kept separate from the Pathé error: the two halves
+    fail for unrelated reasons and one must never mask the other."""
+    summary = " ".join(error.split())[:300]
+    if "Chrome" in error or "CDP" in error or "challenge" in error.lower():
+        guidance = (
+            "The token step could not drive Chrome. Check that Google Chrome is"
+            " installed at the configured path and that the Mac is unlocked;"
+            " Cloudflare only clears for a real browser window."
+        )
+    else:
+        guidance = "Possible causes: Cinesa API change, token rejected, or a network outage."
+    return Finding(
+        kind="WATCHER_ERROR",
+        key=key,
+        confidence="high",
+        title="Watcher cannot reach the Cinesa API",
+        lines=[
+            f"{streak} consecutive Cinesa checks have failed.",
+            f"Last error: {summary}",
+            guidance,
+            (
+                f"{cfg.cinesa_film_title} @ {cfg.cinesa_site_name} is NOT being watched"
+                " right now. The Pathé half is unaffected."
+            ),
+        ],
+        url=cfg.cinesa_page_url,
+    )
+
+
+def build_cinesa_recovered_finding(cfg, now: datetime) -> Finding:
+    return Finding(
+        kind="RECOVERED",
+        key=f"cinesa_recovered:{now:%Y-%m-%dT%H%M}",
+        confidence="high",
+        title="Watcher recovered — Cinesa API reachable again",
+        lines=[f"{cfg.cinesa_site_name} checks are running normally again."],
+        url=cfg.cinesa_page_url,
+    )
+
+
 def build_heartbeat(cfg, snap: detect.Snapshot, st: dict, now: datetime) -> Finding:
     primary = next(
         (s for s in snap.matched_shows if s.get("slug") == cfg.primary_slug), None
@@ -81,19 +125,33 @@ def build_heartbeat(cfg, snap: detect.Snapshot, st: dict, now: datetime) -> Find
     if sales:
         parts = [f"{slug}: {detect.fmt_dt(detect.parse_iso(iso))}" for slug, iso in sales.items()]
         sale_line = "; ".join(parts)
+    lines = [
+        f"Release date (Pathé): {detect.fmt_release(primary) if primary else cfg.release_date}",
+        f"Sale opening: {sale_line}",
+        f"Listed at {cfg.cinema_name}: {'yes' if snap.cinema_entries else 'no'}",
+        f"Bookable sessions at {cfg.cinema_name}: {'YES' if snap.showtimes else 'none'}",
+        f"Pathé listings watched: {len(snap.matched_shows)}",
+    ]
+    if cfg.cinesa_enabled:
+        cin = st.get("cinesa", {})
+        imax = cin.get("imax_present")
+        lines += [
+            "",
+            f"— {cfg.cinesa_film_title} @ {cfg.cinesa_site_name} —",
+            (
+                f"Bookable through: {cin.get('horizon') or 'unknown'}"
+                f" ({cin.get('day_count') or 0} days)"
+            ),
+            "IMAX: " + {True: "scheduled", False: "NOT scheduled"}.get(imax, "unknown"),
+            "Watching dates: " + (", ".join(cfg.cinesa_target_dates) or "none"),
+        ]
+    lines.append("Daily checks are running normally.")
     return Finding(
         kind="HEARTBEAT",
         key=f"heartbeat:{now:%Y-%m-%d}",
         confidence="high",
         title=f"Watcher alive — nothing new ({cfg.film_title})",
-        lines=[
-            f"Release date (Pathé): {detect.fmt_release(primary) if primary else cfg.release_date}",
-            f"Sale opening: {sale_line}",
-            f"Listed at {cfg.cinema_name}: {'yes' if snap.cinema_entries else 'no'}",
-            f"Bookable sessions at {cfg.cinema_name}: {'YES' if snap.showtimes else 'none'}",
-            f"Pathé listings watched: {len(snap.matched_shows)}",
-            "Daily checks are running normally.",
-        ],
+        lines=lines,
         url=cfg.film_page_url,
     )
 
@@ -116,13 +174,15 @@ def run(argv: list[str] | None = None) -> int:
         type=float,
         default=0,
         metavar="HOURS",
-        help="check mode: exit at once when the last successful check is newer than this (fixed threshold)",
+        help="check mode: skip the Pathé/news half when its last successful check is"
+        " newer than this (fixed threshold); the Cinesa half still runs",
     )
     parser.add_argument(
         "--adaptive-cadence",
         action="store_true",
-        help="check mode: compute the freshness threshold from the sale-target proximity"
-        " (war-room mode near the opening); reminders are left to the cloud pass",
+        help="check mode: compute the Pathé freshness threshold from the sale-target"
+        " proximity (war-room mode near the opening); reminders are left to the"
+        " cloud pass. Does not gate the Cinesa half, which runs every time",
     )
     parser.add_argument("--test-telegram", action="store_true", help="send a test message and exit")
     parser.add_argument("--verbose", action="store_true")
@@ -158,19 +218,27 @@ def run(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    # The cadence guard governs the Pathé half only. Cinesa is a single small
+    # call against a host that is neither bot-gated nor rate-limited, and the
+    # point is catching a schedule change within minutes — so it runs on every
+    # firing. When Pathé is not due and Cinesa is off, the run is still the
+    # original zero-network no-op.
+    pathe_due = True
     if args.mode == "check":
         threshold = args.skip_if_checked_within
         if args.adaptive_cadence:
             threshold = state_mod.adaptive_staleness_hours(st, cfg, now)
         if threshold > 0 and state_mod.is_check_fresh(st, threshold, now):
             log.info(
-                "last successful check (%s) is newer than %.2fh%s — nothing to do, exiting",
+                "last successful Pathé check (%s) is newer than %.2fh%s — skipping it",
                 st.get("last_check_ok"),
                 threshold,
                 " [adaptive tier]" if args.adaptive_cadence else "",
             )
-            return 0
-        if args.adaptive_cadence:
+            pathe_due = False
+            if not cfg.cinesa_enabled:
+                return 0
+        elif args.adaptive_cadence:
             log.info("adaptive cadence tier: check when older than %.2fh — running", threshold)
 
     sent_any = False
@@ -181,8 +249,9 @@ def run(argv: list[str] | None = None) -> int:
         client = pathe.make_client()
 
         try:
-            snap = pathe.fetch_snapshot(client, cfg)
-        except Exception as e:  # noqa: BLE001 — any fetch failure is handled the same way
+            if pathe_due:
+                snap = pathe.fetch_snapshot(client, cfg)
+        except Exception as e:
             log.exception("Pathé check failed")
             st["failure_streak"] = st.get("failure_streak", 0) + 1
             # With adaptive cadence, retries come every 15 min — require both
@@ -210,12 +279,38 @@ def run(argv: list[str] | None = None) -> int:
             st["last_check_ok"] = now.isoformat()
             findings.extend(detect.analyze_pathe(snap, st, cfg, now))
 
-        if cfg.news_enabled:
+        if pathe_due and cfg.news_enabled:
             try:
                 items = news.fetch_news_items(client, cfg)
                 findings.extend(detect.analyze_news(items, cfg, st, now))
-            except Exception:  # noqa: BLE001 — news layer must never kill the run
+            except Exception:
                 log.exception("news check failed (non-fatal)")
+
+        csnap: detect.CinesaSnapshot | None = None
+        cinesa_error_key: str | None = None
+        if cfg.cinesa_enabled:
+            cin = st.setdefault("cinesa", {})
+            try:
+                csnap = cinesa.fetch_snapshot(cfg)
+            except Exception as e:
+                log.exception("Cinesa check failed")
+                # Capped at the alert threshold: nothing reads a larger value,
+                # and a counter that kept growing would rewrite state.json on
+                # every firing of a long outage, commit and push included.
+                cin["failure_streak"] = min(
+                    cin.get("failure_streak", 0) + 1, cfg.failure_streak_threshold
+                )
+                if cin["failure_streak"] >= cfg.failure_streak_threshold and not cin.get(
+                    "error_alerted"
+                ):
+                    cinesa_error_key = f"cinesa_error:{now:%Y-%m-%d}"
+                    findings.append(
+                        build_cinesa_error_finding(cfg, cin["failure_streak"], str(e), cinesa_error_key)
+                    )
+            else:
+                if cin.get("error_alerted"):
+                    findings.append(build_cinesa_recovered_finding(cfg, now))
+                findings.extend(detect.analyze_cinesa(csnap, st, cfg, now))
 
         for f in findings:
             if state_mod.already_sent(st, f.key):
@@ -230,6 +325,22 @@ def run(argv: list[str] | None = None) -> int:
             ):
                 state_mod.mark_sent(st, f.key, now)
                 sent_any = True
+
+        # The error flag flips only once the alert really went out, so a failed
+        # send retries on the next run instead of being silently swallowed.
+        if cinesa_error_key and state_mod.already_sent(st, cinesa_error_key):
+            st.setdefault("cinesa", {})["error_alerted"] = True
+
+        if csnap is not None:
+            # Same rule for the IMAX baseline: advancing it after a failed send
+            # would make analyze_cinesa agree with the new reality and never
+            # re-raise the transition, losing the alert for good.
+            imax_delivered = all(
+                state_mod.already_sent(st, f.key)
+                for f in findings
+                if f.kind in ("CINESA_IMAX_GONE", "CINESA_IMAX_BACK")
+            )
+            state_mod.update_from_cinesa(st, csnap, cfg, now, advance_imax=imax_delivered)
 
         if snap is not None:
             state_mod.update_from_snapshot(st, snap, cfg, now)
@@ -266,8 +377,11 @@ def run(argv: list[str] | None = None) -> int:
                 title="No successful Pathé check recently",
                 lines=[
                     f"Last successful check: {detect.fmt_dt(detect.parse_iso(st.get('last_check_ok')))}.",
-                    f"Threshold: {cfg.stale_check_hours}h — the daily check job seems to have stopped"
-                    " (machine off/asleep for days, launchd job unloaded, or git push failing).",
+                    (
+                        f"Threshold: {cfg.stale_check_hours}h — the daily check job seems to"
+                        " have stopped (machine off/asleep for days, launchd job unloaded,"
+                        " or git push failing)."
+                    ),
                     "Cloud reminders still run, but new Pathé signals are NOT being watched.",
                 ],
                 url=cfg.film_page_url,

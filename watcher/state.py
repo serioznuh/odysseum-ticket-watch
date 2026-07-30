@@ -13,6 +13,12 @@ from . import detect
 
 log = logging.getLogger(__name__)
 
+# Consecutive IMAX-free checks needed before `imax_present` flips to False.
+# Doubles as the ceiling for the streak counter: past the confirmation point a
+# bigger number would mean nothing, but it would keep the state file changing
+# on every firing (see update_from_cinesa).
+IMAX_ABSENT_CONFIRM = 2
+
 DEFAULT_STATE: dict = {
     "version": 1,
     "alerts": {},          # dedup key -> ISO timestamp of when the alert was sent
@@ -26,6 +32,19 @@ DEFAULT_STATE: dict = {
     "error_alerted": False,
     "last_check_ok": None,
     "last_heartbeat": None,
+    # Cinesa (Diagonal Mar) half — namespaced so it never collides with Pathé.
+    # No per-run timestamp lives here on purpose: the Cinesa check runs on
+    # every 15-min firing, and a field that changed each time would make
+    # local-check.sh commit and push ~96 times a day. Only real changes land.
+    "cinesa": {
+        "imax_present": None,       # None until the first successful check
+        "imax_absent_streak": 0,    # consecutive non-empty checks without IMAX
+        "horizon": None,            # last bookable business date (YYYY-MM-DD)
+        "day_count": 0,
+        "last_change": None,        # when horizon/IMAX last actually moved
+        "failure_streak": 0,
+        "error_alerted": False,
+    },
 }
 
 
@@ -43,7 +62,14 @@ def load_state(path: str | Path) -> dict:
             pass
         return json.loads(json.dumps(DEFAULT_STATE))
     merged = json.loads(json.dumps(DEFAULT_STATE))
+    nested_defaults = {k: v for k, v in merged.items() if isinstance(v, dict) and k == "cinesa"}
     merged.update(loaded)
+    # `update` is shallow: re-apply defaults for sub-keys a state file written
+    # by an older version does not have yet, so new fields arrive initialised.
+    for key, defaults in nested_defaults.items():
+        section = dict(defaults)
+        section.update(merged.get(key) or {})
+        merged[key] = section
     return merged
 
 
@@ -94,6 +120,57 @@ def update_from_snapshot(state: dict, snap: detect.Snapshot, cfg: Any, now: date
             future.append((detect.as_aware(dt), iso))
     if future:
         state["sale_target"] = min(future)[1]
+
+
+def update_from_cinesa(
+    state: dict,
+    snap: detect.CinesaSnapshot,
+    cfg: Any,
+    now: datetime,
+    advance_imax: bool = True,
+) -> None:
+    """Record the Cinesa snapshot as the new baseline (call after alerting).
+
+    An empty snapshot never flips `imax_present`: a transient API hiccup would
+    otherwise manufacture an "IMAX disappeared" alert on the next check.
+    `imax_present` only goes False once absence is confirmed twice, which is
+    the same threshold analyze_cinesa uses before it alerts.
+
+    `advance_imax=False` freezes the IMAX baseline (`imax_present` and its
+    streak) while still recording the horizon: the caller passes it when an
+    IMAX gone/back alert was generated but not delivered, so the next run sees
+    the same transition again instead of losing the alert forever.
+    """
+    cin = state.setdefault("cinesa", {})
+    before = dict(cin)
+    cin["failure_streak"] = 0
+    cin["error_alerted"] = False
+    if not snap.days:
+        log.warning("cinesa: snapshot has no bookable days — not updating IMAX baseline")
+        return
+
+    cin["horizon"] = snap.days[-1]["date"]
+    cin["day_count"] = len(snap.days)
+    if not advance_imax:
+        log.info("cinesa: IMAX alert not delivered — keeping the previous IMAX baseline")
+    elif detect.imax_days(snap.days, cfg.cinesa_imax_attribute_id):
+        cin["imax_present"] = True
+        cin["imax_absent_streak"] = 0
+    else:
+        # Capped: only the confirmation threshold is ever read, and an
+        # ever-growing counter would diff the state file on every firing.
+        cin["imax_absent_streak"] = min(
+            cin.get("imax_absent_streak", 0) + 1, IMAX_ABSENT_CONFIRM
+        )
+        if cin["imax_absent_streak"] >= IMAX_ABSENT_CONFIRM:
+            cin["imax_present"] = False
+
+    # Timestamp only a genuine change, so an unchanged schedule leaves the
+    # state file byte-identical and the 15-min job has nothing to commit.
+    if {k: v for k, v in cin.items() if k != "last_change"} != {
+        k: v for k, v in before.items() if k != "last_change"
+    }:
+        cin["last_change"] = now.isoformat()
 
 
 def due_reminders(state: dict, offsets_minutes: list[int], now: datetime) -> list[dict]:

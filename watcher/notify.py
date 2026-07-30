@@ -24,6 +24,10 @@ ICONS = {
     "WATCHER_ERROR": "⚠️",
     "RECOVERED": "✅",
     "HEARTBEAT": "💤",
+    "CINESA_TARGET_DATE": "🎫",
+    "CINESA_TARGET_NO_IMAX": "🗓️",
+    "CINESA_IMAX_GONE": "📉",
+    "CINESA_IMAX_BACK": "📈",
 }
 
 OFFSET_LABELS = {1440: "24 hours", 120: "2 hours", 15: "15 minutes"}
@@ -31,7 +35,7 @@ OFFSET_LABELS = {1440: "24 hours", 120: "2 hours", 15: "15 minutes"}
 # Kinds delivered without sound/vibration by default; the phone buzzes for
 # everything else (sale dates, tickets, reminders, failures). Reminders and
 # the "open now" ping are always loud. Override via [alerts] silent_kinds.
-DEFAULT_SILENT_KINDS = ["HEARTBEAT", "NEWS_LEAD", "RECOVERED"]
+DEFAULT_SILENT_KINDS = ["HEARTBEAT", "NEWS_LEAD", "RECOVERED", "CINESA_TARGET_NO_IMAX"]
 
 
 def is_silent(cfg: Any, kind: str) -> bool:

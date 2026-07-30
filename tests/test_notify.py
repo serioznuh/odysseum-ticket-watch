@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 from watcher import notify
 
 
 class Cfg:
-    silent_kinds = ["HEARTBEAT", "NEWS_LEAD", "RECOVERED"]
+    silent_kinds: ClassVar = ["HEARTBEAT", "NEWS_LEAD", "RECOVERED"]
     telegram_token = None
     telegram_chat_id = None
 
@@ -20,7 +22,7 @@ def test_silent_kinds_default_split():
 
 def test_silent_kinds_configurable():
     class QuietCfg(Cfg):
-        silent_kinds = ["HEARTBEAT", "NEWS_LEAD", "RECOVERED", "NEW_LISTING"]
+        silent_kinds: ClassVar = ["HEARTBEAT", "NEWS_LEAD", "RECOVERED", "NEW_LISTING"]
 
     assert notify.is_silent(QuietCfg, "NEW_LISTING")
     assert not notify.is_silent(QuietCfg, "SALE_DATE")

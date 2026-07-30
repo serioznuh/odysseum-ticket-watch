@@ -7,3 +7,5 @@ __pycache__/
 state/*.bak
 state/*.tmp
 logs/
+# Cinesa API token (a credential) and the throwaway Chrome profile used to mint it.
+.cache/
