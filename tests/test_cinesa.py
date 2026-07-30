@@ -7,7 +7,7 @@ import json
 import time
 from datetime import datetime
 
-from watcher import cinesa, detect, state as state_mod
+from watcher import __main__ as main, cinesa, detect, notify, state as state_mod
 from watcher.detect import CinesaSnapshot
 from watcher.state import DEFAULT_STATE
 
@@ -257,6 +257,36 @@ def test_state_upgrade_fills_in_new_cinesa_keys(tmp_path):
     loaded = state_mod.load_state(path)
     assert loaded["cinesa"]["imax_present"] is None
     assert loaded["cinesa"]["imax_absent_streak"] == 0
+
+
+def test_cinesa_failure_alert_buzzes_and_names_the_cause():
+    """The safety net: a blind Cinesa half must reach the phone, loudly, and
+    must not be mistaken for the Pathé half failing."""
+    chrome = main.build_cinesa_error_finding(
+        Cfg, 3, "CDPError: Chrome DevTools endpoint never came up", "cinesa_error:2026-08-01"
+    )
+    assert chrome.kind == "WATCHER_ERROR"
+    assert chrome.kind not in notify.DEFAULT_SILENT_KINDS  # i.e. it buzzes
+    body = "\n".join(chrome.lines)
+    assert "Chrome" in body and "unlocked" in body
+    assert "Pathé half is unaffected" in body
+
+    generic = main.build_cinesa_error_finding(
+        Cfg, 3, "HTTP 500 from vwc.cinesa.es", "cinesa_error:2026-08-01"
+    )
+    assert "Cinesa API change" in "\n".join(generic.lines)
+
+
+def test_cinesa_error_and_recovery_keys_allow_repeat_incidents():
+    """Daily-granular keys: one alert per incident per day, but a later outage
+    is not silenced forever by the dedup store."""
+    day1 = main.build_cinesa_error_finding(Cfg, 3, "boom", "cinesa_error:2026-08-01")
+    day2 = main.build_cinesa_error_finding(Cfg, 3, "boom", "cinesa_error:2026-08-02")
+    assert day1.key != day2.key
+
+    rec = main.build_cinesa_recovered_finding(Cfg, NOW)
+    assert rec.kind == "RECOVERED"
+    assert rec.key.startswith("cinesa_recovered:")
 
 
 def test_state_upgrade_preserves_existing_cinesa_values(tmp_path):

@@ -45,6 +45,10 @@ A single-user Telegram watcher covering **two independent targets**:
   ~3 s). `--headless=new` is challenged and never settles — measured, not
   assumed. No stealth or challenge-solving is used or wanted: if Chrome stops
   clearing the challenge on its own, the watcher must fail loudly instead.
+- Chrome **self-activates on launch** even under `open -g -j`, so `cdp.py`
+  captures the frontmost app and re-activates it after the tab is created
+  (doing it any earlier just lets Chrome take focus again). Measured focus
+  loss: 0–0.15 s per refresh, twice a day.
 - Verified IDs: film `HO00003228`, site `032` (Diagonal Mar), IMAX showtime
   attribute `0000000086`.
 - **The booking wall is fixed, not rolling** — observed 2026-07-29→08-25

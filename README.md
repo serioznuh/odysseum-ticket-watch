@@ -72,8 +72,9 @@ throwaway profile, ~3 s) twice a day. Headless is challenged and never settles, 
 headed is required — and no stealth tooling or challenge-solving is used: if Chrome
 stops clearing the challenge itself, the watcher raises ⚠️ rather than working around it.
 
-**Requirements:** Google Chrome installed, and the Mac awake and logged in when a
-token refresh is due (a real browser window must be able to open).
+**Requirements:** Chrome installed, Mac awake and logged in at refresh time. The window
+opens hidden and offscreen and focus is handed straight back — measured 0–0.15 s, so you
+should not notice it. Chrome self-activates on launch, so the hand-back is deliberate.
 
 ## Setup
 

@@ -153,6 +153,84 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _frontmost_app() -> str | None:
+    """Bundle path of the app that currently has focus, if it can be read."""
+    try:
+        asn = subprocess.run(
+            ["lsappinfo", "front"], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        if not asn:
+            return None
+        out = subprocess.run(
+            ["lsappinfo", "info", "-only", "bundlepath", asn],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+        path = out.partition("=")[2].strip().strip('"')
+        return path or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _restore_focus(bundle_path: str | None) -> None:
+    if not bundle_path:
+        return
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(
+            ["open", "-a", bundle_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+
+
+def _launch_background(chrome_path: str, args: list[str]) -> str | None:
+    """Start Chrome hidden/backgrounded; returns the app that had focus.
+
+    Chrome activates itself on launch even under `open -g -j` (measured: our
+    own PID became frontmost), and on a twice-daily schedule that means Chrome
+    grabbing the keyboard mid-sentence. `-g -j` still helps — the window starts
+    hidden and offscreen — but focus has to be handed back explicitly, and only
+    *after* Chrome's last activation point, or it simply steals it again.
+    The window is still a real one, which is what clears the challenge;
+    nothing here touches the challenge itself.
+    """
+    previous = _frontmost_app()
+    bundle = chrome_path.split("/Contents/MacOS/")[0]
+    subprocess.run(
+        ["open", "-g", "-j", "-n", "-a", bundle, "--args", *args],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+    )
+    return previous
+
+
+def _terminate_by_profile(profile_dir: str) -> None:
+    """Kill only the Chrome we started, matched on its throwaway profile path.
+
+    `open` detaches, so there is no child PID to wait on. The profile path is
+    unique to this watcher, so the user's own Chrome can never match.
+    """
+    marker = f"--user-data-dir={profile_dir}"
+    try:
+        listing = subprocess.run(
+            ["ps", "-Ao", "pid=,command="], capture_output=True, text=True, timeout=15
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return
+    for line in listing.splitlines():
+        if marker not in line:
+            continue
+        pid_text = line.strip().split(None, 1)[0]
+        try:
+            os.kill(int(pid_text), 15)
+        except (ValueError, ProcessLookupError, PermissionError):
+            continue
+
+
 def _devtools(url: str, method: str = "GET", timeout: float = 5.0) -> Any:
     req = urllib.request.Request(url, method=method)
     with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 — localhost only
@@ -178,12 +256,13 @@ def evaluate_on_page(
         raise CDPError(f"Chrome not found at {chrome_path} — set [cinesa] chrome_path")
 
     os.makedirs(profile_dir, exist_ok=True)
+    profile = os.path.abspath(profile_dir)
     port = _free_port()
-    proc = subprocess.Popen(
+    previous_app = _launch_background(
+        chrome_path,
         [
-            chrome_path,
             f"--remote-debugging-port={port}",
-            f"--user-data-dir={os.path.abspath(profile_dir)}",
+            f"--user-data-dir={profile}",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-background-networking",
@@ -191,8 +270,6 @@ def evaluate_on_page(
             "--window-position=-32000,-32000",
             "about:blank",
         ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
     )
     try:
         deadline = time.monotonic() + 30
@@ -209,6 +286,9 @@ def evaluate_on_page(
             f"http://127.0.0.1:{port}/json/new?{urllib.parse.quote(url, safe=':/?=&%')}",
             method="PUT",
         )
+        # Opening the tab is Chrome's last activation point, so hand focus back
+        # now — doing it earlier just lets Chrome take it again.
+        _restore_focus(previous_app)
         ws = _WebSocket(tab["webSocketDebuggerUrl"])
         try:
             deadline = time.monotonic() + wait_seconds
@@ -235,10 +315,4 @@ def evaluate_on_page(
         finally:
             ws.close()
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            with contextlib.suppress(Exception):
-                proc.wait(timeout=5)
+        _terminate_by_profile(profile)
