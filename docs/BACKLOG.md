@@ -19,10 +19,30 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-04 | Cinesa alert: include session times + booking link | P2 | S | Features | [ ] |
 | OTW-05 | Confirm Cinesa token behaviour with screen locked/asleep | P2 | S | Infra, tooling & docs | [x] |
 | OTW-06 | Pathé failure_streak churns state; baseline can lose an alert | P2 | S | Bugs | [x] |
+| OTW-07 | Stale-check alert says "Pathé" but the whole local half is down | P3 | S | Bugs | [ ] |
+| OTW-08 | Run the news half from the cloud pass to cover Mac-asleep windows | P1 | M | Features | [ ] |
 
 ## 1. Critical — security & breakage
 
 ## 2. Bugs
+
+### OTW-07 · Stale-check alert says "Pathé" but the whole local half is down
+**Priority:** P3 · **Effort:** S
+**Problem:** The dead-man's-switch alert in `watcher/__main__.py` (the
+`is_check_stale` block) is titled "No successful Pathé check recently" and its
+body says "new Pathé signals are NOT being watched". But it is keyed on
+`last_check_ok`, which goes stale whenever the *local half* stops — and that
+half runs Cinesa and the news feeds too. The most likely cause (Mac asleep,
+lid shut) takes all three down, so naming only Pathé understates the outage and
+points the user at the wrong subsystem. Found while sizing `stale_check_hours`
+down from 72 h to 18 h.
+**Fix:** Retitle to something like "Local checks have stopped" and list what is
+actually dark (Pathé + news + Cinesa, conditional on `cfg.cinesa_enabled`),
+keeping the "cloud reminders still run" reassurance. Key format must not
+change — `stale:{last_check_ok}` is dedup memory (AGENTS.md "Conventions").
+**Done when:** the alert body names every half that the local script owns, a
+unit test asserts Cinesa is mentioned when enabled, and the `Finding.key`
+format is byte-identical to today's.
 
 ### OTW-03 · 403 alert VPN wording wrong on manual CI dispatch
 **Priority:** P3 · **Effort:** S
@@ -79,6 +99,27 @@ the session times plus a direct booking URL to the alert lines.
 **Done when:** the 🎫 alert lists IMAX session times for the date, with a unit
 test over a captured `by-business-date` payload, and a Cinesa failure on that
 extra call still leaves the base alert intact.
+
+### OTW-08 · Run the news half from the cloud pass to cover Mac-asleep windows
+**Priority:** P1 · **Effort:** M
+**Problem:** The structural hole behind OTW-05: while the Mac sleeps (lid shut,
+on battery, away for a day) the local half runs nothing, and the cloud pass is
+remind-only — so a sale announcement landing overnight is not seen until the
+lid opens. Pathé genuinely cannot move to the cloud (Akamai 403s datacenter
+IPs), but the **news feeds can**: `watcher/news.py` only reads Google News RSS,
+which is not IP-gated, and the measured worst ordinary blind window is ~13 h
+overnight — long enough to miss an announcement outright.
+**Fix:** Give the cloud pass a news-capable mode (e.g. `--mode remind
+--with-news`, or a `news` mode) that runs the news half and its NEWS_LEAD /
+sale-detection findings but skips Pathé and Cinesa entirely, and wire it into
+`.github/workflows/watch.yml`. News matching must stay strict (AGENTS.md
+"Conventions") — this widens *when* it runs, never *what* it matches. Watch for
+double-sending: the local half runs the same feeds, so dedup must be shared
+through `state/state.json`, which both halves already commit.
+**Done when:** a scheduled cloud run raises a news finding with the Mac off,
+the same finding is not re-sent by the next local run, the cloud pass still
+never touches `www.pathe.fr`, and `--mode remind` without the flag behaves
+exactly as today.
 
 ## 4. UX & design
 
