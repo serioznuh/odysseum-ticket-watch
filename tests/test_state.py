@@ -89,6 +89,46 @@ def test_update_from_snapshot_marks_tickets_available():
     assert st["formats_seen"]["a"] == ["imax70"]
 
 
+def test_undelivered_one_shot_alerts_leave_their_baselines_alone():
+    """Failed NEW_LISTING/TICKETS_AVAILABLE sends must retry, while current
+    sale and ticket facts still move forward."""
+
+    class Cfg:
+        primary_slug = "primary"
+        cinema_name = "Pathé Odysseum"
+        cinema_city = "Montpellier"
+
+    sale = iso_in(timedelta(days=30))
+    show = {
+        "slug": "dune-imax-70mm",
+        "title": "Dune : Projection IMAX 70mm",
+        "salesOpeningDatetime": sale,
+        "isMovie": False,
+    }
+    snap = Snapshot(
+        matched_shows=[show],
+        cinema_entries={show["slug"]: {"isBookable": True}},
+        showtimes={
+            show["slug"]: {
+                "2026-12-16": [{"tags": ["imax"], "refCmd": "https://booking"}]
+            }
+        },
+    )
+    st = fresh_state()
+
+    update_from_snapshot(st, snap, Cfg, NOW, advance_one_shot=False)
+
+    assert st["shows_seen"] == []
+    assert st["formats_seen"] == {}
+    assert st["sales"] == {show["slug"]: sale}
+    assert st["sale_target"] == sale
+    assert st["tickets_available"] is True
+    assert [f.kind for f in detect.analyze_pathe(snap, st, Cfg, NOW)] == [
+        "NEW_LISTING",
+        "TICKETS_AVAILABLE",
+    ]
+
+
 # ------------------------------------------------------------------ reminders
 
 def test_no_reminder_far_from_target():

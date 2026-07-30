@@ -253,7 +253,12 @@ def run(argv: list[str] | None = None) -> int:
                 snap = pathe.fetch_snapshot(client, cfg)
         except Exception as e:
             log.exception("Pathé check failed")
-            st["failure_streak"] = st.get("failure_streak", 0) + 1
+            # Capped at the alert threshold: nothing reads a larger value,
+            # and a counter that kept growing would rewrite state.json on
+            # every firing of a long outage, commit and push included.
+            st["failure_streak"] = min(
+                st.get("failure_streak", 0) + 1, cfg.failure_streak_threshold
+            )
             # With adaptive cadence, retries come every 15 min — require both
             # a failure streak AND 6h without success before crying wolf.
             if (
@@ -343,7 +348,16 @@ def run(argv: list[str] | None = None) -> int:
             state_mod.update_from_cinesa(st, csnap, cfg, now, advance_imax=imax_delivered)
 
         if snap is not None:
-            state_mod.update_from_snapshot(st, snap, cfg, now)
+            # Advancing these baselines after a failed send would make the next
+            # analysis agree with the new reality and lose one-shot alerts.
+            one_shot_delivered = all(
+                state_mod.already_sent(st, f.key)
+                for f in findings
+                if f.kind in ("NEW_LISTING", "TICKETS_AVAILABLE")
+            )
+            state_mod.update_from_snapshot(
+                st, snap, cfg, now, advance_one_shot=one_shot_delivered
+            )
             if not sent_any and heartbeat_due(st, now, cfg.heartbeat_days):
                 hb = build_heartbeat(cfg, snap, st, now)
                 if notify.send_telegram(
