@@ -294,7 +294,12 @@ def run(argv: list[str] | None = None) -> int:
                 csnap = cinesa.fetch_snapshot(cfg)
             except Exception as e:
                 log.exception("Cinesa check failed")
-                cin["failure_streak"] = cin.get("failure_streak", 0) + 1
+                # Capped at the alert threshold: nothing reads a larger value,
+                # and a counter that kept growing would rewrite state.json on
+                # every firing of a long outage, commit and push included.
+                cin["failure_streak"] = min(
+                    cin.get("failure_streak", 0) + 1, cfg.failure_streak_threshold
+                )
                 if cin["failure_streak"] >= cfg.failure_streak_threshold and not cin.get(
                     "error_alerted"
                 ):
@@ -327,7 +332,15 @@ def run(argv: list[str] | None = None) -> int:
             st.setdefault("cinesa", {})["error_alerted"] = True
 
         if csnap is not None:
-            state_mod.update_from_cinesa(st, csnap, cfg, now)
+            # Same rule for the IMAX baseline: advancing it after a failed send
+            # would make analyze_cinesa agree with the new reality and never
+            # re-raise the transition, losing the alert for good.
+            imax_delivered = all(
+                state_mod.already_sent(st, f.key)
+                for f in findings
+                if f.kind in ("CINESA_IMAX_GONE", "CINESA_IMAX_BACK")
+            )
+            state_mod.update_from_cinesa(st, csnap, cfg, now, advance_imax=imax_delivered)
 
         if snap is not None:
             state_mod.update_from_snapshot(st, snap, cfg, now)

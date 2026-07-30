@@ -13,6 +13,12 @@ from . import detect
 
 log = logging.getLogger(__name__)
 
+# Consecutive IMAX-free checks needed before `imax_present` flips to False.
+# Doubles as the ceiling for the streak counter: past the confirmation point a
+# bigger number would mean nothing, but it would keep the state file changing
+# on every firing (see update_from_cinesa).
+IMAX_ABSENT_CONFIRM = 2
+
 DEFAULT_STATE: dict = {
     "version": 1,
     "alerts": {},          # dedup key -> ISO timestamp of when the alert was sent
@@ -117,7 +123,11 @@ def update_from_snapshot(state: dict, snap: detect.Snapshot, cfg: Any, now: date
 
 
 def update_from_cinesa(
-    state: dict, snap: detect.CinesaSnapshot, cfg: Any, now: datetime
+    state: dict,
+    snap: detect.CinesaSnapshot,
+    cfg: Any,
+    now: datetime,
+    advance_imax: bool = True,
 ) -> None:
     """Record the Cinesa snapshot as the new baseline (call after alerting).
 
@@ -125,6 +135,11 @@ def update_from_cinesa(
     otherwise manufacture an "IMAX disappeared" alert on the next check.
     `imax_present` only goes False once absence is confirmed twice, which is
     the same threshold analyze_cinesa uses before it alerts.
+
+    `advance_imax=False` freezes the IMAX baseline (`imax_present` and its
+    streak) while still recording the horizon: the caller passes it when an
+    IMAX gone/back alert was generated but not delivered, so the next run sees
+    the same transition again instead of losing the alert forever.
     """
     cin = state.setdefault("cinesa", {})
     before = dict(cin)
@@ -136,12 +151,18 @@ def update_from_cinesa(
 
     cin["horizon"] = snap.days[-1]["date"]
     cin["day_count"] = len(snap.days)
-    if detect.imax_days(snap.days, cfg.cinesa_imax_attribute_id):
+    if not advance_imax:
+        log.info("cinesa: IMAX alert not delivered — keeping the previous IMAX baseline")
+    elif detect.imax_days(snap.days, cfg.cinesa_imax_attribute_id):
         cin["imax_present"] = True
         cin["imax_absent_streak"] = 0
     else:
-        cin["imax_absent_streak"] = cin.get("imax_absent_streak", 0) + 1
-        if cin["imax_absent_streak"] >= 2:
+        # Capped: only the confirmation threshold is ever read, and an
+        # ever-growing counter would diff the state file on every firing.
+        cin["imax_absent_streak"] = min(
+            cin.get("imax_absent_streak", 0) + 1, IMAX_ABSENT_CONFIRM
+        )
+        if cin["imax_absent_streak"] >= IMAX_ABSENT_CONFIRM:
             cin["imax_present"] = False
 
     # Timestamp only a genuine change, so an unchanged schedule leaves the

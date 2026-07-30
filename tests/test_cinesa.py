@@ -329,6 +329,42 @@ def test_unchanged_schedule_leaves_state_untouched():
     assert json.dumps(st, sort_keys=True) == first
 
 
+def test_confirmed_absence_stops_changing_the_state_file():
+    """The streak must not keep counting: it is only ever read as ">= 2", and a
+    growing number would diff (and commit) state.json every 15 minutes for as
+    long as IMAX stays away."""
+    st = fresh_state()
+    st["cinesa"]["imax_present"] = True
+    snap = CinesaSnapshot(days=days(("2026-08-01", False), ("2026-08-02", False)))
+
+    state_mod.update_from_cinesa(st, snap, Cfg, NOW)          # absence recorded
+    state_mod.update_from_cinesa(st, snap, Cfg, NOW)          # absence confirmed
+    confirmed = json.dumps(st, sort_keys=True)
+    assert st["cinesa"]["imax_present"] is False
+
+    for hour in (10, 11, 12):
+        later = datetime(2026, 7, 29, hour, 0, tzinfo=PARIS)
+        state_mod.update_from_cinesa(st, snap, Cfg, later)
+        assert json.dumps(st, sort_keys=True) == confirmed
+
+
+def test_undelivered_imax_alert_leaves_the_baseline_alone():
+    """Advancing the baseline after a failed send would make the next run agree
+    with reality and never re-raise the transition."""
+    st = fresh_state()
+    st["cinesa"]["imax_present"] = True
+    st["cinesa"]["imax_absent_streak"] = 1
+    snap = CinesaSnapshot(days=days(("2026-08-01", False), ("2026-08-02", False)))
+
+    state_mod.update_from_cinesa(st, snap, Cfg, NOW, advance_imax=False)
+    assert st["cinesa"]["imax_present"] is True
+    assert st["cinesa"]["imax_absent_streak"] == 1
+    assert st["cinesa"]["horizon"] == "2026-08-02"  # non-alerting fields still move
+
+    # The alert is therefore still pending on the next check.
+    assert kinds(detect.analyze_cinesa(snap, st, Cfg, NOW)) == ["CINESA_IMAX_GONE"]
+
+
 def test_horizon_move_is_recorded_and_timestamped():
     st = fresh_state()
     state_mod.update_from_cinesa(
@@ -395,3 +431,96 @@ def test_state_upgrade_preserves_existing_cinesa_values(tmp_path):
     assert loaded["cinesa"]["imax_present"] is True
     assert loaded["cinesa"]["horizon"] == "2026-08-25"
     assert loaded["cinesa"]["failure_streak"] == 0  # new key still initialised
+
+
+# ------------------------------------------------------------ check-mode wiring
+
+CONFIG_TOML = """
+[film]
+primary_slug = "dune-troisieme-partie"
+
+[cinema]
+slug = "montpellier-multiplexe-odysseum"
+
+[news]
+enabled = false
+
+[cinesa]
+enabled = true
+film_id = "HO00003228"
+film_title = "La odisea"
+site_id = "032"
+site_name = "Cinesa Diagonal Mar"
+site_city = "Barcelona"
+imax_attribute_id = "0000000086"
+"""
+
+
+class CheckRunner:
+    """Drives `run --mode check` with the Pathé half asleep and Cinesa faked.
+
+    Nothing here touches the network: Pathé is skipped via the freshness guard,
+    `cinesa.fetch_snapshot` and `notify.send_telegram` are replaced.
+    """
+
+    def __init__(self, tmp_path, monkeypatch, initial_cinesa: dict):
+        self.monkeypatch = monkeypatch
+        self.config = tmp_path / "config.toml"
+        self.config.write_text(CONFIG_TOML, encoding="utf-8")
+        self.state = tmp_path / "state.json"
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat")
+        start = fresh_state()
+        start["cinesa"].update(initial_cinesa)
+        start["last_check_ok"] = datetime.now(PARIS).isoformat()
+        self.state.write_text(json.dumps(start), encoding="utf-8")
+
+    def run(self, result, *, delivered: bool) -> dict:
+        """One firing. `result` is a snapshot to return or an exception to raise."""
+        def fake_fetch(cfg):
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        self.monkeypatch.setattr(cinesa, "fetch_snapshot", fake_fetch)
+        self.monkeypatch.setattr(
+            notify, "send_telegram", lambda *a, **kw: delivered
+        )
+        assert main.run(
+            ["--config", str(self.config), "--state", str(self.state),
+             "--mode", "check", "--skip-if-checked-within", "6"]
+        ) == 0
+        return json.loads(self.state.read_text(encoding="utf-8"))
+
+
+def test_failed_imax_alert_is_retried_on_the_next_run(tmp_path, monkeypatch):
+    """A CINESA_IMAX_GONE that never reached the phone must not be swallowed by
+    the baseline advancing behind it."""
+    runner = CheckRunner(
+        tmp_path, monkeypatch, {"imax_present": True, "imax_absent_streak": 1}
+    )
+    gone = CinesaSnapshot(days=days(("2026-08-01", False), ("2026-08-02", False)))
+
+    st = runner.run(gone, delivered=False)
+    assert st["cinesa"]["imax_present"] is True       # baseline held back
+    assert st["cinesa"]["imax_absent_streak"] == 1
+    assert st["cinesa"]["horizon"] == "2026-08-02"    # horizon still recorded
+
+    st = runner.run(gone, delivered=True)
+    assert st["cinesa"]["imax_present"] is False      # delivered — baseline moves
+
+
+def test_cinesa_outage_stops_rewriting_state_once_capped(tmp_path, monkeypatch):
+    """A dead Cinesa half must not commit and push a new failure count every
+    15 minutes for the whole outage."""
+    runner = CheckRunner(tmp_path, monkeypatch, {"imax_present": True})
+    boom = RuntimeError("HTTP 500 from vwc.cinesa.es")
+
+    for _ in range(3):  # failure_streak_threshold
+        runner.run(boom, delivered=False)
+    assert json.loads(runner.state.read_text())["cinesa"]["failure_streak"] == 3
+
+    settled = runner.state.read_bytes()
+    runner.run(boom, delivered=False)
+    runner.run(boom, delivered=False)
+    assert runner.state.read_bytes() == settled

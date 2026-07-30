@@ -90,6 +90,7 @@ def load_config(path: str | Path) -> Config:
         for required in ("film_id", "site_id"):
             if not cinesa.get(required):
                 raise ValueError(f"config: [cinesa] {required} is required when enabled")
+    cinesa_page_url = str(cinesa.get("page_url") or "https://www.cinesa.es/")
     target_dates = [str(d) for d in cinesa.get("target_dates", [])]
     for value in target_dates:
         try:
@@ -138,7 +139,7 @@ def load_config(path: str | Path) -> Config:
         cinesa_enabled=cinesa_enabled,
         cinesa_film_id=str(cinesa.get("film_id", "")),
         cinesa_film_title=str(cinesa.get("film_title", cinesa.get("film_id", ""))),
-        cinesa_page_url=str(cinesa.get("page_url", "https://www.cinesa.es/")),
+        cinesa_page_url=cinesa_page_url,
         cinesa_site_id=str(cinesa.get("site_id", "")),
         cinesa_site_name=str(cinesa.get("site_name", cinesa.get("site_id", ""))),
         cinesa_site_city=str(cinesa.get("site_city", "")),
@@ -147,7 +148,8 @@ def load_config(path: str | Path) -> Config:
         cinesa_api_base=str(
             cinesa.get("api_base", "https://vwc.cinesa.es/WSVistaWebClient")
         ),
-        cinesa_token_url=str(cinesa.get("token_url", cinesa.get("page_url", ""))),
+        # Documented fallback: the token is minted on the film page itself.
+        cinesa_token_url=str(cinesa.get("token_url") or cinesa_page_url),
         cinesa_token_cache=str(cinesa.get("token_cache", ".cache/cinesa-token.json")),
         cinesa_token_refresh_before_hours=float(
             cinesa.get("token_refresh_before_hours", 3.0)

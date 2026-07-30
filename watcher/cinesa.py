@@ -27,6 +27,7 @@ import base64
 import binascii
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -111,8 +112,11 @@ def save_token(path: str | Path, token: str, *, last_attempt: float | None = Non
     stamp = time.time() if last_attempt is None else last_attempt
     payload = {"token": token, "last_refresh_attempt": stamp}
     tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload), encoding="utf-8")
-    tmp.chmod(0o600)
+    # Created 0600 rather than chmod'ed afterwards: the token must never be
+    # world-readable, not even for the instant between write and chmod.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload))
     tmp.replace(p)
 
 
