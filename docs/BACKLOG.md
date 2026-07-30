@@ -21,6 +21,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-06 | Pathé failure_streak churns state; baseline can lose an alert | P2 | S | Bugs | [x] |
 | OTW-07 | Stale-check alert says "Pathé" but the whole local half is down | P3 | S | Bugs | [ ] |
 | OTW-08 | Run the news half from the cloud pass to cover Mac-asleep windows | P1 | M | Features | [ ] |
+| OTW-09 | Supervision is one-directional — nothing watches the cloud half | P2 | M | Features | [ ] |
 
 ## 1. Critical — security & breakage
 
@@ -120,6 +121,36 @@ through `state/state.json`, which both halves already commit.
 the same finding is not re-sent by the next local run, the cloud pass still
 never touches `www.pathe.fr`, and `--mode remind` without the flag behaves
 exactly as today.
+
+### OTW-09 · Supervision is one-directional — nothing watches the cloud half
+**Priority:** P2 · **Effort:** M
+**Problem:** If the *local* half dies, the cloud pass says so (`is_check_stale`
+in `watcher/__main__.py`, `alerts.stale_check_hours`, now 18 h). The reverse has
+no cover: if the *cloud* half stops — Actions disabled, `TELEGRAM_*` secrets
+rotated, workflow error, GitHub disabling the cron after 60 days of repo
+inactivity — the reminder pings **and** the stale alert both vanish silently,
+and nothing on the local side notices. The 7-day `heartbeat_days` is the only
+positive liveness signal, and it is sent by the local half, so it keeps arriving
+happily while the cloud is dead. Worst case is losing the countdown reminders
+around the sale opening, which is the one moment the whole project exists for.
+**Fix:** Have the cloud pass record its own liveness and the local pass alert on
+it — the mirror of the existing stale check. Two hazards shape the design:
+- **State churn.** A `last_cloud_run` timestamp written every 15 min would make
+  the cloud commit and push ~96 times a day — the exact trap AGENTS.md calls out
+  for the `cinesa` key. Bucket it (floor to the hour, or the day) so the value
+  changes at most ~24 times daily, or keep it out of `state/state.json` and read
+  the last successful run from the GitHub Actions API instead (the repo is
+  public, so unauthenticated works).
+- **Commit timestamps are not a substitute.** The cloud only commits state on
+  real change, so quiet periods produce no cloud commits at all — the last 12
+  state commits are all `local check`. Absence of a commit proves nothing.
+Alert should reuse `WATCHER_ERROR` (buzzes by default) with a fresh key prefix,
+and stay quiet while the cloud is merely idle rather than dead.
+**Done when:** disabling the workflow (or pointing it at a bad token) produces
+one loud alert from the local half within a bounded window, the fix adds no more
+than ~24 state writes/day, and a normal week of both halves running raises
+nothing. Note the irreducible limit: if both halves die, only the absence of the
+7-day heartbeat is left — worth saying plainly in the README rather than solving.
 
 ## 4. UX & design
 
