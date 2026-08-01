@@ -7,7 +7,7 @@
   "cinesa": {
     "day_count": 25,
     "error_alerted": false,
-    "failure_streak": 1,
+    "failure_streak": 2,
     "horizon": "2026-08-25",
     "imax_absent_streak": 0,
     "imax_present": true,
