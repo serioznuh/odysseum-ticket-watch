@@ -22,6 +22,8 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-07 | Stale-check alert says "Pathé" but the whole local half is down | P3 | S | Bugs | [ ] |
 | OTW-08 | Run the news half from the cloud pass to cover Mac-asleep windows | P1 | M | Features | [ ] |
 | OTW-09 | Supervision is one-directional — nothing watches the cloud half | P2 | M | Features | [ ] |
+| OTW-10 | Cinesa VPN 403 repeatedly launches headed Chrome | P1 | S | Bugs | [x] |
+| OTW-11 | Make Cinesa Chrome refresh normally imperceptible | P2 | S | UX & design | [ ] |
 
 ## 1. Critical — security & breakage
 
@@ -83,6 +85,30 @@ sessions fields that are meant to always reflect current truth).
 after the cap, and a failed send for a one-shot Pathé alert kind retries on the
 next run instead of being silently dropped — both with regression tests
 mirroring `tests/test_cinesa.py`'s equivalents.
+
+### OTW-10 · Cinesa VPN 403 repeatedly launches headed Chrome
+**Priority:** P1 · **Effort:** S
+**Problem:** `watcher/cinesa.py::_get_json` treats both 401 and 403 as a rejected
+token, and `fetch_snapshot` responds with `get_token(force=True)`. The forced
+path bypasses the proactive-refresh backoff and valid-token fallback. With the
+owner's VPN enabled on 2026-08-01/02, the data API returned 403 while the same
+cached token worked again after the VPN was disabled; meanwhile every 15-min
+firing launched headed Chrome, often leaving it alive for the full 60 s on
+Cloudflare's `Attention Required!` page. This is noisy, cannot repair an
+IP-level block, and the eventual alert misdiagnoses it as a Chrome/GUI problem.
+**Fix:** Preserve the response status and distinguish an authentication failure
+from a likely network/IP rejection. A 401 may force an immediate token mint. A
+403 may try one forced mint, but a failed mint must record a cooldown in the
+git-ignored credential cache while preserving the still-unexpired token; later
+firings should retry the API but must not reopen Chrome inside that cooldown.
+When the API accepts the cached token again, clear the incident naturally. Add
+VPN/proxy guidance to the Cinesa error alert. Never put the token, cooldown, or
+per-run timestamps in `state/state.json` or logs.
+**Done when:** a test simulating repeated 15-min 403s plus a hard-blocked mint
+launches Chrome at most once per cooldown window (at least 60 min), turning the
+VPN off lets the original cached token recover without another mint, a 401 still
+forces renewal, and the three-failure alert says to disable VPN/proxy and wait
+for the automatic retry.
 
 ## 3. Features
 
@@ -153,6 +179,33 @@ nothing. Note the irreducible limit: if both halves die, only the absence of the
 7-day heartbeat is left — worth saying plainly in the README rather than solving.
 
 ## 4. UX & design
+
+### OTW-11 · Make Cinesa Chrome refresh normally imperceptible
+**Priority:** P2 · **Effort:** S
+**Problem:** A headed browser is irreducible on this laptop: Chrome activates
+itself even under `open -g -j`, so `watcher/cdp.py` restores the previously
+frontmost app after opening the Cinesa tab. That works in the measured happy
+path, but restoration is absent when startup or `/json/new` fails, restoration
+errors are intentionally swallowed, Chrome termination is not confirmed, and a
+definitive `Attention Required!` hard block can keep the hidden browser alive
+for the full 60 s. Therefore the honest local target is *normally
+imperceptible*, not 100% guaranteed invisible.
+**Fix:** Keep the real headed, offscreen, throwaway-profile design. Restore the
+captured app again from the outer `finally` after cleanup so every post-launch
+exit path gets a best-effort hand-back; make a definitive Cloudflare hard-block
+title fail fast while still allowing the normal `Just a moment…` challenge time
+to settle; and verify watcher-profile Chrome processes exit with a short bounded
+wait and warning. Add small mocked tests for launch arguments, early/late failure
+focus restoration, and profile-scoped cleanup—do not add Selenium/Playwright,
+stealth, CAPTCHA solving, headless mode, idle detection, or user-profile access.
+Update README/current-state wording to promise only normally imperceptible
+operation and state that absolute zero laptop impact requires a separate
+always-on home machine.
+**Done when:** successful refresh still yields a token, every simulated failure
+after Chrome launch attempts final focus restoration and watcher-only cleanup, a
+hard-block page exits within 10 s rather than 60 s, the user's own Chrome cannot
+match the cleanup target, tests cover the lifecycle contract, and the owner docs
+describe the realistic visibility boundary without claiming a 100% guarantee.
 
 ## 5. Infra, tooling & docs
 
