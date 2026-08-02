@@ -185,7 +185,11 @@ def test_hard_block_title_fails_without_waiting_for_normal_timeout(
             if params["expression"] == "token":
                 return {"result": {"result": {"value": ""}}}
             assert params["expression"] == "document.title"
-            return {"result": {"result": {"value": "Attention Required!"}}}
+            return {
+                "result": {
+                    "result": {"value": "Attention Required! | Cloudflare"}
+                }
+            }
 
         def close(self):
             pass

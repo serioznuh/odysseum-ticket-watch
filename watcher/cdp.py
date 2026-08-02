@@ -381,9 +381,9 @@ def evaluate_on_page(
                 if value:
                     return value
                 title = _page_title(ws)
-                if title.strip() == HARD_BLOCK_TITLE:
+                if title.strip().startswith(HARD_BLOCK_TITLE):
                     raise CDPError(
-                        f"Cloudflare hard block: page title is {HARD_BLOCK_TITLE!r}"
+                        f"Cloudflare hard block: page title is {title.strip()!r}"
                     )
                 time.sleep(poll_seconds)
             if not title:
