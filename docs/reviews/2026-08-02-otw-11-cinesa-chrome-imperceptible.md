@@ -12,3 +12,12 @@ NOTES:
 2. cdp.py:225,249 — exact-argv match assumes profile path has no spaces; true for default `.cache/chrome-profile` but worth a comment.
 3. cdp.py:307 — narrow suppress tuple could let `struct.error` escape `_page_title`; harmless in practice.
 4. docs/current-state.md:55 — will be accurate once the comparison is fixed.
+## Round 2 — VERDICT: APPROVE · re-review @ high
+- [P1] cdp.py:384 — hard-block title check now uses `startswith(HARD_BLOCK_TITLE)` and test fixture uses real observed title — FIXED
+NOTES:
+1. [accepted] cdp.py:399-404 — late _restore_focus on 60s timeout path; explicitly requested behavior per OTW-11 spec.
+2. [accepted] cdp.py:225 — exact-argv match assumes no spaces in profile path; true for deployment path.
+3. [accepted] _page_title extra round-trip per poll; negligible against localhost DevTools.
+
+## Outcome
+Approved after 2 rounds; eligible for merge pending GitHub confirmation.
