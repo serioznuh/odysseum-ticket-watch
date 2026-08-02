@@ -73,7 +73,7 @@ headed is required — and no stealth tooling or challenge-solving is used: if C
 stops clearing the challenge itself, the watcher raises ⚠️ rather than working around it.
 
 **Requirements:** Chrome installed, Mac logged in and awake — a locked screen is fine (verified); only system sleep or a login window blocks it.
-Chrome self-activates on launch, so focus is handed back explicitly — measured 0–0.15 s, i.e. you should not notice it.
+Chrome self-activates on launch, so focus is handed back explicitly. Refreshes are normally imperceptible, not a 100% guarantee of invisibility; absolute zero laptop impact requires a separate always-on home machine.
 
 ## Setup
 

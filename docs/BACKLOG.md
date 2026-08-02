@@ -23,7 +23,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-08 | Run the news half from the cloud pass to cover Mac-asleep windows | P1 | M | Features | [ ] |
 | OTW-09 | Supervision is one-directional — nothing watches the cloud half | P2 | M | Features | [ ] |
 | OTW-10 | Cinesa VPN 403 repeatedly launches headed Chrome | P1 | S | Bugs | [x] |
-| OTW-11 | Make Cinesa Chrome refresh normally imperceptible | P2 | S | UX & design | [ ] |
+| OTW-11 | Make Cinesa Chrome refresh normally imperceptible | P2 | S | UX & design | [x] |
 
 ## 1. Critical — security & breakage
 

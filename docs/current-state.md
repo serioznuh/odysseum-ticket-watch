@@ -48,9 +48,15 @@ A single-user Telegram watcher covering **two independent targets**:
   assumed. No stealth or challenge-solving is used or wanted: if Chrome stops
   clearing the challenge on its own, the watcher must fail loudly instead.
 - Chrome **self-activates on launch** even under `open -g -j`, so `cdp.py`
-  captures the frontmost app and re-activates it after the tab is created
-  (doing it any earlier just lets Chrome take focus again). Measured focus
-  loss: 0–0.15 s per refresh, twice a day.
+  captures the frontmost app and hands focus back after the tab is created and
+  again after profile-scoped cleanup (doing it any earlier just lets Chrome
+  take focus again). Refreshes are normally imperceptible, but a headed
+  browser has no absolute invisibility guarantee.
+- A definitive Cloudflare `Attention Required!` title fails fast; the normal
+  `Just a moment…` challenge is allowed to use the regular poll window. Cleanup
+  signals only the watcher profile and warns if Chrome termination is not
+  confirmed. Absolute zero laptop impact requires a separate always-on home
+  machine.
 - **A locked screen does not block the token step** — measured on the owner's
   Mac: eight mints over 13 min while locked (one with the display on, seven
   with it asleep, on AC) each returned a fresh ~12 h token in 2.3 s, against a

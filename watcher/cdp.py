@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import socket
 import struct
 import subprocess
@@ -34,6 +35,10 @@ log = logging.getLogger(__name__)
 
 DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+HARD_BLOCK_TITLE = "Attention Required!"
+CLEANUP_WAIT_SECONDS = 3.0
+CLEANUP_POLL_SECONDS = 0.1
+_MISSING = object()
 
 
 class CDPError(RuntimeError):
@@ -187,7 +192,12 @@ def _restore_focus(bundle_path: str | None) -> None:
         )
 
 
-def _launch_background(chrome_path: str, args: list[str]) -> str | None:
+def _launch_background(
+    chrome_path: str,
+    args: list[str],
+    *,
+    previous_app: str | None | object = _MISSING,
+) -> str | None:
     """Start Chrome hidden/backgrounded; returns the app that had focus.
 
     Chrome activates itself on launch even under `open -g -j` (measured: our
@@ -198,7 +208,7 @@ def _launch_background(chrome_path: str, args: list[str]) -> str | None:
     The window is still a real one, which is what clears the challenge;
     nothing here touches the challenge itself.
     """
-    previous = _frontmost_app()
+    previous = _frontmost_app() if previous_app is _MISSING else previous_app
     bundle = chrome_path.split("/Contents/MacOS/")[0]
     subprocess.run(
         ["open", "-g", "-j", "-n", "-a", bundle, "--args", *args],
@@ -210,13 +220,9 @@ def _launch_background(chrome_path: str, args: list[str]) -> str | None:
     return previous
 
 
-def _terminate_by_profile(profile_dir: str) -> None:
-    """Kill only the Chrome we started, matched on its throwaway profile path.
-
-    `open` detaches, so there is no child PID to wait on. The profile path is
-    unique to this watcher, so the user's own Chrome can never match.
-    """
-    marker = f"--user-data-dir={profile_dir}"
+def _profile_pids(profile_dir: str) -> set[int] | None:
+    """Return running Chrome PIDs whose exact profile argument is ours."""
+    marker = f"--user-data-dir={os.path.abspath(profile_dir)}"
     try:
         listing = subprocess.run(
             ["ps", "-Ao", "pid=,command="],
@@ -226,15 +232,81 @@ def _terminate_by_profile(profile_dir: str) -> None:
             check=True,
         ).stdout
     except (OSError, subprocess.SubprocessError):
-        return
+        log.warning(
+            "could not inspect Chrome processes for watcher profile %s;"
+            " termination not confirmed",
+            profile_dir,
+        )
+        return None
+
+    pids = set()
     for line in listing.splitlines():
-        if marker not in line:
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
             continue
-        pid_text = line.strip().split(None, 1)[0]
         try:
-            os.kill(int(pid_text), 15)
-        except (ValueError, ProcessLookupError, PermissionError):
+            pid = int(parts[0])
+            command = shlex.split(parts[1])
+        except (ValueError, OSError):
             continue
+        if marker in command:
+            pids.add(pid)
+    return pids
+
+
+def _terminate_by_profile(profile_dir: str) -> None:
+    """Terminate only our Chrome profile and confirm it goes away.
+
+    `open` detaches, so there is no child PID to wait on. The profile path is
+    unique to this watcher, so the user's own Chrome can never match. A short
+    bounded wait catches a Chrome that ignored SIGTERM without holding the
+    watcher open indefinitely.
+    """
+    pids = _profile_pids(profile_dir)
+    if not pids:
+        return
+
+    deadline = time.monotonic() + CLEANUP_WAIT_SECONDS
+    while pids:
+        for pid in pids:
+            try:
+                os.kill(pid, 15)
+            except (ProcessLookupError, PermissionError):
+                continue
+
+        current = _profile_pids(profile_dir)
+        if current is None or not current:
+            return
+        pids = current
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(CLEANUP_POLL_SECONDS, remaining))
+
+    if pids:
+        log.warning(
+            "Chrome processes for watcher profile %s did not exit within %.1fs: %s",
+            profile_dir,
+            CLEANUP_WAIT_SECONDS,
+            ", ".join(str(pid) for pid in sorted(pids)),
+        )
+
+
+def _page_title(ws: _WebSocket) -> str:
+    """Read the title without turning a transient CDP error into a failure."""
+    try:
+        value = (
+            ws.call(
+                "Runtime.evaluate",
+                {"expression": "document.title", "returnByValue": True},
+            )
+            .get("result", {})
+            .get("result", {})
+            .get("value", "")
+        )
+    except (AttributeError, CDPError, OSError, TypeError, ValueError):
+        return ""
+    return value if isinstance(value, str) else ""
 
 
 def _devtools(url: str, method: str = "GET", timeout: float = 5.0) -> Any:
@@ -264,20 +336,22 @@ def evaluate_on_page(
     os.makedirs(profile_dir, exist_ok=True)
     profile = os.path.abspath(profile_dir)
     port = _free_port()
-    previous_app = _launch_background(
-        chrome_path,
-        [
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={profile}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-background-networking",
-            "--window-size=1200,900",
-            "--window-position=-32000,-32000",
-            "about:blank",
-        ],
-    )
+    previous_app = _frontmost_app()
     try:
+        _launch_background(
+            chrome_path,
+            [
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={profile}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-background-networking",
+                "--window-size=1200,900",
+                "--window-position=-32000,-32000",
+                "about:blank",
+            ],
+            previous_app=previous_app,
+        )
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
@@ -298,6 +372,7 @@ def evaluate_on_page(
         ws = _WebSocket(tab["webSocketDebuggerUrl"])
         try:
             deadline = time.monotonic() + wait_seconds
+            title = ""
             while time.monotonic() < deadline:
                 reply = ws.call(
                     "Runtime.evaluate", {"expression": expression, "returnByValue": True}
@@ -305,15 +380,14 @@ def evaluate_on_page(
                 value = reply.get("result", {}).get("result", {}).get("value")
                 if value:
                     return value
+                title = _page_title(ws)
+                if title.strip() == HARD_BLOCK_TITLE:
+                    raise CDPError(
+                        f"Cloudflare hard block: page title is {HARD_BLOCK_TITLE!r}"
+                    )
                 time.sleep(poll_seconds)
-            title = ""
-            with contextlib.suppress(Exception):
-                title = (
-                    ws.call("Runtime.evaluate", {"expression": "document.title", "returnByValue": True})
-                    .get("result", {})
-                    .get("result", {})
-                    .get("value", "")
-                )
+            if not title:
+                title = _page_title(ws)
             raise CDPError(
                 f"page never produced the value within {wait_seconds:.0f}s"
                 f" (last page title: {title!r})"
@@ -321,4 +395,9 @@ def evaluate_on_page(
         finally:
             ws.close()
     finally:
-        _terminate_by_profile(profile)
+        try:
+            _terminate_by_profile(profile)
+        except Exception:
+            log.exception("unexpected error while cleaning up watcher Chrome")
+        finally:
+            _restore_focus(previous_app)
