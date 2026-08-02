@@ -63,9 +63,30 @@ TOKEN_SKEW_SECONDS = 600
 # hours would launch Chrome on all twelve firings in the proactive window.
 PROACTIVE_RETRY_SECONDS = 1800
 
+# A 403 from the data host is more likely to be a network/IP rejection than a
+# bad bearer token. Do not launch headed Chrome again on every 15-min firing
+# while that condition persists.
+NETWORK_REJECTION_COOLDOWN_SECONDS = 60 * 60
+
 
 class TokenRejected(RuntimeError):
-    """The API refused the token (401/403) — it needs re-minting."""
+    """The API refused the token, retaining the response status."""
+
+    def __init__(self, status_code: int, url: str):
+        self.status_code = status_code
+        self.url = url
+        super().__init__(f"HTTP {status_code} from {url}")
+
+
+class TokenMintCooldown(RuntimeError):
+    """A previous 403 blocked token minting, so Chrome must stay closed."""
+
+    status_code = 403
+
+    def __init__(self):
+        super().__init__(
+            "Cinesa token mint is on cooldown after an HTTP 403 network/IP rejection"
+        )
 
 
 def make_client() -> httpx.Client:
@@ -92,6 +113,19 @@ def read_cache(path: str | Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _write_cache(path: str | Path, payload: dict) -> None:
+    """Atomically write credential metadata without weakening its permissions."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    # Created 0600 rather than chmod'ed afterwards: the token must never be
+    # world-readable, not even for the instant between write and chmod.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload))
+    tmp.replace(p)
+
+
 def load_cached_token(path: str | Path, now_epoch: float) -> str | None:
     """Cached token if it is still usable at all, else None."""
     token = read_cache(path).get("token") or ""
@@ -105,19 +139,46 @@ def load_cached_token(path: str | Path, now_epoch: float) -> str | None:
 
 def save_token(path: str | Path, token: str, *, last_attempt: float | None = None) -> None:
     """Cache the token 0600 — it is a credential, and must never be committed."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
     # `or` would be wrong here: an explicit 0 ("never attempted") is falsy and
     # would silently become now, arming the backoff against a fresh cache.
     stamp = time.time() if last_attempt is None else last_attempt
     payload = {"token": token, "last_refresh_attempt": stamp}
-    tmp = p.with_suffix(".tmp")
-    # Created 0600 rather than chmod'ed afterwards: the token must never be
-    # world-readable, not even for the instant between write and chmod.
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload))
-    tmp.replace(p)
+    _write_cache(path, payload)
+
+
+def mint_cooldown_active(path: str | Path, now_epoch: float | None = None) -> bool:
+    """Whether a network-rejection cooldown still suppresses token minting."""
+    now = time.time() if now_epoch is None else now_epoch
+    try:
+        return float(read_cache(path).get("mint_cooldown_until")) > now
+    except (TypeError, ValueError):
+        return False
+
+
+def record_mint_cooldown(path: str | Path, now_epoch: float | None = None) -> None:
+    """Record a fixed cooldown while preserving the cached credential."""
+    now = time.time() if now_epoch is None else now_epoch
+    cache = read_cache(path)
+    try:
+        existing = float(cache.get("mint_cooldown_until"))
+    except (TypeError, ValueError):
+        existing = 0.0
+    # Repeated 403s during an active window must not extend it forever: the
+    # watcher should get one fresh chance per window, not suppress minting for
+    # the lifetime of a VPN outage.
+    if existing > now:
+        return
+    cache["mint_cooldown_until"] = now + NETWORK_REJECTION_COOLDOWN_SECONDS
+    _write_cache(path, cache)
+
+
+def clear_mint_cooldown(path: str | Path) -> None:
+    """Forget a network incident after the API accepts a token again."""
+    cache = read_cache(path)
+    if "mint_cooldown_until" not in cache:
+        return
+    del cache["mint_cooldown_until"]
+    _write_cache(path, cache)
 
 
 def mint_token(cfg: Any) -> str:
@@ -147,6 +208,14 @@ def get_token(cfg: Any, *, force: bool = False) -> str:
     cache = read_cache(cfg.cinesa_token_cache)
     cached = load_cached_token(cfg.cinesa_token_cache, now)
     exp = token_expiry(cached) if cached else None
+
+    if not force and mint_cooldown_active(cfg.cinesa_token_cache, now):
+        if cached:
+            log.debug(
+                "using cached Cinesa token while the network-rejection cooldown is active"
+            )
+            return cached
+        raise TokenMintCooldown()
 
     if cached and not force:
         remaining_h = (exp - now) / 3600 if exp else 0.0
@@ -197,7 +266,7 @@ def _get_json(client: httpx.Client, url: str, token: str) -> Any:
         try:
             r = client.get(url, headers={"Authorization": f"Bearer {token}"})
             if r.status_code in (401, 403):
-                raise TokenRejected(f"HTTP {r.status_code} from {url}")
+                raise TokenRejected(r.status_code, url)
             r.raise_for_status()
             return r.json()
         except TokenRejected:
@@ -207,6 +276,30 @@ def _get_json(client: httpx.Client, url: str, token: str) -> Any:
             log.warning("GET %s failed (attempt %d/3): %s", url, attempt + 1, e)
             time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"Cinesa API request failed for {url}: {last_error}")
+
+
+def _token_after_403(cfg: Any, token: str) -> str:
+    """Try one mint for a 403, or reuse the valid token during its cooldown."""
+    now = time.time()
+    if mint_cooldown_active(cfg.cinesa_token_cache, now):
+        log.info("Cinesa API returned 403 — retrying the cached token without Chrome")
+        return token
+
+    try:
+        return get_token(cfg, force=True)
+    except Exception as e:
+        # The 403 is usually an IP/network rejection. Keep the token that was
+        # just used; it may work as soon as the VPN/proxy is removed.
+        record_mint_cooldown(cfg.cinesa_token_cache, now)
+        exp = token_expiry(token)
+        if exp is None or exp > now:
+            log.warning(
+                "Cinesa token mint after HTTP 403 failed (%s) — keeping the cached"
+                " token; Chrome minting is suppressed for the cooldown window",
+                e,
+            )
+            return token
+        raise
 
 
 def parse_screening_dates(payload: Any, cfg: Any) -> list[dict]:
@@ -246,11 +339,31 @@ def fetch_snapshot(cfg: Any) -> detect.CinesaSnapshot:
         try:
             payload = _get_json(client, url, token)
         except TokenRejected as e:
-            # Expected roughly twice a day, or if Cinesa rotates signing keys.
-            log.info("Cinesa token rejected (%s) — re-minting once", e)
-            payload = _get_json(client, url, get_token(cfg, force=True))
+            if e.status_code == 401:
+                # A 401 is an authentication failure: force an immediate mint,
+                # even if a network-rejection cooldown is present.
+                log.info("Cinesa token rejected (%s) — forcing one new token", e)
+                payload = _get_json(client, url, get_token(cfg, force=True))
+            elif e.status_code == 403:
+                # A 403 is more likely an IP/network rejection. A failed mint
+                # is contained by a cache-only cooldown, and the still-valid
+                # token gets another API chance on later firings.
+                log.info("Cinesa API rejected the network (%s)", e)
+                retry_token = _token_after_403(cfg, token)
+                try:
+                    payload = _get_json(client, url, retry_token)
+                except TokenRejected as retry_error:
+                    if retry_error.status_code == 403:
+                        # A freshly minted token that is also rejected points
+                        # to the same network/IP block; start the cooldown.
+                        record_mint_cooldown(cfg.cinesa_token_cache)
+                    raise
+            else:
+                raise
     finally:
         client.close()
+
+    clear_mint_cooldown(cfg.cinesa_token_cache)
 
     days = parse_screening_dates(payload, cfg)
     log.info(

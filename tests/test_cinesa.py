@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from typing import ClassVar
 
+import httpx
 import pytest
 
 from watcher import __main__ as main
@@ -160,6 +161,37 @@ class TokenCfg:
         self.cinesa_token_cache = str(cache)
 
 
+class FetchCfg(Cfg):
+    """Cinesa fields needed by fetch_snapshot, with a test cache path."""
+
+    cinesa_api_base = "https://vwc.cinesa.es/WSVistaWebClient"
+    cinesa_token_url = "https://www.cinesa.es/"
+    cinesa_chrome_path = "/nonexistent/Chrome"
+    cinesa_chrome_profile = "/tmp/profile"
+    cinesa_token_refresh_before_hours = 3.0
+
+    def __init__(self, cache):
+        self.cinesa_token_cache = str(cache)
+
+
+def mock_cinesa_api(monkeypatch, route):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        result = route(request)
+        if isinstance(result, int):
+            return httpx.Response(result, request=request)
+        return httpx.Response(200, json=result, request=request)
+
+    monkeypatch.setattr(
+        cinesa,
+        "make_client",
+        lambda: httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    return requests
+
+
 def test_fresh_token_is_reused_without_launching_chrome(tmp_path, monkeypatch):
     cfg = TokenCfg(tmp_path / "t.json")
     token = make_jwt(time.time() + 10 * 3600)
@@ -235,6 +267,109 @@ def test_rejected_token_never_falls_back_to_itself(tmp_path, monkeypatch):
     monkeypatch.setattr(cinesa, "mint_token", boom)
     with pytest.raises(cdp.CDPError):
         cinesa.get_token(cfg, force=True)
+
+
+def test_403_mint_failure_cools_down_chrome_and_cached_token_recovers(
+    tmp_path, monkeypatch
+):
+    """A VPN 403 retries the API every firing but mints at most once per hour."""
+    clock = [1_800_000_000.0]
+    monkeypatch.setattr(cinesa.time, "time", lambda: clock[0])
+    cfg = FetchCfg(tmp_path / "token.json")
+    old = make_jwt(clock[0] + 12 * 3600)
+    cinesa.save_token(cfg.cinesa_token_cache, old, last_attempt=0)
+
+    launches = []
+
+    def blocked_mint(_cfg):
+        launches.append(clock[0])
+        raise cdp.CDPError("Cloudflare challenge did not clear")
+
+    monkeypatch.setattr(cinesa, "mint_token", blocked_mint)
+    recovered = [False]
+
+    def route(_request):
+        if recovered[0]:
+            return ocapi_payload(("2026-08-26", Cfg.cinesa_film_id, "032", [IMAX]))
+        return 403
+
+    mock_cinesa_api(monkeypatch, route)
+
+    for _ in range(4):
+        with pytest.raises(cinesa.TokenRejected) as rejected:
+            cinesa.fetch_snapshot(cfg)
+        assert rejected.value.status_code == 403
+        clock[0] += 15 * 60
+
+    assert len(launches) == 1
+    cache = cinesa.read_cache(cfg.cinesa_token_cache)
+    assert cache["token"] == old
+    assert cache["mint_cooldown_until"] == pytest.approx(
+        1_800_000_000.0 + cinesa.NETWORK_REJECTION_COOLDOWN_SECONDS
+    )
+
+    # Once the network is usable again, the original token succeeds without a
+    # second headed Chrome launch, and the cache-only incident disappears.
+    recovered[0] = True
+    snap = cinesa.fetch_snapshot(cfg)
+    assert snap.days == [{"date": "2026-08-26", "attributes": [IMAX]}]
+    assert len(launches) == 1
+    cache = cinesa.read_cache(cfg.cinesa_token_cache)
+    assert cache["token"] == old
+    assert "mint_cooldown_until" not in cache
+
+
+def test_403_gets_one_new_mint_after_cooldown_window(tmp_path, monkeypatch):
+    """A persistent block gets another mint chance only after the window."""
+    clock = [1_800_000_000.0]
+    monkeypatch.setattr(cinesa.time, "time", lambda: clock[0])
+    cfg = FetchCfg(tmp_path / "token.json")
+    cinesa.save_token(
+        cfg.cinesa_token_cache,
+        make_jwt(clock[0] + 12 * 3600),
+        last_attempt=0,
+    )
+    launches = []
+
+    def blocked_mint(_cfg):
+        launches.append(clock[0])
+        raise cdp.CDPError("blocked")
+
+    monkeypatch.setattr(cinesa, "mint_token", blocked_mint)
+    mock_cinesa_api(monkeypatch, lambda _request: 403)
+
+    with pytest.raises(cinesa.TokenRejected):
+        cinesa.fetch_snapshot(cfg)
+    clock[0] += 15 * 60
+    with pytest.raises(cinesa.TokenRejected):
+        cinesa.fetch_snapshot(cfg)
+    assert len(launches) == 1
+
+    clock[0] += cinesa.NETWORK_REJECTION_COOLDOWN_SECONDS
+    with pytest.raises(cinesa.TokenRejected):
+        cinesa.fetch_snapshot(cfg)
+    assert len(launches) == 2
+
+
+def test_401_forces_token_renewal(tmp_path, monkeypatch):
+    cfg = FetchCfg(tmp_path / "token.json")
+    old = make_jwt(time.time() + 6 * 3600)
+    new = make_jwt(time.time() + 12 * 3600)
+    cinesa.save_token(cfg.cinesa_token_cache, old)
+    monkeypatch.setattr(cinesa, "mint_token", lambda _cfg: new)
+
+    requests = mock_cinesa_api(
+        monkeypatch,
+        lambda _request: 401 if len(requests) == 1 else ocapi_payload(
+            ("2026-08-26", Cfg.cinesa_film_id, "032", [IMAX])
+        ),
+    )
+
+    snap = cinesa.fetch_snapshot(cfg)
+    assert snap.days == [{"date": "2026-08-26", "attributes": [IMAX]}]
+    assert len(requests) == 2
+    assert requests[0].headers["Authorization"] == f"Bearer {old}"
+    assert requests[1].headers["Authorization"] == f"Bearer {new}"
 
 
 # ------------------------------------------------------------------- detection
@@ -410,6 +545,24 @@ def test_cinesa_failure_alert_buzzes_and_names_the_cause():
         Cfg, 3, "HTTP 500 from vwc.cinesa.es", "cinesa_error:2026-08-01"
     )
     assert "Cinesa API change" in "\n".join(generic.lines)
+
+    vpn = main.build_cinesa_error_finding(
+        Cfg,
+        3,
+        cinesa.TokenRejected(403, "https://vwc.cinesa.es/WSVistaWebClient"),
+        "cinesa_error:2026-08-01",
+    )
+    vpn_body = "\n".join(vpn.lines)
+    assert "VPN" in vpn_body and "proxy" in vpn_body
+    assert "automatic retry" in vpn_body
+
+    quoted = main.build_cinesa_error_finding(
+        Cfg,
+        3,
+        "Client error '403 Forbidden' for url 'https://vwc.cinesa.es/WSVistaWebClient'",
+        "cinesa_error:2026-08-01",
+    )
+    assert "VPN" in "\n".join(quoted.lines)
 
 
 def test_cinesa_error_and_recovery_keys_allow_repeat_incidents():

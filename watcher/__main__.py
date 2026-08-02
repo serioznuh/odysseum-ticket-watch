@@ -75,11 +75,38 @@ def build_recovered_finding(cfg, now: datetime) -> Finding:
     )
 
 
-def build_cinesa_error_finding(cfg, streak: int, error: str, key: str) -> Finding:
+def _cinesa_error_status(error: str | Exception) -> int | None:
+    status = getattr(error, "status_code", None)
+    if status is None:
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None)
+    if status is not None:
+        try:
+            return int(status)
+        except (TypeError, ValueError):
+            pass
+
+    text = str(error)
+    match = re.search(r'''(?:\bHTTP\s+|['"])(\d{3})\b''', text)
+    return int(match.group(1)) if match else None
+
+
+def build_cinesa_error_finding(
+    cfg, streak: int, error: str | Exception, key: str
+) -> Finding:
     """Cinesa half is blind. Kept separate from the Pathé error: the two halves
     fail for unrelated reasons and one must never mask the other."""
-    summary = " ".join(error.split())[:300]
-    if "Chrome" in error or "CDP" in error or "challenge" in error.lower():
+    summary = " ".join(str(error).split())[:300]
+    status = _cinesa_error_status(error)
+    if status == 403:
+        guidance = (
+            "Likely a Cinesa network/IP rejection. Disable any VPN or proxy, then"
+            " wait for the next automatic retry; the cached token is preserved and"
+            " Chrome stays closed during the cooldown."
+        )
+    elif status == 401:
+        guidance = "Cinesa rejected the token; the watcher will force a fresh token on the next automatic retry."
+    elif "Chrome" in str(error) or "CDP" in str(error) or "challenge" in str(error).lower():
         guidance = (
             "The token step could not drive Chrome. Check that Google Chrome is"
             " installed at the configured path and that the Mac is logged in and"
@@ -311,7 +338,7 @@ def run(argv: list[str] | None = None) -> int:
                 ):
                     cinesa_error_key = f"cinesa_error:{now:%Y-%m-%d}"
                     findings.append(
-                        build_cinesa_error_finding(cfg, cin["failure_streak"], str(e), cinesa_error_key)
+                        build_cinesa_error_finding(cfg, cin["failure_streak"], e, cinesa_error_key)
                     )
             else:
                 if cin.get("error_alerted"):

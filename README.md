@@ -181,7 +181,7 @@ before editing any working copy.
 | `cinesa.token_url` | `page_url` | Page loaded purely to mint a token; any Cinesa page works. |
 | `cinesa.api_base` | `https://vwc.cinesa.es/WSVistaWebClient` | The open data host. |
 | `cinesa.token_cache` | `.cache/cinesa-token.json` | Cached 12 h token, mode 0600. **Git-ignored — it is a credential.** |
-| `cinesa.token_refresh_before_hours` | `3.0` | Refresh the token once it has less than this much life left, instead of at expiry. Gives a multi-hour retry window if the Mac is locked/asleep; a failed refresh keeps using the token in hand rather than failing the check. Retries are backed off to 30 min apart. |
+| `cinesa.token_refresh_before_hours` | `3.0` | Refresh the token once it has less than this much life left, instead of at expiry. Gives a multi-hour retry window if the Mac is locked/asleep; a failed refresh keeps using the token in hand rather than failing the check. Retries are backed off to 30 min apart. A data-API 403 also preserves the token and suppresses another Chrome mint for at least 60 min; disable any VPN/proxy and wait for the automatic retry. |
 | `cinesa.chrome_path`, `cinesa.chrome_profile` | macOS Chrome, `.cache/chrome-profile` | Chrome binary for the token step, and a throwaway profile — never your own. |
 | `general.state_file` | `state/state.json` | Dedup/reminder state location. |
 

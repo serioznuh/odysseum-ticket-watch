@@ -62,8 +62,13 @@ A single-user Telegram watcher covering **two independent targets**:
 - The token is refreshed **3 h before expiry**, not at it, and a failed refresh
   falls back to the token still in hand, so one blocked attempt cannot take the
   half down — it has ~12 firings to succeed, backed off to 30 min apart so a
-  long outage does not mean a Chrome launch every 15 min. A token that is
-  actually dead (or 401-rejected) still fails loudly rather than going quiet.
+  long outage does not mean a Chrome launch every 15 min. A data-API **403**
+  is treated as a likely network/IP rejection: the watcher tries one forced mint,
+  then keeps the still-valid token and records a one-hour cooldown in the
+  git-ignored credential cache if minting fails. During that window it retries
+  the API without reopening Chrome; a successful response clears the cooldown.
+  A token that is actually dead (or 401-rejected) still forces renewal and fails
+  loudly rather than going quiet.
 - Verified IDs: film `HO00003228`, site `032` (Diagonal Mar), IMAX showtime
   attribute `0000000086`.
 - **The booking wall is fixed, not rolling** — observed 2026-07-29→08-25
