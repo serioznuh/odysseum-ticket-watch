@@ -7,13 +7,13 @@
     "recovered:2026-07-21T1019": "2026-07-21T10:19:22.048455+02:00"
   },
   "cinesa": {
-    "day_count": 22,
+    "day_count": 21,
     "error_alerted": false,
     "failure_streak": 0,
     "horizon": "2026-08-25",
     "imax_absent_streak": 0,
     "imax_present": true,
-    "last_change": "2026-08-03T22:04:48.116661+02:00"
+    "last_change": "2026-08-04T21:51:19.928898+02:00"
   },
   "error_alerted": false,
   "failure_streak": 0,
