@@ -92,7 +92,7 @@ after_tickets_hours = 6.0     # tickets already bookable (watch for new waves)
 # Cloudflare-challenged www.cinesa.es, via a real headed Chrome (see cdp.py).
 # ---------------------------------------------------------------------------
 [cinesa]
-enabled = true
+enabled = false
 # Vista HO code, straight from the film page URL.
 film_id = "HO00003228"
 film_title = "La odisea (The Odyssey)"
