@@ -2,23 +2,25 @@
   "alerts": {
     "cinesa_error:2026-08-01": "2026-08-01T16:50:15.372184+02:00",
     "cinesa_recovered:2026-08-01T1856": "2026-08-01T18:56:58.290476+02:00",
+    "cinesa_target:032:HO00003228:2026-08-26": "2026-08-06T15:08:31.710968+02:00",
+    "cinesa_target:032:HO00003228:2026-08-27": "2026-08-06T15:08:31.710968+02:00",
     "news:2cd51b28ab127985": "2026-07-07T09:30:05.307379+02:00",
     "recovered:2026-07-18T1710": "2026-07-18T17:10:21.895829+02:00",
     "recovered:2026-07-21T1019": "2026-07-21T10:19:22.048455+02:00"
   },
   "cinesa": {
-    "day_count": 20,
+    "day_count": 36,
     "error_alerted": false,
     "failure_streak": 0,
-    "horizon": "2026-08-25",
+    "horizon": "2026-09-10",
     "imax_absent_streak": 0,
     "imax_present": true,
-    "last_change": "2026-08-05T21:52:39.107691+02:00"
+    "last_change": "2026-08-06T15:08:31.710968+02:00"
   },
   "error_alerted": false,
   "failure_streak": 0,
   "formats_seen": {},
-  "last_check_ok": "2026-08-06T11:08:17.794165+02:00",
+  "last_check_ok": "2026-08-06T15:08:31.710968+02:00",
   "last_heartbeat": "2026-08-03T15:04:25.271660+02:00",
   "reminders_sent": {},
   "sale_target": null,
