@@ -35,6 +35,13 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
+    # A healthy pass takes ~20 s. During a GitHub Actions incident (2026-08-06:
+    # "Failed to resolve action download info / Service Unavailable") setup can
+    # instead hang for 15+ min, and because of the concurrency group above that
+    # blocks the next cron firings until they are cancelled — one GitHub blip
+    # becomes a burst of failure/cancellation emails. Cap it so a sick run dies
+    # fast and the 15-min cadence self-heals on the next firing.
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
