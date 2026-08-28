@@ -17,7 +17,7 @@
     "imax_present": true,
     "last_change": "2026-08-06T15:08:31.710968+02:00"
   },
-  "error_alerted": false,
+  "error_alerted": true,
   "failure_streak": 3,
   "formats_seen": {},
   "last_check_ok": "2026-08-28T17:21:47.950809+02:00",
