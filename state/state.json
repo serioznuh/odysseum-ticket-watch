@@ -6,7 +6,8 @@
     "cinesa_target:032:HO00003228:2026-08-27": "2026-08-06T15:08:31.710968+02:00",
     "news:2cd51b28ab127985": "2026-07-07T09:30:05.307379+02:00",
     "recovered:2026-07-18T1710": "2026-07-18T17:10:21.895829+02:00",
-    "recovered:2026-07-21T1019": "2026-07-21T10:19:22.048455+02:00"
+    "recovered:2026-07-21T1019": "2026-07-21T10:19:22.048455+02:00",
+    "recovered:2026-08-29T0708": "2026-08-29T07:08:16.669857+02:00"
   },
   "cinesa": {
     "day_count": 36,
@@ -17,10 +18,10 @@
     "imax_present": true,
     "last_change": "2026-08-06T15:08:31.710968+02:00"
   },
-  "error_alerted": true,
-  "failure_streak": 3,
+  "error_alerted": false,
+  "failure_streak": 0,
   "formats_seen": {},
-  "last_check_ok": "2026-08-28T17:21:47.950809+02:00",
+  "last_check_ok": "2026-08-29T07:08:16.669857+02:00",
   "last_heartbeat": "2026-08-24T20:34:46.876126+02:00",
   "reminders_sent": {},
   "sale_target": null,
