@@ -24,6 +24,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-09 | Supervision is one-directional — nothing watches the cloud half | P2 | M | Features | [ ] |
 | OTW-10 | Cinesa VPN 403 repeatedly launches headed Chrome | P1 | S | Bugs | [x] |
 | OTW-11 | Make Cinesa Chrome refresh normally imperceptible | P2 | S | UX & design | [x] |
+| OTW-12 | `reminders_cover` can over-promise on two same-pass events | P3 | S | Bugs | [ ] |
 
 ## 1. Critical — security & breakage
 
@@ -257,3 +258,29 @@ or exceeding a budget makes `python -m pytest -q` fail.
 `ruff.toml`/`pyproject.toml` config, a lint step in `.github/workflows/tests.yml`,
 and update AGENTS.md + docs/verification.md commands.
 **Done when:** `ruff check .` passes locally and in CI, and the docs mention it.
+
+### OTW-12 · `reminders_cover` can over-promise on two same-pass events
+**Priority:** P3 · **Effort:** S
+**Problem:** `detect.reminders_cover()` gates the "Reminders set: …" line on the
+opening being the earliest future one and tickets not yet bookable. It agrees
+with `due_reminders` in every ordinary case (verified by differential test over
+five scenarios), but has two narrow disagreements, both needing two independent
+Pathé events inside a single poll:
+1. It reads `state["tickets_available"]`, which `analyze_pathe` sees one run
+   stale — `update_from_snapshot` sets it afterwards. If one listing's sessions
+   become bookable in the *same* pass that another first announces a future
+   opening, the claim is made and the ladder is then switched off.
+2. It derives "earliest future opening" from `snap.matched_shows`, while
+   `update_from_snapshot` derives `sale_target` from `state["sales"]`, which
+   never prunes slugs that left the catalogue. If a previously-seen listing
+   with an earlier opening disappears from `/shows` while a later opening is
+   announced in the same pass, the claim is made while the ladder still targets
+   the vanished listing.
+Both self-correct from the next pass on, and both are strictly narrower than
+the unconditional promise they replaced (2026-09-02 review, PR #11).
+**Fix:** Union the snapshot's openings with `state["sales"]` inside
+`reminders_cover`, and take `tickets_available` from the snapshot being analysed
+rather than from state.
+**Done when:** the differential test in `tests/test_detect.py` is extended with
+both same-pass scenarios and `reminders_cover` agrees with `due_reminders` in
+each.
