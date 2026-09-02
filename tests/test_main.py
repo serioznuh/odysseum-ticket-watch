@@ -315,3 +315,40 @@ def test_stale_period_is_zero_right_at_the_threshold():
     assert cli.stale_period(timedelta(hours=18, minutes=1), 18) == 0
     assert cli.stale_period(timedelta(hours=41), 18) == 0
     assert cli.stale_period(timedelta(hours=42), 18) == 1
+
+
+def test_stale_finding_never_blames_ci_for_an_error_the_mac_recorded(monkeypatch):
+    """The cloud supervision pass always runs inside Actions, but the cause it
+    reports was recorded by the Mac. Branching on the *reader's* machine made
+    every residential 403 read as the expected datacenter block — telling the
+    user to dismiss a real outage."""
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    st = dict(BLIND_STATE, error_alerted=True, last_error="HTTP 403")
+
+    stale = cli.build_stale_finding(Cfg, st, timedelta(days=2), "k", 2)
+
+    assert "Cause: Pathé is still blocking your IP (403)." in stale.lines
+    assert "datacenter" not in "\n".join(stale.lines)
+
+    # The local builder still describes the machine it is running on.
+    error = "Client error '403 Forbidden' for url 'https://www.pathe.fr/api/shows'"
+    assert "GitHub datacenter IPs" in "\n".join(
+        cli.build_error_finding(Cfg, BLIND_STATE, error, NOW).lines
+    )
+
+
+def test_recorded_cause_drops_the_failing_url():
+    """fetch_snapshot hits several endpoints. Keeping the URL in `last_error`
+    would rewrite — and commit and push — state on every 15-min firing of an
+    outage that flapped between them."""
+    a = cli.summarize_pathe_error(
+        "Client error '403 Forbidden' for url 'https://www.pathe.fr/api/shows'"
+    )
+    b = cli.summarize_pathe_error(
+        "Client error '403 Forbidden' for url 'https://www.pathe.fr/api/show/x/showtimes/y'"
+    )
+
+    assert a[1] == b[1] == 403
+    assert f"HTTP {a[1]}" == f"HTTP {b[1]}" == "HTTP 403"
+    # And the stored short form still yields its status when re-read.
+    assert cli.summarize_pathe_error("HTTP 403")[1] == 403

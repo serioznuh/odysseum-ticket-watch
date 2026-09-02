@@ -55,3 +55,37 @@ day one and then silence.
 - The stale key gained a `:{period}` suffix, deliberately breaking OTW-07's
   byte-identical requirement. `state.migrate_stale_keys` rewrites the old key
   on load so a currently-blind watcher gets no duplicate alert on deploy.
+
+## Review round (Opus max, PR #11)
+
+Three P1 defects, all confirmed by reproduction before fixing:
+
+- **The stale-key migration corrupted two-digit periods.**
+  `datetime.fromisoformat` accepts sub-minute UTC offsets, so
+  `stale:<iso>:37` parses as a valid timestamp with a `+02:00:37` offset.
+  Using "does it parse?" as the old-format test meant every period from 10 to
+  99 — outage days 11 to 100 — was renamed after being sent, so `already_sent`
+  missed and the alert re-fired on every cloud pass: ~96 messages, commits and
+  pushes a day. The discriminator is now a `fullmatch` on the exact legacy
+  shape (`LEGACY_STALE_KEY`), and a simulation covering days 9-14 with real
+  `load_state`/`save_state` round-trips confirms one message per day.
+- **The cloud alert blamed CI for the Mac's outage.** `pathe_cause` branched
+  on `running_in_ci()`, but the cloud pass always runs in Actions while the
+  cause it reports was recorded by the Mac — so every residential 403 read as
+  "Pathé blocks GitHub datacenter IPs", i.e. the known, dismissable artifact.
+  The CI branch is only sound for an error the current process caught, so it
+  is now an explicit `ci=` argument that `build_stale_finding` never sets.
+- **NEW_LISTING denied a sale date the next alert announced.** The branch fires
+  on first sight of a listing regardless of `salesOpeningDatetime`, and a
+  dedicated 70 mm event page usually arrives with its opening already set —
+  the project's headline scenario. The line is now conditional.
+
+Also fixed from the review notes: "Reminders set: …" was an unconditional
+promise, but the ladder tracks a single `sale_target` (the earliest future
+opening) and stops once tickets are bookable, so it was false for any later
+listing — `reminders_cover()` now gates the claim; `TICKETS_AVAILABLE` titled
+the best format *present* rather than the one that just appeared, re-announcing
+IMAX 70 mm when standard sessions were the news; `last_error` no longer stores
+the failing URL, so an outage flapping between endpoints cannot rewrite state
+every 15 min; and NEWS_LEAD carries its confidence again, so low and medium
+leads are distinguishable.

@@ -283,3 +283,34 @@ def test_load_state_migrates_on_read(tmp_path):
     st = load_state(p)
 
     assert "stale:2026-08-07T09:27:48+02:00:0" in st["alerts"]
+
+
+def test_stale_key_migration_leaves_two_digit_periods_alone():
+    """Regression: `fromisoformat` accepts sub-minute UTC offsets, so
+    'stale:<iso>:37' parses as a timestamp with a +HH:MM:SS offset. Treating
+    "does it parse" as the old-format test renamed every period from 10 to 99
+    after it was sent, re-alerting on every cloud pass — 96 messages a day
+    through days 11-100 of an outage."""
+    iso = "2026-09-02T07:11:00+02:00"
+
+    for period in (0, 1, 9, 10, 37, 99, 100):
+        key = f"stale:{iso}:{period}"
+        st = {"alerts": {key: "x"}}
+
+        migrate_stale_keys(st)
+
+        assert list(st["alerts"]) == [key], f"period {period} was rewritten"
+
+
+def test_stale_key_migration_still_converts_the_real_legacy_shapes():
+    for iso in (
+        "2026-09-02T07:11:00+02:00",
+        "2026-09-02T07:11:00.123456+02:00",
+        "2026-09-02T07:11:00Z",
+        "2026-09-02T07:11:00",
+    ):
+        st = {"alerts": {f"stale:{iso}": "x"}}
+
+        migrate_stale_keys(st)
+
+        assert list(st["alerts"]) == [f"stale:{iso}:0"], iso

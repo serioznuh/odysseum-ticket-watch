@@ -209,6 +209,29 @@ def summarize_sessions(show: dict, days: dict[str, list[dict]]) -> dict:
     }
 
 
+def reminders_cover(sale_iso: str, snap: Snapshot, state: dict, now: datetime) -> bool:
+    """Whether the reminder ladder will actually fire for this opening.
+
+    `due_reminders` tracks a single `sale_target` — the earliest *future*
+    opening across all matched listings — and stops entirely once tickets are
+    known to be bookable. Announcing "reminders set" for anything else was a
+    promise the watcher does not keep.
+    """
+    if state.get("tickets_available"):
+        return False
+    target = parse_iso(sale_iso)
+    if target is None or as_aware(target) <= now:
+        return False
+    future = [
+        as_aware(dt)
+        for dt in (
+            parse_iso(sh.get("salesOpeningDatetime")) for sh in snap.matched_shows
+        )
+        if dt is not None and as_aware(dt) > now
+    ]
+    return bool(future) and as_aware(target) == min(future)
+
+
 # --------------------------------------------------------------------------- Pathé analysis
 
 def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[Finding]:
@@ -226,6 +249,9 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
         # 1. Brand-new listing matching the film (e.g. a dedicated
         #    "Projection IMAX 70mm" event page, as Pathé did for L'Odyssée).
         if slug not in shows_seen and slug != cfg.primary_slug:
+            # A dedicated event page often appears with its opening already
+            # set, and the SALE_DATE finding below fires in the same pass.
+            new_sale = show.get("salesOpeningDatetime")
             findings.append(
                 Finding(
                     kind="NEW_LISTING",
@@ -235,7 +261,14 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                     lines=[
                         watch_line(cfg),
                         f"“{title}”",
-                        f"Release {fmt_release(show)} · no sale date published yet.",
+                        (
+                            f"Release {fmt_release(show)} · "
+                            + (
+                                f"sale opens {fmt_dt_short(parse_iso(new_sale))}."
+                                if new_sale
+                                else "no sale date published yet."
+                            )
+                        ),
                         "Dedicated listings get their own opening — now watching it.",
                     ],
                     url=url,
@@ -270,11 +303,12 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                 lines.append(f"Was: {fmt_dt_short(prev)}{moved}.")
             if display_iso and display_iso != sale_iso:
                 lines.append(f"Showtimes visible from {fmt_dt_short(parse_iso(display_iso))}.")
-            lines.append(
-                "Reminders rescheduled automatically."
-                if changed
-                else f"Reminders set: {fmt_offsets(cfg.reminder_offsets_minutes)} before."
-            )
+            if reminders_cover(sale_iso, snap, state, now):
+                lines.append(
+                    "Reminders rescheduled automatically."
+                    if changed
+                    else f"Reminders set: {fmt_offsets(cfg.reminder_offsets_minutes)} before."
+                )
             lines.append("Opening time is national — seats can go in minutes.")
             findings.append(
                 Finding(
@@ -301,14 +335,13 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
             present = set(summary["counts"]) if summary["counts"] else {listing_fmt}
             new_fmts = present - formats_seen.get(slug, set())
             if new_fmts:
-                fmt_bits = [
-                    f"{FORMAT_LABELS[f]}: {summary['counts'].get(f, '?')} session(s)"
-                    for f in sorted(present)
-                ]
+                # The alert exists because `new_fmts` appeared; naming the
+                # best format merely *present* would re-announce IMAX 70 mm
+                # when what actually changed was standard sessions.
                 best = (
                     FMT_IMAX70
-                    if FMT_IMAX70 in present
-                    else (FMT_IMAX if FMT_IMAX in present else FMT_OTHER)
+                    if FMT_IMAX70 in new_fmts
+                    else (FMT_IMAX if FMT_IMAX in new_fmts else FMT_OTHER)
                 )
                 book = summary["booking_by_fmt"].get(best) or url
                 lines = [watch_line(cfg)]
@@ -317,8 +350,13 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                         f"{plural(summary['total'], 'session')},"
                         f" {fmt_day(summary['first_day'])} – {fmt_day(summary['last_day'])}."
                     )
-                if len(fmt_bits) > 1:
-                    lines.append("Also bookable: " + "; ".join(fmt_bits))
+                others = [
+                    f"{FORMAT_LABELS[f]}: {summary['counts'].get(f, '?')}"
+                    for f in sorted(present)
+                    if f != best
+                ]
+                if others:
+                    lines.append("Also bookable: " + "; ".join(others))
                 lines.append(f"👉 {book}")
                 findings.append(
                     Finding(
@@ -655,7 +693,10 @@ def analyze_news(items: list[dict], cfg: Any, state: dict, now: datetime) -> lis
             f"{item.get('source') or 'web'}"
             + (f", {pub.day} {pub:%b}" if pub else "")
             + f" · matched: {', '.join(hits)}",
-            "Not confirmed on Pathé — no reminders are set from news alone.",
+            (
+                f"Not confirmed on Pathé ({confidence} confidence)"
+                " — no reminders are set from news alone."
+            ),
         ]
         findings.append(
             Finding(

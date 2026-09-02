@@ -38,7 +38,7 @@ def summarize_pathe_error(error: str) -> tuple[str, int | None]:
         )
     # Idempotent on its own output: the summary is what gets stored in state for
     # the cloud pass to read back, so re-summarising it must not lose the code.
-    already = re.match(r"HTTP (\d{3}) ", error)
+    already = re.match(r"HTTP (\d{3})\b", error)
     if already:
         return " ".join(error.split())[:300], int(already.group(1))
     return " ".join(error.split())[:300], None
@@ -86,11 +86,18 @@ def running_in_ci() -> bool:
     return bool(os.environ.get("GITHUB_ACTIONS"))
 
 
-def pathe_cause(error: str) -> tuple[str, str]:
-    """(cause line, what-happens-next line) for a Pathé failure."""
+def pathe_cause(error: str, *, ci: bool = False) -> tuple[str, str]:
+    """(cause line, what-happens-next line) for a Pathé failure.
+
+    `ci` describes the machine that hit the error, which is only knowable for
+    an error the current process just caught. A cause read back out of state
+    was recorded by the *other* half, so callers doing that must leave it
+    False — the cloud pass always runs in Actions, and would otherwise report
+    every one of the Mac's 403s as the expected datacenter block.
+    """
     summary, status = summarize_pathe_error(error)
     if status == 403:
-        if running_in_ci():
+        if ci:
             # Pathé blocks GitHub datacenter IPs outright, so this one will not
             # clear on its own and no local retry is scheduled (OTW-03).
             return (
@@ -114,7 +121,7 @@ def pathe_cause(error: str) -> tuple[str, str]:
 
 def build_error_finding(cfg, st: dict, error: str, now: datetime) -> Finding:
     """Fired once per outage, as soon as the local half is confidently blind."""
-    cause, tail = pathe_cause(error)
+    cause, tail = pathe_cause(error, ci=running_in_ci())
     when, blind_for = blind_since(st, now)
     since = f"No sale detection since {when}"
     since += f" ({blind_for})." if blind_for else "."
@@ -146,7 +153,8 @@ def build_recovered_finding(cfg, st: dict, now: datetime) -> Finding:
 def stale_period(blind: timedelta, stale_hours: int) -> int:
     """Which 24 h slot of an outage we are in: 0 at the alert threshold, then
     one per day. Measured from the threshold rather than from the last good
-    check, so every repeat lands at the same clock time.
+    check, so repeats land 24h apart — the same wall-clock time, except across
+    a Europe/Paris DST change, where the hour shifts by one.
     """
     return (blind - timedelta(hours=stale_hours)).days
 
@@ -162,7 +170,7 @@ def build_stale_finding(cfg, st: dict, blind: timedelta, key: str, day: int) -> 
     repeat = day > 1
     when = short_dt(detect.parse_iso(st.get("last_check_ok")))
     if st.get("error_alerted") and st.get("last_error"):
-        cause, _ = pathe_cause(str(st["last_error"]))
+        cause, _ = pathe_cause(str(st["last_error"]))  # ci=False: recorded by the Mac
         if repeat:
             cause = cause.replace("Cause: Pathé is", "Cause: Pathé is still")
     else:
@@ -419,9 +427,13 @@ def run(argv: list[str] | None = None) -> int:
             # from "the Mac never checked in" — the two need opposite responses.
             # Recording the cause here lets it say which. Written only when the
             # text changes: a steady outage writes state once, not every 15 min.
-            summary, _ = summarize_pathe_error(str(e))
-            if st.get("last_error") != summary:
-                st["last_error"] = summary
+            summary, status = summarize_pathe_error(str(e))
+            # Store the status without the failing URL: fetch_snapshot hits
+            # several endpoints, and an outage that flapped between them would
+            # otherwise rewrite state — and commit and push — every 15 min.
+            recorded = f"HTTP {status}" if status else summary[:120]
+            if st.get("last_error") != recorded:
+                st["last_error"] = recorded
             # With adaptive cadence, retries come every 15 min — require both
             # a failure streak AND 6h without success before crying wolf.
             if (

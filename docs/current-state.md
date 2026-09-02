@@ -39,7 +39,7 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Code** — Python package `watcher/` (`pathe.py` and `cinesa.py` API clients,
   `cdp.py` browser token step, `news.py`, `detect.py`, `state.py`, `notify.py`
   Telegram, `config.py`, `__main__.py` CLI); config in `config.toml`; tests in
-  `tests/` (108 passing).
+  `tests/` (115 passing).
 
 ## Cinesa specifics
 
