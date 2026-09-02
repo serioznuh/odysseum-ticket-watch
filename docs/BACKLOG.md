@@ -15,11 +15,11 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 |----|-------|----------|--------|---------|------|
 | OTW-01 | Docs-contract test in CI | P2 | S | Infra, tooling & docs | [ ] |
 | OTW-02 | Add a linter (ruff) | P2 | S | Infra, tooling & docs | [x] |
-| OTW-03 | 403 alert VPN wording wrong on manual CI dispatch | P3 | S | Bugs | [ ] |
+| OTW-03 | 403 alert VPN wording wrong on manual CI dispatch | P3 | S | Bugs | [x] |
 | OTW-04 | Cinesa alert: include session times + booking link | P2 | S | Features | [ ] |
 | OTW-05 | Confirm Cinesa token behaviour with screen locked/asleep | P2 | S | Infra, tooling & docs | [x] |
 | OTW-06 | Pathé failure_streak churns state; baseline can lose an alert | P2 | S | Bugs | [x] |
-| OTW-07 | Stale-check alert says "Pathé" but the whole local half is down | P3 | S | Bugs | [ ] |
+| OTW-07 | Stale-check alert says "Pathé" but the whole local half is down | P3 | S | Bugs | [x] |
 | OTW-08 | Run the news half from the cloud pass to cover Mac-asleep windows | P1 | M | Features | [ ] |
 | OTW-09 | Supervision is one-directional — nothing watches the cloud half | P2 | M | Features | [ ] |
 | OTW-10 | Cinesa VPN 403 repeatedly launches headed Chrome | P1 | S | Bugs | [x] |
@@ -46,6 +46,12 @@ change — `stale:{last_check_ok}` is dedup memory (AGENTS.md "Conventions").
 **Done when:** the alert body names every half that the local script owns, a
 unit test asserts Cinesa is mentioned when enabled, and the `Finding.key`
 format is byte-identical to today's.
+**Done (2026-09-02):** retitled to "Local checks have stopped — {duration}";
+the body names Pathé + news, and Cinesa when enabled. The byte-identical-key
+requirement was **deliberately superseded** in the same change: the alert now
+repeats every 24h while blind, which needs the period in the key
+(`stale:{last_check_ok}:{period}`). `state.migrate_stale_keys` rewrites the old
+key on load so a currently-blind watcher gets no duplicate.
 
 ### OTW-03 · 403 alert VPN wording wrong on manual CI dispatch
 **Priority:** P3 · **Effort:** S
@@ -61,6 +67,11 @@ to ever fire from a one-off dispatch (review note, PR #3).
 the launchd log pointer.
 **Done when:** the ERROR alert body differs between local and CI contexts, with
 a unit test covering both.
+**Done (2026-09-02):** `running_in_ci()` checks `GITHUB_ACTIONS`; in CI the 403
+reads "Pathé blocks GitHub datacenter IPs" / "run the check locally instead",
+with no retry promise. The launchd log pointer and the VPN advice were dropped
+from the local variant too — the 2 Sep outage proved the VPN hint wrong when
+the block is the ISP's own IP.
 
 ### OTW-06 · Pathé failure_streak churns state; baseline can lose an alert
 **Priority:** P2 · **Effort:** S

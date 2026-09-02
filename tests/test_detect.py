@@ -20,6 +20,7 @@ PATTERNS = [
 ]
 
 PRIMARY = "dune-troisieme-partie-50828"
+OFFSETS = [1440, 120, 15]
 
 
 class Cfg:
@@ -32,9 +33,16 @@ class Cfg:
     cinema_name = "Pathé Odysseum"
     cinema_city = "Montpellier"
     cinema_page_url = "https://www.pathe.fr/cinemas/cinema-pathe-odysseum"
+    reminder_offsets_minutes = OFFSETS
     news_min_confidence = "low"
     news_max_age_days = 10
     news_max_alerts_per_run = 3
+
+
+def whole_message(f) -> str:
+    """Title + body, the way the renderer shows it. The redesign moved the
+    headline fact into the title, so body-only assertions test the wrong half."""
+    return f.title + " " + " ".join(f.lines)
 
 
 def fresh_state() -> dict:
@@ -111,7 +119,7 @@ def test_new_event_listing_detected_once():
     snap = Snapshot(matched_shows=[primary_show(), event_show()])
     findings = detect.analyze_pathe(snap, fresh_state(), Cfg, NOW)
     assert [f.kind for f in findings] == ["NEW_LISTING"]
-    assert "IMAX 70 mm" in " ".join(findings[0].lines)
+    assert "IMAX 70 mm" in whole_message(findings[0])
     assert findings[0].url.startswith("https://www.pathe.fr/evenements/")
 
     seen = fresh_state()
@@ -129,7 +137,7 @@ def test_sale_date_announced():
     assert f.confidence == "high"
     assert f.sale_datetime == iso
     assert f.key == f"sale:{PRIMARY}:{iso}"
-    assert any("05 Nov 2026" in line for line in f.lines)
+    assert "Thu 5 Nov, 08:00" in whole_message(f)
 
 
 def test_sale_date_changed_and_unchanged():
@@ -170,7 +178,7 @@ def test_tickets_available_with_imax70_format():
     findings = detect.analyze_pathe(snap, st, Cfg, NOW)
     assert [f.kind for f in findings] == ["TICKETS_AVAILABLE"]
     f = findings[0]
-    joined = " ".join(f.lines)
+    joined = whole_message(f)
     assert "IMAX 70 mm (1.43:1)" in joined  # from the listing title
     assert "https://s.pathe.fr/fr/BOOKME/booking" in joined
     assert "Pathé Odysseum" in joined
@@ -252,7 +260,7 @@ def test_news_lead_with_future_date_is_medium():
     assert len(findings) == 1
     assert findings[0].kind == "NEWS_LEAD"
     assert findings[0].confidence == "medium"
-    assert any("05 Nov 2026" in line for line in findings[0].lines)
+    assert "5 Nov 2026" in whole_message(findings[0])
 
 
 def test_news_release_date_only_stays_low():

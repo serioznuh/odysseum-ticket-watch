@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import logging
 import time
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -21,7 +22,8 @@ ICONS = {
     "NEW_LISTING": "🆕",
     "CINEMA_LISTED": "📍",
     "NEWS_LEAD": "📰",
-    "WATCHER_ERROR": "⚠️",
+    "WATCHER_ERROR": "🔴",
+    "WATCHER_STILL_BLIND": "🔴",
     "RECOVERED": "✅",
     "HEARTBEAT": "💤",
     "CINESA_TARGET_DATE": "🎫",
@@ -35,43 +37,116 @@ OFFSET_LABELS = {1440: "24 hours", 120: "2 hours", 15: "15 minutes"}
 # Kinds delivered without sound/vibration by default; the phone buzzes for
 # everything else (sale dates, tickets, reminders, failures). Reminders and
 # the "open now" ping are always loud. Override via [alerts] silent_kinds.
-DEFAULT_SILENT_KINDS = ["HEARTBEAT", "NEWS_LEAD", "RECOVERED", "CINESA_TARGET_NO_IMAX"]
+DEFAULT_SILENT_KINDS = [
+    "HEARTBEAT",
+    "NEWS_LEAD",
+    "RECOVERED",
+    "CINESA_TARGET_NO_IMAX",
+    # Daily "still blind" repeats: the first outage alert buzzes, the drumbeat
+    # after it must not — it is the same known problem, once a day.
+    "WATCHER_STILL_BLIND",
+]
 
 
 def is_silent(cfg: Any, kind: str) -> bool:
     return kind in getattr(cfg, "silent_kinds", DEFAULT_SILENT_KINDS)
 
 
+def esc(text: str) -> str:
+    """Escape for Telegram HTML. Text content needs only & < > — escaping
+    quotes as well (html.escape's default) turns every apostrophe into
+    &#x27;, which is noise at best and visible at worst."""
+    return html.escape(str(text), quote=False)
+
+
 def render_finding(f: Finding) -> str:
     icon = ICONS.get(f.kind, "ℹ️")
-    body = "\n".join(html.escape(line) for line in f.lines)
-    text = f"{icon} <b>{html.escape(f.title)}</b>\n{body}"
+    body = "\n".join(esc(line) for line in f.lines)
+    text = f"{icon} <b>{esc(f.title)}</b>\n{body}"
     if f.url:
-        text += f"\n🔗 {html.escape(f.url)}"
+        text += f"\n🔗 {esc(f.url)}"
     return text
 
 
-def render_reminder(offset: int | str, target_iso: str, cfg: Any) -> str:
-    when = detect.fmt_dt(detect.parse_iso(target_iso))
-    where = f"{html.escape(cfg.cinema_name)}, {html.escape(cfg.cinema_city)}"
-    film = html.escape(cfg.film_title)
+def _clock(target_iso: str) -> str:
+    """Bare HH:MM (Paris). Used by the near offsets, where the day is obvious."""
+    dt = detect.parse_iso(target_iso)
+    if dt is None:
+        return "unknown"
+    return detect.as_aware(dt).astimezone(detect.TZ_PARIS).strftime("%H:%M")
+
+
+def _when_phrase(target_iso: str, now: datetime | None = None) -> str:
+    """'tomorrow, 10:00' when that is unambiguous, otherwise a dated form.
+
+    The 24 h reminder is due any time between 24 h and 2 h before opening (a
+    missed run pushes it later), so the day word has to be computed, not
+    assumed.
+    """
+    dt = detect.parse_iso(target_iso)
+    if dt is None:
+        return "unknown"
+    dt = detect.as_aware(dt).astimezone(detect.TZ_PARIS)
+    clock = dt.strftime("%H:%M")
+    if now is not None:
+        today = detect.as_aware(now).astimezone(detect.TZ_PARIS).date()
+        delta = (dt.date() - today).days
+        if delta == 0:
+            return f"today, {clock}"
+        if delta == 1:
+            return f"tomorrow, {clock}"
+    return dt.strftime("%a %d %b, ") + clock
+
+
+def render_reminder(
+    offset: int | str, target_iso: str, cfg: Any, now: datetime | None = None
+) -> str:
+    """One reminder message. Each offset says something different: 24 h is for
+    preparing, 2 h is a warning, 15 min means be at the keyboard."""
+    where = f"{esc(cfg.cinema_name)}, {esc(cfg.cinema_city)}"
+    film = esc(cfg.film_title)
+    who = f"{film} · {where}"
+    url = esc(cfg.film_page_url)
+
     if offset == "open":
         return (
-            "🟢 <b>Ticket sales should be OPEN NOW</b>\n"
-            f"🎬 {film}\n"
-            f"🏛️ {where}\n"
-            f"🗓️ Opening was scheduled for: {html.escape(when)}\n"
-            f"👉 Book: {html.escape(cfg.film_page_url)}\n"
-            f"🏟️ Cinema page: {html.escape(cfg.cinema_page_url)}"
+            "🟢 <b>SALE IS OPEN — GO</b>\n"
+            f"{who}\n"
+            f"👉 {url}"
         )
-    label = OFFSET_LABELS.get(int(offset), f"{offset} minutes")
+
+    try:
+        minutes = int(offset)
+    except (TypeError, ValueError):
+        minutes = None
+
+    if minutes == 15:
+        return (
+            f"⏰ <b>Sale opens in 15 minutes — {esc(_clock(target_iso))}</b>\n"
+            f"{who}\n"
+            "Have pathe.fr open and be signed in.\n"
+            f"👉 {url}"
+        )
+    if minutes == 120:
+        return (
+            f"⏰ <b>Sale opens in 2 hours — {esc(_clock(target_iso))}</b>\n"
+            f"{who}\n"
+            "Sign in on pathe.fr and save a card now.\n"
+            f"👉 {url}"
+        )
+    if minutes == 1440:
+        return (
+            f"⏰ <b>Sale opens {esc(_when_phrase(target_iso, now))}</b>\n"
+            f"{who}\n"
+            "Prep now: sign in on pathe.fr and save a card.\n"
+            f"👉 {url}"
+        )
+
+    label = OFFSET_LABELS.get(minutes, f"{offset} minutes")
     return (
-        f"⏰ <b>Reminder: ticket sale opens in ~{label}</b>\n"
-        f"🎬 {film}\n"
-        f"🗓️ Opening: {html.escape(when)}\n"
-        f"🏛️ {where}\n"
-        "Be ready: sign in on pathe.fr, save a payment method.\n"
-        f"👉 {html.escape(cfg.film_page_url)}"
+        f"⏰ <b>Sale opens in ~{esc(label)} — {esc(_when_phrase(target_iso, now))}</b>\n"
+        f"{who}\n"
+        f"👉 {url}"
     )
 
 

@@ -9,7 +9,8 @@ A single-user Telegram watcher covering **two independent targets**:
    `salesOpeningDatetime` in advance) plus Google News RSS, and sends
    deduplicated alerts: sale-date announcements, new listings, bookable-now, a
    24 h / 2 h / 15 min reminder ladder, strictly-filtered news leads, and
-   supervision alerts (failure streak, stale state, weekly heartbeat).
+   supervision alerts (failure streak, stale state, weekly heartbeat). Every
+   message names its film and cinema on the first line.
 2. *La odisea* (Nolan) **in IMAX at Cinesa Diagonal Mar, Barcelona** — watches
    the booking calendar for specific wanted dates and for IMAX leaving or
    returning. The film is already showing; what is watched is the schedule
@@ -33,10 +34,12 @@ A single-user Telegram watcher covering **two independent targets**:
   half writes only on real change, so the 15-min cadence causes no commit churn.
   Failure streaks stop changing at their alert threshold, and Pathé's one-shot
   listing/format baselines advance only after the corresponding alert is delivered.
+  `last_error` records the failure cause for the cloud pass and is rewritten
+  only when the text changes, so a steady outage still writes state once.
 - **Code** — Python package `watcher/` (`pathe.py` and `cinesa.py` API clients,
   `cdp.py` browser token step, `news.py`, `detect.py`, `state.py`, `notify.py`
   Telegram, `config.py`, `__main__.py` CLI); config in `config.toml`; tests in
-  `tests/` (63 passing).
+  `tests/` (108 passing).
 
 ## Cinesa specifics
 

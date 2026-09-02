@@ -70,7 +70,33 @@ def load_state(path: str | Path) -> dict:
         section = dict(defaults)
         section.update(merged.get(key) or {})
         merged[key] = section
+    migrate_stale_keys(merged)
     return merged
+
+
+def migrate_stale_keys(state: dict) -> None:
+    """Adopt the periodic stale key without re-alerting.
+
+    The supervision alert used to be keyed `stale:{last_check_ok}` and fired
+    once per outage. It now repeats every 24h, so the key carries the period:
+    `stale:{last_check_ok}:{period}`. Without this migration the already-sent
+    old key would no longer match, and a machine that is currently blind would
+    get one duplicate alert on upgrade.
+    """
+    alerts = state.get("alerts")
+    if not isinstance(alerts, dict):
+        return
+    for key in list(alerts):
+        if not key.startswith("stale:"):
+            continue
+        # Counting colons cannot tell the formats apart — the ISO timestamp is
+        # full of them ("...T09:27:48+02:00"). The old key is exactly
+        # "stale:" + a parseable timestamp; the new one has ":{period}" glued
+        # on, which stops it parsing.
+        if detect.parse_iso(key[len("stale:"):]) is None:
+            continue
+        alerts.setdefault(f"{key}:0", alerts[key])
+        alerts.pop(key, None)
 
 
 def save_state(path: str | Path, state: dict) -> None:

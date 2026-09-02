@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import sys
 from datetime import datetime, timedelta
@@ -35,42 +36,158 @@ def summarize_pathe_error(error: str) -> tuple[str, int | None]:
         return f"HTTP {status.group(1)} {status.group(2)} from {status.group(3)}", int(
             status.group(1)
         )
+    # Idempotent on its own output: the summary is what gets stored in state for
+    # the cloud pass to read back, so re-summarising it must not lose the code.
+    already = re.match(r"HTTP (\d{3}) ", error)
+    if already:
+        return " ".join(error.split())[:300], int(already.group(1))
     return " ".join(error.split())[:300], None
 
 
-def build_error_finding(cfg, streak: int, error: str, now: datetime) -> Finding:
+def watch_label(cfg) -> str:
+    """Which watch a message is about. Every alert carries this: with more than
+    one film or cinema in play, an unlabelled alert is ambiguous."""
+    return f"{cfg.film_title} · {cfg.cinema_name}"
+
+
+def cinesa_label(cfg) -> str:
+    return f"{cfg.cinesa_film_title} · {cfg.cinesa_site_name}"
+
+
+def fmt_duration(delta: timedelta) -> str:
+    """Human span: '45 min', '6 h 20 m', '3 days'."""
+    total = max(0, int(delta.total_seconds()))
+    if total < 3600:
+        return f"{total // 60} min"
+    if total < 48 * 3600:
+        hours, minutes = divmod(total // 60, 60)
+        return f"{hours} h {minutes} m" if minutes else f"{hours} h"
+    return f"{total // 86400} days"
+
+
+def short_dt(dt: datetime | None) -> str:
+    """'Wed 2 Sep, 07:11' — Paris time, no year, no timezone suffix."""
+    if dt is None:
+        return "unknown"
+    dt = detect.as_aware(dt).astimezone(detect.TZ_PARIS)
+    return f"{dt:%a} {dt.day} {dt:%b}, {dt:%H:%M}"
+
+
+def blind_since(st: dict, now: datetime) -> tuple[str, str | None]:
+    """(when the watcher last saw Pathé, how long it has been blind)."""
+    last = detect.parse_iso(st.get("last_check_ok"))
+    if last is None:
+        return "the watcher started", None
+    last = detect.as_aware(last)
+    return short_dt(last), fmt_duration(now - last)
+
+
+def running_in_ci() -> bool:
+    return bool(os.environ.get("GITHUB_ACTIONS"))
+
+
+def pathe_cause(error: str) -> tuple[str, str]:
+    """(cause line, what-happens-next line) for a Pathé failure."""
     summary, status = summarize_pathe_error(error)
-    guidance = (
-        "Pathé rejected the current network/IP. Disable any VPN or proxy, then wait for"
-        " the next automatic retry."
-        if status == 403
-        else "Possible causes: Pathé API change or a local/network outage."
+    if status == 403:
+        if running_in_ci():
+            # Pathé blocks GitHub datacenter IPs outright, so this one will not
+            # clear on its own and no local retry is scheduled (OTW-03).
+            return (
+                "Cause: Pathé blocks GitHub datacenter IPs (403).",
+                "Expected in CI — run the check locally instead.",
+            )
+        return (
+            "Cause: Pathé is blocking your IP (403).",
+            "Retrying every 15 min — usually clears by itself.",
+        )
+    if status is not None:
+        return (
+            f"Cause: Pathé returned HTTP {status}.",
+            "Retrying every 15 min; check the logs if it persists.",
+        )
+    return (
+        f"Cause: {summary[:160]}",
+        "Retrying every 15 min; check the logs if it persists.",
     )
+
+
+def build_error_finding(cfg, st: dict, error: str, now: datetime) -> Finding:
+    """Fired once per outage, as soon as the local half is confidently blind."""
+    cause, tail = pathe_cause(error)
+    when, blind_for = blind_since(st, now)
+    since = f"No sale detection since {when}"
+    since += f" ({blind_for})." if blind_for else "."
     return Finding(
         kind="WATCHER_ERROR",
         key=f"error:{now:%Y-%m-%d}",
         confidence="high",
-        title="Watcher cannot reach the Pathé API",
-        lines=[
-            f"{streak} consecutive checks have failed.",
-            f"Last error: {summary}",
-            guidance,
-            (
-                "The watcher is currently BLIND. Local checks retry every 15 min; details:"
-                " ~/.ticket-watch/logs/launchd.log"
-            ),
-        ],
+        title="Pathé watch is BLIND",
+        lines=[watch_label(cfg), since, cause, tail],
         url=cfg.film_page_url,
     )
 
 
-def build_recovered_finding(cfg, now: datetime) -> Finding:
+def build_recovered_finding(cfg, st: dict, now: datetime) -> Finding:
+    """Sent on the first successful check after an outage. Reads `st` before the
+    caller refreshes `last_check_ok`, so the blind span is still recoverable."""
+    _, blind_for = blind_since(st, now)
+    line = f"Blind for {blind_for}. " if blind_for else ""
     return Finding(
         kind="RECOVERED",
         key=f"recovered:{now:%Y-%m-%dT%H%M}",
         confidence="high",
-        title="Watcher recovered — Pathé API reachable again",
-        lines=["Checks are running normally again."],
+        title="Pathé watch is back",
+        lines=[watch_label(cfg), f"{line}Checks are running normally."],
+        url=cfg.film_page_url,
+    )
+
+
+def stale_period(blind: timedelta, stale_hours: int) -> int:
+    """Which 24 h slot of an outage we are in: 0 at the alert threshold, then
+    one per day. Measured from the threshold rather than from the last good
+    check, so every repeat lands at the same clock time.
+    """
+    return (blind - timedelta(hours=stale_hours)).days
+
+
+def build_stale_finding(cfg, st: dict, blind: timedelta, key: str, day: int) -> Finding:
+    """Cloud-side supervision. `day` 1 is the first alert at the threshold;
+    every later one is a silent 24 h repeat, so a long outage cannot go quiet.
+
+    The cloud pass never calls Pathé, so it cannot see *why* it is blind. It
+    infers that from `error_alerted`: set means the local half ran, failed and
+    alerted; clear means the Mac never got as far as reporting.
+    """
+    repeat = day > 1
+    when = short_dt(detect.parse_iso(st.get("last_check_ok")))
+    if st.get("error_alerted") and st.get("last_error"):
+        cause, _ = pathe_cause(str(st["last_error"]))
+        if repeat:
+            cause = cause.replace("Cause: Pathé is", "Cause: Pathé is still")
+    else:
+        cause = "Cause: the Mac hasn't completed a check — off, asleep, or can't push."
+    # The key is `last_check_ok`, which goes stale when the *local half* stops —
+    # and that half runs the news feeds and Cinesa too, so naming only Pathé
+    # understates the outage (OTW-07).
+    dark = "Pathé and news checks"
+    if getattr(cfg, "cinesa_enabled", False):
+        dark = "Pathé, news and Cinesa checks"
+    return Finding(
+        kind="WATCHER_STILL_BLIND" if repeat else "WATCHER_ERROR",
+        key=key,
+        confidence="high",
+        title=(
+            f"Still blind — day {day}"
+            if repeat
+            else f"Local checks have stopped — {fmt_duration(blind)}"
+        ),
+        lines=[
+            watch_label(cfg),
+            f"Last successful check: {when}.",
+            cause,
+            f"{dark} are dark — cloud reminders still run.",
+        ],
         url=cfg.film_page_url,
     )
 
@@ -87,47 +204,49 @@ def _cinesa_error_status(error: str | Exception) -> int | None:
             pass
 
     text = str(error)
-    match = re.search(r'''(?:\bHTTP\s+|['"])(\d{3})\b''', text)
+    match = re.search(r'''(?:\bHTTP\s+|[\'"])(\d{3})\b''', text)
     return int(match.group(1)) if match else None
 
 
 def build_cinesa_error_finding(
-    cfg, streak: int, error: str | Exception, key: str
+    cfg, error: str | Exception, key: str, *, day: int = 1, since: str | None = None
 ) -> Finding:
     """Cinesa half is blind. Kept separate from the Pathé error: the two halves
-    fail for unrelated reasons and one must never mask the other."""
-    summary = " ".join(str(error).split())[:300]
+    fail for unrelated reasons and one must never mask the other.
+
+    Cinesa state still carries no per-run success timestamp (at 15-min cadence
+    it would rewrite and push state.json ~96x a day); `since` comes from
+    `blind_since`, stamped once when an outage is first confirmed.
+    """
     status = _cinesa_error_status(error)
+    text = str(error)
     if status == 403:
-        guidance = (
-            "Likely a Cinesa network/IP rejection. Disable any VPN or proxy, then"
-            " wait for the next automatic retry; the cached token is preserved and"
-            " Chrome stays closed during the cooldown."
-        )
+        cause = "Cause: Cinesa is blocking your IP (403)."
+        tail = "Retrying every 15 min — the cached token is kept."
     elif status == 401:
-        guidance = "Cinesa rejected the token; the watcher will force a fresh token on the next automatic retry."
-    elif "Chrome" in str(error) or "CDP" in str(error) or "challenge" in str(error).lower():
-        guidance = (
-            "The token step could not drive Chrome. Check that Google Chrome is"
-            " installed at the configured path and that the Mac is logged in and"
-            " awake — a locked screen is fine (verified), but a login window or"
-            " system sleep leaves no GUI session for a real browser window."
-        )
+        cause = "Cause: Cinesa rejected the token."
+        tail = "A fresh token is minted on the next retry."
+    elif "Chrome" in text or "CDP" in text or "challenge" in text.lower():
+        cause = "Cause: the token step couldn't drive Chrome."
+        tail = "Needs you: check Chrome is installed and the Mac is logged in and awake."
     else:
-        guidance = "Possible causes: Cinesa API change, token rejected, or a network outage."
+        cause = f"Cause: {' '.join(text.split())[:160]}"
+        tail = "Retrying every 15 min; check the logs if it persists."
+    repeat = day > 1
     return Finding(
-        kind="WATCHER_ERROR",
+        kind="WATCHER_STILL_BLIND" if repeat else "WATCHER_ERROR",
         key=key,
         confidence="high",
-        title="Watcher cannot reach the Cinesa API",
+        title=f"Cinesa watch still blind — day {day}" if repeat else "Cinesa watch is BLIND",
         lines=[
-            f"{streak} consecutive Cinesa checks have failed.",
-            f"Last error: {summary}",
-            guidance,
+            cinesa_label(cfg),
             (
-                f"{cfg.cinesa_film_title} @ {cfg.cinesa_site_name} is NOT being watched"
-                " right now. The Pathé half is unaffected."
+                f"Not watched since {since} — the Pathé half is unaffected."
+                if since
+                else "Not being watched right now — the Pathé half is unaffected."
             ),
+            cause,
+            tail,
         ],
         url=cfg.cinesa_page_url,
     )
@@ -138,8 +257,8 @@ def build_cinesa_recovered_finding(cfg, now: datetime) -> Finding:
         kind="RECOVERED",
         key=f"cinesa_recovered:{now:%Y-%m-%dT%H%M}",
         confidence="high",
-        title="Watcher recovered — Cinesa API reachable again",
-        lines=[f"{cfg.cinesa_site_name} checks are running normally again."],
+        title="Cinesa watch is back",
+        lines=[cinesa_label(cfg), "Checks are running normally."],
         url=cfg.cinesa_page_url,
     )
 
@@ -149,36 +268,45 @@ def build_heartbeat(cfg, snap: detect.Snapshot, st: dict, now: datetime) -> Find
         (s for s in snap.matched_shows if s.get("slug") == cfg.primary_slug), None
     )
     sales = st.get("sales", {})
-    sale_line = "not yet announced"
-    if sales:
-        parts = [f"{slug}: {detect.fmt_dt(detect.parse_iso(iso))}" for slug, iso in sales.items()]
-        sale_line = "; ".join(parts)
+    sale_line = "no sale date yet"
+    if len(sales) == 1:
+        # One watched listing is the normal case; naming its slug adds nothing.
+        sale_line = "sale opens " + detect.fmt_dt_short(
+            detect.parse_iso(next(iter(sales.values())))
+        )
+    elif sales:
+        parts = [
+            f"{slug}: {detect.fmt_dt_short(detect.parse_iso(iso))}"
+            for slug, iso in sales.items()
+        ]
+        sale_line = "sales open — " + "; ".join(parts)
+    listed = "Listed at the cinema" if snap.cinema_entries else "Not yet listed"
+    bookable = "sessions bookable" if snap.showtimes else "nothing bookable"
     lines = [
-        f"Release date (Pathé): {detect.fmt_release(primary) if primary else cfg.release_date}",
-        f"Sale opening: {sale_line}",
-        f"Listed at {cfg.cinema_name}: {'yes' if snap.cinema_entries else 'no'}",
-        f"Bookable sessions at {cfg.cinema_name}: {'YES' if snap.showtimes else 'none'}",
-        f"Pathé listings watched: {len(snap.matched_shows)}",
+        watch_label(cfg),
+        f"Release {detect.fmt_release(primary) if primary else cfg.release_date} · {sale_line}.",
+        f"{listed} · {bookable} · {detect.plural(len(snap.matched_shows), 'listing')} watched.",
     ]
     if cfg.cinesa_enabled:
         cin = st.get("cinesa", {})
-        imax = cin.get("imax_present")
+        imax = {True: "IMAX scheduled", False: "no IMAX scheduled"}.get(
+            cin.get("imax_present"), "IMAX unknown"
+        )
         lines += [
             "",
-            f"— {cfg.cinesa_film_title} @ {cfg.cinesa_site_name} —",
+            cinesa_label(cfg),
             (
-                f"Bookable through: {cin.get('horizon') or 'unknown'}"
-                f" ({cin.get('day_count') or 0} days)"
+                f"Bookable to {cin.get('horizon') or 'unknown'}"
+                f" ({cin.get('day_count') or 0} days) · {imax}."
             ),
-            "IMAX: " + {True: "scheduled", False: "NOT scheduled"}.get(imax, "unknown"),
-            "Watching dates: " + (", ".join(cfg.cinesa_target_dates) or "none"),
+            "Watching: " + (", ".join(cfg.cinesa_target_dates) or "no target dates"),
         ]
-    lines.append("Daily checks are running normally.")
+    lines.append("All checks healthy.")
     return Finding(
         kind="HEARTBEAT",
         key=f"heartbeat:{now:%Y-%m-%d}",
         confidence="high",
-        title=f"Watcher alive — nothing new ({cfg.film_title})",
+        title="All quiet — nothing new",
         lines=lines,
         url=cfg.film_page_url,
     )
@@ -287,6 +415,13 @@ def run(argv: list[str] | None = None) -> int:
             st["failure_streak"] = min(
                 st.get("failure_streak", 0) + 1, cfg.failure_streak_threshold
             )
+            # The cloud pass never calls Pathé, so it cannot tell "IP blocked"
+            # from "the Mac never checked in" — the two need opposite responses.
+            # Recording the cause here lets it say which. Written only when the
+            # text changes: a steady outage writes state once, not every 15 min.
+            summary, _ = summarize_pathe_error(str(e))
+            if st.get("last_error") != summary:
+                st["last_error"] = summary
             # With adaptive cadence, retries come every 15 min — require both
             # a failure streak AND 6h without success before crying wolf.
             if (
@@ -294,7 +429,7 @@ def run(argv: list[str] | None = None) -> int:
                 and not state_mod.is_check_fresh(st, 6.0, now)
                 and not st.get("error_alerted")
             ):
-                err = build_error_finding(cfg, st["failure_streak"], str(e), now)
+                err = build_error_finding(cfg, st, str(e), now)
                 if notify.send_telegram(
                     cfg,
                     notify.render_finding(err),
@@ -306,9 +441,14 @@ def run(argv: list[str] | None = None) -> int:
 
         if snap is not None:
             if st.get("error_alerted"):
-                findings.append(build_recovered_finding(cfg, now))
+                findings.append(build_recovered_finding(cfg, st, now))
             st["failure_streak"] = 0
             st["error_alerted"] = False
+            # Stale cause + spent stale keys must not survive into the next
+            # outage: they would make the cloud pass report the wrong reason.
+            st.pop("last_error", None)
+            for spent in [k for k in st.get("alerts", {}) if k.startswith("stale:")]:
+                st["alerts"].pop(spent, None)
             st["last_check_ok"] = now.isoformat()
             findings.extend(detect.analyze_pathe(snap, st, cfg, now))
 
@@ -333,16 +473,28 @@ def run(argv: list[str] | None = None) -> int:
                 cin["failure_streak"] = min(
                     cin.get("failure_streak", 0) + 1, cfg.failure_streak_threshold
                 )
-                if cin["failure_streak"] >= cfg.failure_streak_threshold and not cin.get(
-                    "error_alerted"
-                ):
+                if cin["failure_streak"] >= cfg.failure_streak_threshold:
+                    # Stamped once, when the outage is first confirmed — not per
+                    # run, which at 15-min cadence would push state ~96x a day.
+                    cin.setdefault("blind_since", now.isoformat())
+                    started = detect.parse_iso(cin.get("blind_since")) or now
+                    # The key is already day-stamped, so it yields exactly one
+                    # alert per day; day 1 buzzes, later days repeat silently.
+                    day = (now.date() - detect.as_aware(started).date()).days + 1
                     cinesa_error_key = f"cinesa_error:{now:%Y-%m-%d}"
                     findings.append(
-                        build_cinesa_error_finding(cfg, cin["failure_streak"], e, cinesa_error_key)
+                        build_cinesa_error_finding(
+                            cfg,
+                            e,
+                            cinesa_error_key,
+                            day=day,
+                            since=short_dt(started) if day > 1 else None,
+                        )
                     )
             else:
                 if cin.get("error_alerted"):
                     findings.append(build_cinesa_recovered_finding(cfg, now))
+                cin.pop("blind_since", None)
                 findings.extend(detect.analyze_cinesa(csnap, st, cfg, now))
 
         for f in findings:
@@ -402,7 +554,7 @@ def run(argv: list[str] | None = None) -> int:
         st, cfg.reminder_offsets_minutes, now
     )
     for r in due:
-        text = notify.render_reminder(r["offset"], r["target"], cfg)
+        text = notify.render_reminder(r["offset"], r["target"], cfg, now)
         log.info("reminder due: %s before %s", r["offset"], r["target"])
         if notify.send_telegram(cfg, text, dry_run=args.dry_run):
             state_mod.mark_reminder(st, r["target"], r["offset"], cfg.reminder_offsets_minutes)
@@ -410,24 +562,16 @@ def run(argv: list[str] | None = None) -> int:
     # Supervision: alert when the Pathé check (running on another machine
     # than the cloud reminder pass) stopped reporting.
     if not args.adaptive_cadence and state_mod.is_check_stale(st, cfg.stale_check_hours, now):
-        key = f"stale:{st.get('last_check_ok')}"
+        last_ok = detect.as_aware(detect.parse_iso(st.get("last_check_ok")))
+        blind = now - last_ok
+        # Alert once at the threshold, then every 24h for as long as it lasts —
+        # a blind spell that goes quiet after one message is the failure mode
+        # this exists to prevent. Periods are measured from the first alert, so
+        # every repeat lands at the same clock time.
+        period = stale_period(blind, cfg.stale_check_hours)
+        key = f"stale:{st.get('last_check_ok')}:{period}"
         if not state_mod.already_sent(st, key):
-            stale = Finding(
-                kind="WATCHER_ERROR",
-                key=key,
-                confidence="high",
-                title="No successful Pathé check recently",
-                lines=[
-                    f"Last successful check: {detect.fmt_dt(detect.parse_iso(st.get('last_check_ok')))}.",
-                    (
-                        f"Threshold: {cfg.stale_check_hours}h — the daily check job seems to"
-                        " have stopped (machine off/asleep for days, launchd job unloaded,"
-                        " or git push failing)."
-                    ),
-                    "Cloud reminders still run, but new Pathé signals are NOT being watched.",
-                ],
-                url=cfg.film_page_url,
-            )
+            stale = build_stale_finding(cfg, st, blind, key, period + 1)
             if notify.send_telegram(
                 cfg,
                 notify.render_finding(stale),
