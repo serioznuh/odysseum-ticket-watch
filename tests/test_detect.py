@@ -20,6 +20,7 @@ PATTERNS = [
 ]
 
 PRIMARY = "dune-troisieme-partie-50828"
+OFFSETS = [1440, 120, 15]
 
 
 class Cfg:
@@ -32,9 +33,16 @@ class Cfg:
     cinema_name = "Pathé Odysseum"
     cinema_city = "Montpellier"
     cinema_page_url = "https://www.pathe.fr/cinemas/cinema-pathe-odysseum"
+    reminder_offsets_minutes = OFFSETS
     news_min_confidence = "low"
     news_max_age_days = 10
     news_max_alerts_per_run = 3
+
+
+def whole_message(f) -> str:
+    """Title + body, the way the renderer shows it. The redesign moved the
+    headline fact into the title, so body-only assertions test the wrong half."""
+    return f.title + " " + " ".join(f.lines)
 
 
 def fresh_state() -> dict:
@@ -111,7 +119,7 @@ def test_new_event_listing_detected_once():
     snap = Snapshot(matched_shows=[primary_show(), event_show()])
     findings = detect.analyze_pathe(snap, fresh_state(), Cfg, NOW)
     assert [f.kind for f in findings] == ["NEW_LISTING"]
-    assert "IMAX 70 mm" in " ".join(findings[0].lines)
+    assert "IMAX 70 mm" in whole_message(findings[0])
     assert findings[0].url.startswith("https://www.pathe.fr/evenements/")
 
     seen = fresh_state()
@@ -129,7 +137,7 @@ def test_sale_date_announced():
     assert f.confidence == "high"
     assert f.sale_datetime == iso
     assert f.key == f"sale:{PRIMARY}:{iso}"
-    assert any("05 Nov 2026" in line for line in f.lines)
+    assert "Thu 5 Nov, 08:00" in whole_message(f)
 
 
 def test_sale_date_changed_and_unchanged():
@@ -170,7 +178,7 @@ def test_tickets_available_with_imax70_format():
     findings = detect.analyze_pathe(snap, st, Cfg, NOW)
     assert [f.kind for f in findings] == ["TICKETS_AVAILABLE"]
     f = findings[0]
-    joined = " ".join(f.lines)
+    joined = whole_message(f)
     assert "IMAX 70 mm (1.43:1)" in joined  # from the listing title
     assert "https://s.pathe.fr/fr/BOOKME/booking" in joined
     assert "Pathé Odysseum" in joined
@@ -252,7 +260,7 @@ def test_news_lead_with_future_date_is_medium():
     assert len(findings) == 1
     assert findings[0].kind == "NEWS_LEAD"
     assert findings[0].confidence == "medium"
-    assert any("05 Nov 2026" in line for line in findings[0].lines)
+    assert "5 Nov 2026" in whole_message(findings[0])
 
 
 def test_news_release_date_only_stays_low():
@@ -315,3 +323,83 @@ def test_news_url_dedup_and_cap():
     st["alerts"][findings[0].key] = NOW.isoformat()
     again = detect.analyze_news(items[:1], Cfg, st, NOW)
     assert again == []
+
+
+def test_new_listing_does_not_deny_a_sale_date_it_is_about_to_announce():
+    """A dedicated 70 mm event page — the project's headline scenario — often
+    appears with its opening already set, so NEW_LISTING and SALE_DATE fire in
+    the same pass. The body used to hard-code "no sale date published yet"."""
+    show = primary_show(
+        slug="dune-troisieme-partie-projection-imax-70mm-55289",
+        title="Dune : Troisième partie : Projection IMAX 70mm",
+        salesOpeningDatetime="2026-11-05T08:00:00+01:00",
+    )
+    snap = Snapshot(matched_shows=[show], cinema_entries={}, showtimes={})
+
+    findings = detect.analyze_pathe(snap, fresh_state(), Cfg, NOW)
+
+    kinds = [f.kind for f in findings]
+    assert kinds == ["NEW_LISTING", "SALE_DATE"]
+    new_listing = " ".join(findings[0].lines)
+    assert "no sale date published yet" not in new_listing
+    assert "Thu 5 Nov, 08:00" in new_listing
+
+
+def test_reminder_promise_only_when_the_ladder_actually_covers_that_opening():
+    """Reminders track a single `sale_target` — the earliest future opening —
+    and stop once tickets are bookable. Claiming "reminders set" on any other
+    listing promised something the watcher never delivers."""
+    early = primary_show(slug="early", salesOpeningDatetime="2026-10-01T10:00:00+02:00")
+    late = primary_show(slug="late", salesOpeningDatetime="2026-11-20T10:00:00+02:00")
+    snap = Snapshot(matched_shows=[early, late], cinema_entries={}, showtimes={})
+    st = fresh_state()
+    st["shows_seen"] = ["early", "late"]
+
+    by_slug = {
+        f.key.split(":")[1]: f
+        for f in detect.analyze_pathe(snap, st, Cfg, NOW)
+        if f.kind == "SALE_DATE"
+    }
+
+    assert any("Reminders set" in ln for ln in by_slug["early"].lines)
+    assert not any("Reminders" in ln for ln in by_slug["late"].lines)
+
+    # Once tickets are bookable the ladder is over for every listing.
+    st2 = fresh_state()
+    st2["shows_seen"] = ["early"]
+    st2["tickets_available"] = True
+    snap2 = Snapshot(matched_shows=[early], cinema_entries={}, showtimes={})
+    only = [f for f in detect.analyze_pathe(snap2, st2, Cfg, NOW) if f.kind == "SALE_DATE"]
+    assert not any("Reminders" in ln for ln in only[0].lines)
+
+
+def test_tickets_alert_headlines_the_format_that_just_appeared():
+    """The alert fires because `new_fmts` appeared. Titling the best format
+    merely *present* re-announced IMAX 70 mm when standard sessions were what
+    actually changed."""
+    show = primary_show(slug="dune")
+    snap = Snapshot(
+        matched_shows=[show],
+        cinema_entries={"dune": {"isBookable": True}},
+        showtimes={
+            "dune": {
+                "2026-12-16": [
+                    {"tags": ["imax", "70mm"], "refCmd": "https://book/imax"},
+                    {"tags": ["vf"], "auditoriumName": "Salle 3", "refCmd": "https://book/std"},
+                ]
+            }
+        },
+    )
+    st = fresh_state()
+    st["shows_seen"] = ["dune"]
+    st["formats_seen"] = {"dune": [detect.FMT_IMAX70]}  # IMAX already announced
+
+    f = next(
+        x for x in detect.analyze_pathe(snap, st, Cfg, NOW)
+        if x.kind == "TICKETS_AVAILABLE"
+    )
+
+    assert f.title == "BOOK NOW — Standard / other is live"
+    assert "https://book/std" in " ".join(f.lines)
+    # The already-known format is context, not the headline, and is not repeated.
+    assert "Also bookable: IMAX 70 mm (1.43:1): 1" in f.lines

@@ -15,11 +15,13 @@ from watcher.state import (
     load_state,
     mark_reminder,
     mark_sent,
+    migrate_stale_keys,
     save_state,
     update_from_snapshot,
 )
 
 PARIS = detect.TZ_PARIS
+OFFSETS = [1440, 120, 15]
 NOW = datetime(2026, 7, 6, 9, 0, tzinfo=PARIS)
 OFFSETS = [1440, 120, 15]
 
@@ -95,8 +97,10 @@ def test_undelivered_one_shot_alerts_leave_their_baselines_alone():
 
     class Cfg:
         primary_slug = "primary"
+        film_title = "Dune : Troisième partie"
         cinema_name = "Pathé Odysseum"
         cinema_city = "Montpellier"
+        reminder_offsets_minutes = OFFSETS
 
     sale = iso_in(timedelta(days=30))
     show = {
@@ -245,3 +249,68 @@ def test_reminders_stop_when_tickets_available():
     st["sale_target"] = iso_in(timedelta(minutes=10))
     st["tickets_available"] = True
     assert due_reminders(st, OFFSETS, NOW) == []
+
+
+def test_stale_key_migration_does_not_re_alert_a_currently_blind_watcher():
+    """The stale key gained a ':{period}' suffix so the alert can repeat daily.
+    A machine that is blind right now must not get a duplicate on upgrade."""
+    old_key = "stale:2026-08-07T09:27:48+02:00"
+    st = {"alerts": {old_key: "2026-08-08T03:00:00+02:00", "error:2026-09-02": "x"}}
+
+    migrate_stale_keys(st)
+
+    assert old_key not in st["alerts"]
+    assert st["alerts"][f"{old_key}:0"] == "2026-08-08T03:00:00+02:00"
+    # Unrelated dedup memory is untouched.
+    assert st["alerts"]["error:2026-09-02"] == "x"
+
+
+def test_stale_key_migration_is_idempotent_and_leaves_new_keys_alone():
+    already = {"alerts": {"stale:2026-08-07T09:27:48+02:00:0": "x"}}
+
+    migrate_stale_keys(already)
+    migrate_stale_keys(already)
+
+    assert already["alerts"] == {"stale:2026-08-07T09:27:48+02:00:0": "x"}
+
+
+def test_load_state_migrates_on_read(tmp_path):
+    p = tmp_path / "state.json"
+    p.write_text(
+        json.dumps({"alerts": {"stale:2026-08-07T09:27:48+02:00": "x"}}), encoding="utf-8"
+    )
+
+    st = load_state(p)
+
+    assert "stale:2026-08-07T09:27:48+02:00:0" in st["alerts"]
+
+
+def test_stale_key_migration_leaves_two_digit_periods_alone():
+    """Regression: `fromisoformat` accepts sub-minute UTC offsets, so
+    'stale:<iso>:37' parses as a timestamp with a +HH:MM:SS offset. Treating
+    "does it parse" as the old-format test renamed every period from 10 to 99
+    after it was sent, re-alerting on every cloud pass — 96 messages a day
+    through days 11-100 of an outage."""
+    iso = "2026-09-02T07:11:00+02:00"
+
+    for period in (0, 1, 9, 10, 37, 99, 100):
+        key = f"stale:{iso}:{period}"
+        st = {"alerts": {key: "x"}}
+
+        migrate_stale_keys(st)
+
+        assert list(st["alerts"]) == [key], f"period {period} was rewritten"
+
+
+def test_stale_key_migration_still_converts_the_real_legacy_shapes():
+    for iso in (
+        "2026-09-02T07:11:00+02:00",
+        "2026-09-02T07:11:00.123456+02:00",
+        "2026-09-02T07:11:00Z",
+        "2026-09-02T07:11:00",
+    ):
+        st = {"alerts": {f"stale:{iso}": "x"}}
+
+        migrate_stale_keys(st)
+
+        assert list(st["alerts"]) == [f"stale:{iso}:0"], iso

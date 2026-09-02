@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -70,7 +71,37 @@ def load_state(path: str | Path) -> dict:
         section = dict(defaults)
         section.update(merged.get(key) or {})
         merged[key] = section
+    migrate_stale_keys(merged)
     return merged
+
+
+LEGACY_STALE_KEY = re.compile(
+    r"stale:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?"
+)
+
+
+def migrate_stale_keys(state: dict) -> None:
+    """Adopt the periodic stale key without re-alerting.
+
+    The supervision alert used to be keyed `stale:{last_check_ok}` and fired
+    once per outage. It now repeats every 24h, so the key carries the period:
+    `stale:{last_check_ok}:{period}`. Without this migration the already-sent
+    old key would no longer match, and a machine that is currently blind would
+    get one duplicate alert on upgrade.
+    """
+    alerts = state.get("alerts")
+    if not isinstance(alerts, dict):
+        return
+    for key in list(alerts):
+        # Match the legacy shape exactly. "Does the remainder parse as a
+        # timestamp?" is NOT a valid test: fromisoformat accepts sub-minute UTC
+        # offsets, so "...+02:00:37" parses happily and every two-digit period
+        # (outage days 11-100) would be mistaken for an un-migrated key and
+        # renamed after each send — re-alerting on every cloud pass.
+        if not LEGACY_STALE_KEY.fullmatch(key):
+            continue
+        alerts.setdefault(f"{key}:0", alerts[key])
+        alerts.pop(key, None)
 
 
 def save_state(path: str | Path, state: dict) -> None:

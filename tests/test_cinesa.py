@@ -530,7 +530,7 @@ def test_cinesa_failure_alert_buzzes_and_names_the_cause():
     """The safety net: a blind Cinesa half must reach the phone, loudly, and
     must not be mistaken for the Pathé half failing."""
     chrome = main.build_cinesa_error_finding(
-        Cfg, 3, "CDPError: Chrome DevTools endpoint never came up", "cinesa_error:2026-08-01"
+        Cfg, "CDPError: Chrome DevTools endpoint never came up", "cinesa_error:2026-08-01"
     )
     assert chrome.kind == "WATCHER_ERROR"
     assert chrome.kind not in notify.DEFAULT_SILENT_KINDS  # i.e. it buzzes
@@ -540,41 +540,60 @@ def test_cinesa_failure_alert_buzzes_and_names_the_cause():
     assert "Chrome" in body and "logged in and awake" in body
     assert "unlocked" not in body
     assert "Pathé half is unaffected" in body
+    # Every alert names its target, so a second watch can never be confused
+    # with this one.
+    assert Cfg.cinesa_film_title in body and Cfg.cinesa_site_name in body
 
     generic = main.build_cinesa_error_finding(
-        Cfg, 3, "HTTP 500 from vwc.cinesa.es", "cinesa_error:2026-08-01"
+        Cfg, "HTTP 500 from vwc.cinesa.es", "cinesa_error:2026-08-01"
     )
-    assert "Cinesa API change" in "\n".join(generic.lines)
+    assert "500" in "\n".join(generic.lines)
 
-    vpn = main.build_cinesa_error_finding(
+    blocked = main.build_cinesa_error_finding(
         Cfg,
-        3,
         cinesa.TokenRejected(403, "https://vwc.cinesa.es/WSVistaWebClient"),
         "cinesa_error:2026-08-01",
     )
-    vpn_body = "\n".join(vpn.lines)
-    assert "VPN" in vpn_body and "proxy" in vpn_body
-    assert "automatic retry" in vpn_body
+    blocked_body = "\n".join(blocked.lines)
+    # The old copy told the user to disable a VPN. That advice was wrong
+    # whenever they had none — an IP block is the fact; the remedy is not.
+    assert "blocking your IP (403)" in blocked_body
+    assert "VPN" not in blocked_body
 
     quoted = main.build_cinesa_error_finding(
         Cfg,
-        3,
         "Client error '403 Forbidden' for url 'https://vwc.cinesa.es/WSVistaWebClient'",
         "cinesa_error:2026-08-01",
     )
-    assert "VPN" in "\n".join(quoted.lines)
+    assert "blocking your IP (403)" in "\n".join(quoted.lines)
+
+
+def test_cinesa_repeat_after_day_one_is_silent():
+    """A long Cinesa outage keeps reporting, but only the first day buzzes."""
+    first = main.build_cinesa_error_finding(Cfg, "boom", "cinesa_error:2026-08-01")
+    later = main.build_cinesa_error_finding(
+        Cfg, "boom", "cinesa_error:2026-08-04", day=4, since="Sat 1 Aug, 09:00"
+    )
+
+    assert first.kind == "WATCHER_ERROR"
+    assert first.kind not in notify.DEFAULT_SILENT_KINDS
+    assert later.kind == "WATCHER_STILL_BLIND"
+    assert later.kind in notify.DEFAULT_SILENT_KINDS
+    assert "day 4" in later.title
+    assert "Sat 1 Aug, 09:00" in "\n".join(later.lines)
 
 
 def test_cinesa_error_and_recovery_keys_allow_repeat_incidents():
     """Daily-granular keys: one alert per incident per day, but a later outage
     is not silenced forever by the dedup store."""
-    day1 = main.build_cinesa_error_finding(Cfg, 3, "boom", "cinesa_error:2026-08-01")
-    day2 = main.build_cinesa_error_finding(Cfg, 3, "boom", "cinesa_error:2026-08-02")
+    day1 = main.build_cinesa_error_finding(Cfg, "boom", "cinesa_error:2026-08-01")
+    day2 = main.build_cinesa_error_finding(Cfg, "boom", "cinesa_error:2026-08-02")
     assert day1.key != day2.key
 
     rec = main.build_cinesa_recovered_finding(Cfg, NOW)
     assert rec.kind == "RECOVERED"
     assert rec.key.startswith("cinesa_recovered:")
+    assert Cfg.cinesa_film_title in "\n".join(rec.lines)
 
 
 def test_state_upgrade_preserves_existing_cinesa_values(tmp_path):

@@ -13,7 +13,7 @@ and it can watch any film/cinema on pathe.fr by editing [config.toml](config.tom
 - 🆕 **New listing** — a matching catalogue entry appeared (Pathé creates dedicated event pages for 70 mm runs, each with its own sale opening)
 - 📍 **Listed at your cinema** (not bookable yet) → 🚨 **Tickets bookable NOW**, with formats, session dates and a direct booking link
 - 📰 **News lead** — early press hint via Google News (low/medium confidence, strictly filtered — see configuration)
-- ⚠️ watcher failure / ✅ recovery / 💤 weekly "still alive" heartbeat
+- 🔴 watcher blind, then a silent **"still blind — day N"** every 24 h until it recovers / ✅ recovery / 💤 weekly heartbeat
 
 From the second watch target (*La odisea* in IMAX at **Cinesa Diagonal Mar**,
 Barcelona — see [Cinesa target](#cinesa-target)):
@@ -22,11 +22,11 @@ Barcelona — see [Cinesa target](#cinesa-target)):
 - 🗓️ *(silent)* that date opened, but **without** IMAX — you still get the loud 🎫 if IMAX appears for it later
 - 📉 **IMAX disappeared** (confirmed over two checks) / 📈 **IMAX is back**
 
-Every alert carries the source URL, detected format (IMAX 70 mm / IMAX /
-other), cinema and a confidence level. Each distinct finding is sent **once**,
-deduplicated forever via `state/state.json`. News leads, heartbeats and
-recovery notes arrive **silently**; sale dates, tickets, reminders and
-failures buzz (tune via `alerts.silent_kinds`).
+Every alert names its **film and cinema** first, so a second watch target is
+never mistaken for this one, plus the source URL and detected format. Findings
+are sent **once**, deduplicated forever via `state/state.json` — except the
+outage reminder, which repeats daily by design. News leads, heartbeats,
+recoveries and "still blind" repeats are **silent** (`alerts.silent_kinds`).
 
 ## How it works
 
@@ -45,10 +45,10 @@ datacenter IPs (verified: 403 from Actions, 200 from a home IP, same code):
 | your Mac — launchd, adaptive cadence | full Pathé + news check; pushes `state/state.json` | needs a residential IP |
 | GitHub Actions — every 15 min | reminder ladder + supervision, reading the shared state | needs 24/7 uptime; no Pathé access required |
 
-Safety nets so it never dies silently: ⚠️ if the local check hasn't succeeded
-for 72 h, ⚠️ after 3 consecutive Pathé failures, 💤 weekly heartbeat. A 403
-failure calls out VPN/proxy egress explicitly and points to the local launchd log;
-checks retry automatically every 15 min until the connection recovers.
+Safety nets so it never dies silently: 🔴 after 3 consecutive Pathé failures,
+🔴 if nothing has succeeded for 18 h — **then every 24 h until it recovers**, so
+a long outage cannot fall out of mind — and 💤 a weekly heartbeat. Each names
+the cause it can prove (IP block, CI datacenter range, or a silent Mac).
 
 ### Cinesa target
 
@@ -165,7 +165,7 @@ before editing any working copy.
 | `alerts.heartbeat_days` | `7` | 💤 "alive" summary when nothing was alerted for N days. `0` = off. |
 | `alerts.failure_streak_threshold` | `3` | ⚠️ after N consecutive failed Pathé checks. |
 | `alerts.stale_check_hours` | `18` | Cloud pass ⚠️ when the last successful check is older than this (local job died, or the Mac stayed shut). `0` = off. Sized from measured gaps: 4 h median, 12.9 h worst ordinary overnight — below ~16 h, normal nights trip it. |
-| `alerts.silent_kinds` | `["HEARTBEAT", "NEWS_LEAD", "RECOVERED", "CINESA_TARGET_NO_IMAX"]` | Alert kinds delivered silently (no sound/vibration). Everything else buzzes; reminders and the 🟢 "open now" ping always buzz. |
+| `alerts.silent_kinds` | `["HEARTBEAT", "NEWS_LEAD", "RECOVERED", "CINESA_TARGET_NO_IMAX", "WATCHER_STILL_BLIND"]` | Alert kinds delivered silently (no sound/vibration). Everything else buzzes; reminders and the 🟢 "open now" ping always buzz. This list **replaces** the built-in default rather than extending it, so a new quiet kind must be added here too (a test enforces this). |
 | `cadence.baseline_hours` | `4.0` | Check frequency while nothing is announced. |
 | `cadence.within_week_hours` | `2.0` | …when the sale opening is ≤ 7 days away. |
 | `cadence.final_48h_hours` | `0.5` | …when it's ≤ 48 h away. |

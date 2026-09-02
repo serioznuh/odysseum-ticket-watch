@@ -89,6 +89,59 @@ def fmt_dt(dt: datetime | None) -> str:
     return dt.strftime("%a %d %b %Y, %H:%M") + " (Paris time)"
 
 
+def fmt_dt_short(dt: datetime | None) -> str:
+    """'Wed 15 Oct, 10:00' — for titles, where the year and the timezone note
+    cost more room than they earn. Still Paris time, like every other time."""
+    if dt is None:
+        return "unknown"
+    dt = as_aware(dt).astimezone(TZ_PARIS)
+    return f"{dt:%a} {dt.day} {dt:%b}, {dt:%H:%M}"
+
+
+def fmt_day(iso_day: str | None) -> str:
+    """'2026-12-16' -> '16 Dec'."""
+    if not iso_day:
+        return "unknown"
+    try:
+        d = date.fromisoformat(iso_day)
+    except ValueError:
+        return iso_day
+    return f"{d.day} {d:%b}"
+
+
+def fmt_offsets(minutes: list[int]) -> str:
+    """[1440, 120, 15] -> '24 h, 2 h and 15 min'."""
+    def one(m: int) -> str:
+        if m >= 1440 and m % 1440 == 0:
+            return f"{m // 1440} d" if m > 1440 else "24 h"
+        if m >= 60 and m % 60 == 0:
+            return f"{m // 60} h"
+        return f"{m} min"
+
+    parts = [one(m) for m in sorted(minutes, reverse=True)]
+    if not parts:
+        return "none"
+    if len(parts) == 1:
+        return parts[0]
+    return ", ".join(parts[:-1]) + f" and {parts[-1]}"
+
+
+def plural(n: int, word: str) -> str:
+    """'1 session' / '2 sessions'. Alerts are read at a glance; '(s)' is a form
+    field, not a sentence."""
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+def watch_line(cfg: Any) -> str:
+    """Film and cinema, on every alert. With more than one watch configured an
+    unlabelled alert cannot be told apart from another target's."""
+    return f"{cfg.film_title} · {cfg.cinema_name}, {cfg.cinema_city}"
+
+
+def cinesa_line(cfg: Any) -> str:
+    return f"{cfg.cinesa_film_title} · {cfg.cinesa_site_name}, {cfg.cinesa_site_city}"
+
+
 def fmt_release(show: dict | None) -> str:
     rel = (show or {}).get("releaseAt") or {}
     if isinstance(rel, dict):
@@ -156,6 +209,29 @@ def summarize_sessions(show: dict, days: dict[str, list[dict]]) -> dict:
     }
 
 
+def reminders_cover(sale_iso: str, snap: Snapshot, state: dict, now: datetime) -> bool:
+    """Whether the reminder ladder will actually fire for this opening.
+
+    `due_reminders` tracks a single `sale_target` — the earliest *future*
+    opening across all matched listings — and stops entirely once tickets are
+    known to be bookable. Announcing "reminders set" for anything else was a
+    promise the watcher does not keep.
+    """
+    if state.get("tickets_available"):
+        return False
+    target = parse_iso(sale_iso)
+    if target is None or as_aware(target) <= now:
+        return False
+    future = [
+        as_aware(dt)
+        for dt in (
+            parse_iso(sh.get("salesOpeningDatetime")) for sh in snap.matched_shows
+        )
+        if dt is not None and as_aware(dt) > now
+    ]
+    return bool(future) and as_aware(target) == min(future)
+
+
 # --------------------------------------------------------------------------- Pathé analysis
 
 def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[Finding]:
@@ -173,18 +249,27 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
         # 1. Brand-new listing matching the film (e.g. a dedicated
         #    "Projection IMAX 70mm" event page, as Pathé did for L'Odyssée).
         if slug not in shows_seen and slug != cfg.primary_slug:
+            # A dedicated event page often appears with its opening already
+            # set, and the SALE_DATE finding below fires in the same pass.
+            new_sale = show.get("salesOpeningDatetime")
             findings.append(
                 Finding(
                     kind="NEW_LISTING",
                     key=f"new_show:{slug}",
                     confidence="high",
-                    title="New Pathé listing detected",
+                    title=f"New listing: {FORMAT_LABELS[listing_fmt]}",
                     lines=[
-                        f"Listing: {title}",
-                        f"Detected format: {FORMAT_LABELS[listing_fmt]}",
-                        f"Release date: {fmt_release(show)}",
-                        "Dedicated event listings get their own sale opening — watch incoming.",
-                        "Confidence: HIGH — new entry in the official Pathé catalogue matching your film patterns.",
+                        watch_line(cfg),
+                        f"“{title}”",
+                        (
+                            f"Release {fmt_release(show)} · "
+                            + (
+                                f"sale opens {fmt_dt_short(parse_iso(new_sale))}."
+                                if new_sale
+                                else "no sale date published yet."
+                            )
+                        ),
+                        "Dedicated listings get their own opening — now watching it.",
                     ],
                     url=url,
                 )
@@ -195,28 +280,46 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
         if sale_iso and known_sales.get(slug) != sale_iso:
             changed = slug in known_sales
             display_iso = show.get("showtimesDisplayDatetime")
-            lines = [
-                f"Listing: {title}",
-                f"Sales open: {fmt_dt(parse_iso(sale_iso))}",
-                f"Watched cinema: {cfg.cinema_name}, {cfg.cinema_city}",
-                f"Format of this listing: {FORMAT_LABELS[listing_fmt]}",
-            ]
+            sale_dt = parse_iso(sale_iso)
+            lines = [f"{cfg.film_title} · {FORMAT_LABELS[listing_fmt]} · {cfg.cinema_name}"]
             if changed:
-                lines.insert(
-                    1, f"Previous sale opening: {fmt_dt(parse_iso(known_sales[slug]))} → CHANGED"
-                )
+                prev = parse_iso(known_sales[slug])
+                moved = ""
+                if prev and sale_dt:
+                    shift = as_aware(sale_dt) - as_aware(prev)
+                    days = round(shift.total_seconds() / 86400)
+                    if days:
+                        moved = (
+                            f" — moved {plural(abs(days), 'day')}"
+                            f" {'later' if days > 0 else 'earlier'}"
+                        )
+                    else:
+                        hours = round(shift.total_seconds() / 3600)
+                        if hours:
+                            moved = (
+                                f" — moved {abs(hours)} h"
+                                f" {'later' if hours > 0 else 'earlier'}"
+                            )
+                lines.append(f"Was: {fmt_dt_short(prev)}{moved}.")
             if display_iso and display_iso != sale_iso:
-                lines.append(f"Showtimes visible from: {fmt_dt(parse_iso(display_iso))}")
-            lines += [
-                "Confidence: HIGH — official Pathé API field salesOpeningDatetime.",
-                "Note: opening time is national; popular IMAX 70 mm seats can sell out in minutes.",
-            ]
+                lines.append(f"Showtimes visible from {fmt_dt_short(parse_iso(display_iso))}.")
+            if reminders_cover(sale_iso, snap, state, now):
+                lines.append(
+                    "Reminders rescheduled automatically."
+                    if changed
+                    else f"Reminders set: {fmt_offsets(cfg.reminder_offsets_minutes)} before."
+                )
+            lines.append("Opening time is national — seats can go in minutes.")
             findings.append(
                 Finding(
                     kind="SALE_DATE_CHANGED" if changed else "SALE_DATE",
                     key=f"sale:{slug}:{sale_iso}",
                     confidence="high",
-                    title="Ticket sale opening CHANGED" if changed else "Ticket sale opening announced",
+                    title=(
+                        f"Sale time CHANGED → {fmt_dt_short(sale_dt)}"
+                        if changed
+                        else f"Sale opens {fmt_dt_short(sale_dt)}"
+                    ),
                     lines=lines,
                     url=url,
                     sale_datetime=sale_iso,
@@ -232,36 +335,35 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
             present = set(summary["counts"]) if summary["counts"] else {listing_fmt}
             new_fmts = present - formats_seen.get(slug, set())
             if new_fmts:
-                fmt_bits = [
-                    f"{FORMAT_LABELS[f]}: {summary['counts'].get(f, '?')} session(s)"
-                    for f in sorted(present)
-                ]
+                # The alert exists because `new_fmts` appeared; naming the
+                # best format merely *present* would re-announce IMAX 70 mm
+                # when what actually changed was standard sessions.
                 best = (
                     FMT_IMAX70
-                    if FMT_IMAX70 in present
-                    else (FMT_IMAX if FMT_IMAX in present else FMT_OTHER)
+                    if FMT_IMAX70 in new_fmts
+                    else (FMT_IMAX if FMT_IMAX in new_fmts else FMT_OTHER)
                 )
                 book = summary["booking_by_fmt"].get(best) or url
-                lines = [
-                    f"Listing: {title}",
-                    f"Cinema: {cfg.cinema_name}, {cfg.cinema_city}",
-                    "Formats bookable: " + "; ".join(fmt_bits),
-                ]
+                lines = [watch_line(cfg)]
                 if summary["first_day"]:
                     lines.append(
-                        f"Session dates: {summary['first_day']} → {summary['last_day']}"
-                        f" ({summary['total']} sessions)"
+                        f"{plural(summary['total'], 'session')},"
+                        f" {fmt_day(summary['first_day'])} – {fmt_day(summary['last_day'])}."
                     )
-                lines += [
-                    f"Book ({FORMAT_LABELS[best]}): {book}",
-                    "Confidence: HIGH — sessions returned by the Pathé booking API for this cinema.",
+                others = [
+                    f"{FORMAT_LABELS[f]}: {summary['counts'].get(f, '?')}"
+                    for f in sorted(present)
+                    if f != best
                 ]
+                if others:
+                    lines.append("Also bookable: " + "; ".join(others))
+                lines.append(f"👉 {book}")
                 findings.append(
                     Finding(
                         kind="TICKETS_AVAILABLE",
                         key="tickets:{}:{}".format(slug, ",".join(sorted(new_fmts))),
                         confidence="high",
-                        title="Tickets are bookable NOW",
+                        title=f"BOOK NOW — {FORMAT_LABELS[best]} is live",
                         lines=lines,
                         url=url,
                     )
@@ -273,12 +375,11 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                     kind="CINEMA_LISTED",
                     key=f"cinema_listed:{slug}",
                     confidence="high",
-                    title="Film now listed at the cinema (not bookable yet)",
+                    title=f"Now on the programme at {cfg.cinema_name}",
                     lines=[
-                        f"Listing: {title}",
-                        f"Cinema: {cfg.cinema_name}, {cfg.cinema_city}",
-                        "The film appears on the cinema's programme feed without bookable sessions — sales usually open soon after.",
-                        "Confidence: HIGH — Pathé cinema programme API.",
+                        watch_line(cfg),
+                        "On the cinema's feed, with no bookable sessions yet.",
+                        "Sales usually open within days of this.",
                     ],
                     url=url,
                 )
@@ -306,7 +407,6 @@ def analyze_cinesa(snap: CinesaSnapshot, state: dict, cfg: Any, now: datetime) -
     days = snap.days
     known = {d["date"] for d in days}
     imax = set(imax_days(days, cfg.cinesa_imax_attribute_id))
-    where = f"{cfg.cinesa_site_name}, {cfg.cinesa_site_city}"
 
     # 1. A watched date became bookable.
     for target in cfg.cinesa_target_dates:
@@ -318,13 +418,11 @@ def analyze_cinesa(snap: CinesaSnapshot, state: dict, cfg: Any, now: datetime) -
                     kind="CINESA_TARGET_DATE",
                     key=f"cinesa_target:{cfg.cinesa_site_id}:{cfg.cinesa_film_id}:{target}",
                     confidence="high",
-                    title="IMAX tickets open for a date you are watching",
+                    title=f"Your date is open — {fmt_day(target)}, IMAX",
                     lines=[
-                        f"Film: {cfg.cinesa_film_title}",
-                        f"Cinema: {where}",
-                        f"Date now bookable: {target} — IMAX is in that day's schedule.",
-                        f"Booking horizon now runs to {days[-1]['date']}.",
-                        "Confidence: HIGH — Cinesa/Vista booking API.",
+                        cinesa_line(cfg),
+                        f"{target} is bookable with IMAX in that day's schedule.",
+                        f"👉 {cfg.cinesa_page_url}",
                     ],
                     url=cfg.cinesa_page_url,
                 )
@@ -336,13 +434,11 @@ def analyze_cinesa(snap: CinesaSnapshot, state: dict, cfg: Any, now: datetime) -
                     kind="CINESA_TARGET_NO_IMAX",
                     key=f"cinesa_target_noimax:{cfg.cinesa_site_id}:{cfg.cinesa_film_id}:{target}",
                     confidence="high",
-                    title="Watched date is bookable, but not in IMAX",
+                    title=f"{fmt_day(target)} opened — but no IMAX",
                     lines=[
-                        f"Film: {cfg.cinesa_film_title}",
-                        f"Cinema: {where}",
-                        f"Date now bookable: {target}, with no IMAX session in that day's schedule.",
-                        "You will still get a loud alert if IMAX appears for this date later.",
-                        "Confidence: HIGH — Cinesa/Vista booking API.",
+                        cinesa_line(cfg),
+                        f"{target} is bookable, with no IMAX session on it.",
+                        "You'll get a loud alert if IMAX appears for it.",
                     ],
                     url=cfg.cinesa_page_url,
                 )
@@ -358,15 +454,13 @@ def analyze_cinesa(snap: CinesaSnapshot, state: dict, cfg: Any, now: datetime) -
                     kind="CINESA_IMAX_BACK",
                     key=f"cinesa_imax_back:{now:%Y-%m-%d}",
                     confidence="high",
-                    title="IMAX sessions are back",
+                    title="IMAX is back",
                     lines=[
-                        f"Film: {cfg.cinesa_film_title}",
-                        f"Cinema: {where}",
+                        cinesa_line(cfg),
                         (
-                            f"IMAX is scheduled again on {len(imax)} day(s),"
-                            f" {min(imax)} → {max(imax)}."
+                            f"Scheduled again on {plural(len(imax), 'day')},"
+                            f" {fmt_day(min(imax))} → {fmt_day(max(imax))}."
                         ),
-                        "Confidence: HIGH — Cinesa/Vista booking API.",
                     ],
                     url=cfg.cinesa_page_url,
                 )
@@ -378,19 +472,15 @@ def analyze_cinesa(snap: CinesaSnapshot, state: dict, cfg: Any, now: datetime) -
                     kind="CINESA_IMAX_GONE",
                     key=f"cinesa_imax_gone:{now:%Y-%m-%d}",
                     confidence="high",
-                    title="IMAX sessions have disappeared",
+                    title="IMAX dropped from the schedule",
                     lines=[
-                        f"Film: {cfg.cinesa_film_title}",
-                        f"Cinema: {where}",
+                        cinesa_line(cfg),
                         (
-                            f"The film still has {len(days)} bookable day(s)"
-                            f" ({days[0]['date']} → {days[-1]['date']}) but none in IMAX."
+                            f"{plural(len(days), 'day')} still bookable"
+                            f" ({fmt_day(days[0]['date'])} → {fmt_day(days[-1]['date'])}),"
+                            " none in IMAX — likely moved off the IMAX screen."
                         ),
-                        (
-                            "It has probably been moved off the IMAX screen — a later"
-                            " IMAX booking may no longer be possible."
-                        ),
-                        "Confidence: HIGH — confirmed over two consecutive checks.",
+                        "Confirmed over two consecutive checks.",
                     ],
                     url=cfg.cinesa_page_url,
                 )
@@ -594,27 +684,30 @@ def analyze_news(items: list[dict], cfg: Any, state: dict, now: datetime) -> lis
         confidence = "medium" if (sale_dates and sale_hits) else "low"
         if only_medium and confidence == "low":
             continue
+        dates = ", ".join(f"{d.day} {d:%b %Y}" for d in sale_dates) if sale_dates else ""
+        # The film, not the cinema: a press article is about the release, and
+        # naming a cinema it never mentions would overstate what this says.
         lines = [
-            f"Headline: {(item.get('title') or '').strip()}",
-            f"Source: {item.get('source') or 'web'}"
-            + (f", published {pub:%Y-%m-%d}" if pub else ""),
-            f"Matched phrases: {', '.join(hits)}",
+            cfg.film_title,
+            f"“{(item.get('title') or '').strip()}”",
+            f"{item.get('source') or 'web'}"
+            + (f", {pub.day} {pub:%b}" if pub else "")
+            + f" · matched: {', '.join(hits)}",
+            (
+                f"Not confirmed on Pathé ({confidence} confidence)"
+                " — no reminders are set from news alone."
+            ),
         ]
-        if sale_dates:
-            lines.append(
-                "Date(s) mentioned (possible sale date): "
-                + ", ".join(d.strftime("%d %b %Y") for d in sale_dates)
-            )
-        lines.append(
-            f"Confidence: {confidence.upper()} — external lead, verify on Pathé."
-            " No reminders are scheduled from news alone."
-        )
         findings.append(
             Finding(
                 kind="NEWS_LEAD",
                 key=key,
                 confidence=confidence,
-                title="News lead: possible ticket-sale info",
+                title=(
+                    f"Press says {dates} — unconfirmed"
+                    if dates
+                    else "Press mention — unconfirmed"
+                ),
                 lines=lines,
                 url=url,
             )

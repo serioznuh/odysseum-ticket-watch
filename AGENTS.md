@@ -13,7 +13,7 @@ Stack: Python 3.9+ stdlib + `httpx`, no framework. Package `watcher/` (entry:
 ## Commands
 
 - Lint: `.venv/bin/ruff check .`
-- Tests: `.venv/bin/python -m pytest -q` (currently 80 passing)
+- Tests: `.venv/bin/python -m pytest -q` (currently 115 passing)
 - Manual run: `source .env && .venv/bin/python -m watcher --mode check --dry-run`
 - Telegram smoke test: `source .env && .venv/bin/python -m watcher --test-telegram`
 - Secrets are env-only: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — locally in a
@@ -87,8 +87,14 @@ Use the lowest-risk check that proves the change — details in
   `cinesa_target:…`), not `kind`. Changing a key's format re-sends every past
   alert of that shape — never change it without a state migration.
 - Alert kinds buzz by default; only kinds in `alerts.silent_kinds` (default
-  HEARTBEAT, NEWS_LEAD, RECOVERED) are silent. A new non-urgent kind must be
-  added there or it will notify loudly.
+  HEARTBEAT, NEWS_LEAD, RECOVERED, CINESA_TARGET_NO_IMAX, WATCHER_STILL_BLIND)
+  are silent. `config.toml` **replaces** that default rather than extending it,
+  so a new non-urgent kind must be added in *both* places or it will notify
+  loudly — `test_config.py` enforces this.
+- Every alert names its film and cinema on the first line, so a second watch
+  target can never be mistaken for this one.
+- Outage alerts are the one deliberate exception to send-once: the cloud pass
+  repeats a `stale:` alert every 24h while blind, silently after the first.
 - News matching stays strict (sale wording required; format keywords need a
   venue mention) — loosening it needs user approval.
 - Times shown to the user are Paris time; state timestamps are Paris-local

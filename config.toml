@@ -70,7 +70,15 @@ stale_check_hours = 18
 # reminders and the "open now" ping always buzz. CINESA_TARGET_NO_IMAX is the
 # "your date opened, but with no IMAX on it" note — worth knowing, not worth a
 # buzz. The two IMAX drop/return kinds DO buzz: they were asked for by name.
-silent_kinds = ["HEARTBEAT", "NEWS_LEAD", "RECOVERED", "CINESA_TARGET_NO_IMAX"]
+silent_kinds = [
+    "HEARTBEAT",
+    "NEWS_LEAD",
+    "RECOVERED",
+    "CINESA_TARGET_NO_IMAX",
+    # Daily "still blind" repeats. The first alert of an outage buzzes; the
+    # drumbeat that follows must not — same known problem, once a day.
+    "WATCHER_STILL_BLIND",
+]
 
 [cadence]
 # Adaptive check frequency (local launchd job fires every 15 min; these set

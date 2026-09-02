@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from watcher import __main__ as cli
 from watcher import notify, pathe
@@ -14,36 +14,172 @@ NOW = datetime(2026, 7, 18, 14, 53, tzinfo=TZ_PARIS)
 
 
 class Cfg:
+    film_title = "Dune : Troisième partie"
+    cinema_name = "Pathé Odysseum"
+    cinema_city = "Montpellier"
     film_page_url = "https://www.pathe.fr/films/dune-troisieme-partie-50828"
+    stale_check_hours = 18
 
 
-def test_error_finding_explains_vpn_for_403():
+BLIND_STATE = {"last_check_ok": "2026-07-18T07:11:00+02:00"}
+
+
+def test_error_finding_names_the_watch_and_the_ip_block():
     error = (
         "Pathé API request failed for https://www.pathe.fr/api/shows: "
         "Client error '403 Forbidden' for url 'https://www.pathe.fr/api/shows'\n"
         "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/403"
     )
 
-    finding = cli.build_error_finding(Cfg, 9, error, NOW)
+    finding = cli.build_error_finding(Cfg, BLIND_STATE, error, NOW)
 
     assert finding.kind == "WATCHER_ERROR"
+    assert finding.title == "Pathé watch is BLIND"
     assert finding.lines == [
-        "9 consecutive checks have failed.",
-        "Last error: HTTP 403 Forbidden from https://www.pathe.fr/api/shows",
-        "Pathé rejected the current network/IP. Disable any VPN or proxy, then wait for the next automatic retry.",
-        "The watcher is currently BLIND. Local checks retry every 15 min; details: ~/.ticket-watch/logs/launchd.log",
+        "Dune : Troisième partie · Pathé Odysseum",
+        "No sale detection since Sat 18 Jul, 07:11 (7 h 42 m).",
+        "Cause: Pathé is blocking your IP (403).",
+        "Retrying every 15 min — usually clears by itself.",
     ]
+    # The old copy said "disable any VPN or proxy". When the block is the ISP's
+    # own IP — as it was on 2 Sep 2026 — that sends the user after a VPN they
+    # do not have.
+    assert "VPN" not in "\n".join(finding.lines)
 
 
 def test_error_finding_keeps_generic_error_actionable_and_single_line():
-    finding = cli.build_error_finding(Cfg, 3, "temporary DNS failure\nresolver unavailable", NOW)
+    finding = cli.build_error_finding(
+        Cfg, BLIND_STATE, "temporary DNS failure\nresolver unavailable", NOW
+    )
 
     assert finding.lines == [
-        "3 consecutive checks have failed.",
-        "Last error: temporary DNS failure resolver unavailable",
-        "Possible causes: Pathé API change or a local/network outage.",
-        "The watcher is currently BLIND. Local checks retry every 15 min; details: ~/.ticket-watch/logs/launchd.log",
+        "Dune : Troisième partie · Pathé Odysseum",
+        "No sale detection since Sat 18 Jul, 07:11 (7 h 42 m).",
+        "Cause: temporary DNS failure resolver unavailable",
+        "Retrying every 15 min; check the logs if it persists.",
     ]
+
+
+def test_error_finding_survives_a_watcher_that_never_succeeded():
+    """No last_check_ok yet (first-run setup): no duration to report, but the
+    message must still be sendable rather than crashing on None."""
+    finding = cli.build_error_finding(Cfg, {}, "boom", NOW)
+
+    assert finding.lines[1] == "No sale detection since the watcher started."
+
+
+def test_recovered_finding_reports_how_long_it_was_blind():
+    finding = cli.build_recovered_finding(Cfg, BLIND_STATE, NOW)
+
+    assert finding.kind == "RECOVERED"
+    assert finding.kind in notify.DEFAULT_SILENT_KINDS
+    assert finding.lines == [
+        "Dune : Troisième partie · Pathé Odysseum",
+        "Blind for 7 h 42 m. Checks are running normally.",
+    ]
+
+
+def test_stale_finding_first_alert_buzzes_then_repeats_go_silent():
+    """A blind spell that reports once and then goes quiet is the failure this
+    guards against: day 1 buzzes, every later day is a silent reminder."""
+    blind = timedelta(hours=18)
+    first = cli.build_stale_finding(Cfg, BLIND_STATE, blind, "stale:x:0", 1)
+    later = cli.build_stale_finding(Cfg, BLIND_STATE, timedelta(days=3), "stale:x:2", 3)
+
+    assert first.kind == "WATCHER_ERROR"
+    assert first.kind not in notify.DEFAULT_SILENT_KINDS
+    assert first.title == "Local checks have stopped — 18 h"
+
+    assert later.kind == "WATCHER_STILL_BLIND"
+    assert later.kind in notify.DEFAULT_SILENT_KINDS
+    assert later.title == "Still blind — day 3"
+    # Both name the watch and say what the silence is costing.
+    for f in (first, later):
+        assert f.lines[0] == "Dune : Troisième partie · Pathé Odysseum"
+        assert "are dark — cloud reminders still run." in f.lines[-1]
+
+
+def test_stale_finding_names_every_half_the_local_script_owns():
+    """OTW-07: last_check_ok goes stale when the whole local half stops, which
+    takes news and Cinesa down with Pathé — naming only Pathé understates it."""
+
+    class WithCinesa(Cfg):
+        cinesa_enabled = True
+
+    class WithoutCinesa(Cfg):
+        cinesa_enabled = False
+
+    on = cli.build_stale_finding(WithCinesa, BLIND_STATE, timedelta(hours=18), "k", 1)
+    off = cli.build_stale_finding(WithoutCinesa, BLIND_STATE, timedelta(hours=18), "k", 1)
+
+    assert "Pathé, news and Cinesa checks are dark" in on.lines[-1]
+    assert "Pathé and news checks are dark" in off.lines[-1]
+    assert "Cinesa" not in off.lines[-1]
+    # The reassurance that the cloud half is still alive must survive.
+    assert "cloud reminders still run" in on.lines[-1]
+
+
+def test_error_finding_swaps_the_403_hint_in_ci(monkeypatch):
+    """OTW-03: a manual CI dispatch is 403'd by the datacenter IP. There the
+    local advice is wrong — nothing retries and there is no launchd log."""
+    error = "Client error '403 Forbidden' for url 'https://www.pathe.fr/api/shows'"
+
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    local = cli.build_error_finding(Cfg, BLIND_STATE, error, NOW)
+
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    in_ci = cli.build_error_finding(Cfg, BLIND_STATE, error, NOW)
+
+    assert "Retrying every 15 min" in "\n".join(local.lines)
+    assert "datacenter" not in "\n".join(local.lines)
+
+    assert "GitHub datacenter IPs" in "\n".join(in_ci.lines)
+    assert "run the check locally" in "\n".join(in_ci.lines)
+    assert "Retrying every 15 min" not in "\n".join(in_ci.lines)
+
+
+def test_stale_finding_distinguishes_ip_block_from_a_silent_mac():
+    """The cloud pass never calls Pathé, so it reads the cause the local half
+    recorded. The two cases need opposite responses: wait, or go switch the
+    Mac on."""
+    blocked = dict(BLIND_STATE, error_alerted=True, last_error="HTTP 403 Forbidden from x")
+    quiet = dict(BLIND_STATE)
+
+    blocked_msg = cli.build_stale_finding(Cfg, blocked, timedelta(days=2), "k", 2)
+    quiet_msg = cli.build_stale_finding(Cfg, quiet, timedelta(days=2), "k", 2)
+
+    assert "Cause: Pathé is still blocking your IP (403)." in blocked_msg.lines
+    assert "Cause: the Mac hasn't completed a check — off, asleep, or can't push." in quiet_msg.lines
+
+
+def test_stale_finding_ignores_a_stale_cause_from_a_finished_outage():
+    """last_error without error_alerted means the local half is not currently
+    failing — the recorded cause is from an outage that already recovered."""
+    st = dict(BLIND_STATE, error_alerted=False, last_error="HTTP 403 Forbidden from x")
+
+    msg = cli.build_stale_finding(Cfg, st, timedelta(days=2), "k", 2)
+
+    assert "the Mac hasn't completed a check" in "\n".join(msg.lines)
+
+
+def test_error_summary_is_idempotent():
+    """The summary is stored in state and re-parsed by the cloud pass, so
+    summarising it twice must not lose the status code."""
+    raw = "Client error '403 Forbidden' for url 'https://www.pathe.fr/api/shows'"
+    once = cli.summarize_pathe_error(raw)
+
+    assert once == (
+        "HTTP 403 Forbidden from https://www.pathe.fr/api/shows",
+        403,
+    )
+    assert cli.summarize_pathe_error(once[0]) == once
+
+
+def test_fmt_duration_reads_naturally_at_every_scale():
+    assert cli.fmt_duration(timedelta(minutes=45)) == "45 min"
+    assert cli.fmt_duration(timedelta(hours=6, minutes=20)) == "6 h 20 m"
+    assert cli.fmt_duration(timedelta(hours=18)) == "18 h"
+    assert cli.fmt_duration(timedelta(days=3)) == "3 days"
 
 
 CONFIG_TOML = """
@@ -154,3 +290,65 @@ def test_failed_pathe_one_shot_alerts_are_retried_on_the_next_run(
         f"new_show:{show['slug']}",
         f"tickets:{show['slug']}:imax70",
     }
+
+
+def test_stale_period_fires_once_at_the_threshold_then_daily():
+    """Regression guard for the gap this feature closes: an outage used to
+    alert once and then go quiet for as long as it lasted."""
+    hours = 18
+    fired = []
+    # Walk a 5-day outage at the cloud pass's own 15-minute cadence.
+    for step in range(1, 5 * 24 * 4):
+        blind = timedelta(minutes=15 * step)
+        if blind <= timedelta(hours=hours):
+            continue
+        period = cli.stale_period(blind, hours)
+        if period not in [p for p, _ in fired]:
+            fired.append((period, blind))
+
+    assert [p for p, _ in fired] == [0, 1, 2, 3, 4]
+    # First at the threshold, then every 24 h — same clock time each day.
+    assert [round(b.total_seconds() / 3600) for _, b in fired] == [18, 42, 66, 90, 114]
+
+
+def test_stale_period_is_zero_right_at_the_threshold():
+    assert cli.stale_period(timedelta(hours=18, minutes=1), 18) == 0
+    assert cli.stale_period(timedelta(hours=41), 18) == 0
+    assert cli.stale_period(timedelta(hours=42), 18) == 1
+
+
+def test_stale_finding_never_blames_ci_for_an_error_the_mac_recorded(monkeypatch):
+    """The cloud supervision pass always runs inside Actions, but the cause it
+    reports was recorded by the Mac. Branching on the *reader's* machine made
+    every residential 403 read as the expected datacenter block — telling the
+    user to dismiss a real outage."""
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    st = dict(BLIND_STATE, error_alerted=True, last_error="HTTP 403")
+
+    stale = cli.build_stale_finding(Cfg, st, timedelta(days=2), "k", 2)
+
+    assert "Cause: Pathé is still blocking your IP (403)." in stale.lines
+    assert "datacenter" not in "\n".join(stale.lines)
+
+    # The local builder still describes the machine it is running on.
+    error = "Client error '403 Forbidden' for url 'https://www.pathe.fr/api/shows'"
+    assert "GitHub datacenter IPs" in "\n".join(
+        cli.build_error_finding(Cfg, BLIND_STATE, error, NOW).lines
+    )
+
+
+def test_recorded_cause_drops_the_failing_url():
+    """fetch_snapshot hits several endpoints. Keeping the URL in `last_error`
+    would rewrite — and commit and push — state on every 15-min firing of an
+    outage that flapped between them."""
+    a = cli.summarize_pathe_error(
+        "Client error '403 Forbidden' for url 'https://www.pathe.fr/api/shows'"
+    )
+    b = cli.summarize_pathe_error(
+        "Client error '403 Forbidden' for url 'https://www.pathe.fr/api/show/x/showtimes/y'"
+    )
+
+    assert a[1] == b[1] == 403
+    assert f"HTTP {a[1]}" == f"HTTP {b[1]}" == "HTTP 403"
+    # And the stored short form still yields its status when re-read.
+    assert cli.summarize_pathe_error("HTTP 403")[1] == 403
