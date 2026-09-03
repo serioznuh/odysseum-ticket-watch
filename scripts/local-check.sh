@@ -29,7 +29,11 @@ fi
 # byte-identical state, so nothing was committed, so nothing was pushed, so
 # nothing was pulled — and the fix for the outage could never reach this clone.
 # A deploy must not depend on the watcher being healthy enough to write state.
-git pull --rebase --quiet origin main || true
+# A swallowed rebase conflict would leave conflict markers in state.json, and
+# load_state renames an unparseable state file and starts fresh — which re-sends
+# every past alert and loses sale_target. Abort back to a clean tree instead and
+# let the next firing retry.
+git pull --rebase --quiet origin main || git rebase --abort || true
 if [ -n "$(git log --oneline '@{u}..HEAD' 2>/dev/null)" ]; then
   git push --quiet origin main
 fi

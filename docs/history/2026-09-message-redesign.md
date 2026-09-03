@@ -19,9 +19,9 @@ day one and then silence.
 
 ## 2026-09-03 — The 2 Sep outage was never an IP block
 
-Correction to the entry above. Every one of the 258 `403`s in the launchd log
-for 2026-09-02 was on `/api/show/{slug}/showtimes/…`, the first at 11:44:57 —
-none on a catalogue endpoint. The sustained outage was Pathé's origin refusing
+Correction to the entry above. All 129 of 2026-09-02's 403 responses (43 runs
+× 3 retries) were on `/api/show/{slug}/showtimes/…`, the first at 11:44:57 —
+none on a catalogue endpoint, and no `Error from IP` in the log at all. The sustained outage was Pathé's origin refusing
 a *listing*, not Akamai refusing the IP. (The `{"error":"Error from IP …"}`
 body recorded above is a real observation of the Akamai block, but it is not
 what kept the watcher down.) `pathe_cause` mapped every 403 to "blocking your
@@ -31,7 +31,7 @@ survived a day and a half.
 Root cause: a new event listing — `dune-troisieme-partie-projection-imax-70mm`
 — appeared at 11:44 and its showtimes call answered `403 "No movie allowed !"`.
 `get_json` treated that as fatal, so `fetch_snapshot` aborted before detection.
-One unschedulable listing blinded the whole watcher for 38 h, across exactly
+One refused listing blinded the whole watcher for 38 h, across exactly
 the window that published `salesOpeningDatetime` for **2026-09-09 09:00**. Four
 alerts were never sent (sale date on two listings, two new 70 mm listings) and
 `sale_target` stayed `null`, so the cloud reminder ladder was armed on nothing.

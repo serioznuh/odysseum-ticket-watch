@@ -142,8 +142,19 @@ detail and the `refCmd` deep booking link.
 **Fix sketch:** carry `degraded` out of `fetch_snapshot` on `detect.Snapshot`,
 and either name the affected listings in the weekly heartbeat or raise a
 supervision finding once a listing has degraded for N consecutive checks.
-Expected refusals (`origin_refusal`, which returns cleanly and is never added
-to `degraded`) must not count — otherwise the 70 mm listings alert forever.
+Two traps: expected refusals (`origin_refusal`, which returns cleanly and is
+never added to `degraded`) must not count, or the 70 mm listings alert forever;
+and `show_detail()` swallows its own failures inside the helper, so they never
+reach `degraded` at all — a permanently failing *detail* call is invisible too,
+and carrying only `degraded` out would miss it.
+
+**Related, same area:** a swallowed showtimes failure can also *invent* an
+alert. `analyze_pathe` and `update_from_snapshot` fall back to
+`classify_format(title, slug)` when `days` is empty but the entry is bookable,
+so a format never actually seen can enter `present` and fire TICKETS_AVAILABLE
+off a failure rather than a change. Narrow today (`dune-troisieme-partie-50828`
+classifies as `other`, so it needs "no standard sessions ever at Odysseum"),
+but it contradicts the claim that degradation can never invent an alert.
 
 **Files:** `watcher/pathe.py` (`fetch_snapshot`), `watcher/detect.py`
 (`Snapshot`), `watcher/__main__.py` (`build_heartbeat`).
