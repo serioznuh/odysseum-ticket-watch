@@ -26,6 +26,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-11 | Make Cinesa Chrome refresh normally imperceptible | P2 | S | UX & design | [x] |
 | OTW-12 | `reminders_cover` can over-promise on two same-pass events | P3 | S | Bugs | [ ] |
 | OTW-13 | A persistent per-listing Pathé failure is reported as healthy | P2 | S | Bugs | [ ] |
+| OTW-14 | An aborted state rebase can wedge the push until a human intervenes | P3 | S | Bugs | [ ] |
 
 ## 1. Critical — security & breakage
 
@@ -162,6 +163,31 @@ but it contradicts the claim that degradation can never invent an alert.
 **Done when:** a persistent per-listing failure is visible to the user without
 reading logs, and a test covers "catalogue healthy + one listing failing
 forever" not reporting unqualified health.
+
+### OTW-14 · An aborted state rebase can wedge the push until a human intervenes
+
+**Problem:** `local-check.sh` now aborts a failed rebase rather than leaving
+conflict markers in `state.json` (which would make `load_state` start fresh and
+re-send every alert). Correct, but the local state commit survives unpushed, so
+the following `git push` is rejected non-fast-forward and `set -e` exits the
+script 1. The same conflict then recurs on every firing and local state stops
+reaching origin until someone resolves it by hand.
+
+Not urgent: measured, a realistic divergence (cloud adds an `alerts` key while
+the Mac updates `last_check_ok`) auto-merges cleanly, so this needs both halves
+touching adjacent keys. It also degrades to a *self-announcing* failure — the
+cloud pass sees a frozen `last_check_ok` and fires its stale alert — rather
+than the silent state-destroying one it replaced.
+
+**Fix sketch:** on a rebase abort, log the conflict loudly and either retry with
+a state-file merge driver that unions `alerts` keys and takes the newer
+`last_check_ok`, or drop the local state commit and re-derive it next firing
+(the snapshot is cheap; state is a cache, not a ledger).
+
+**Files:** `scripts/local-check.sh`; possibly a `.gitattributes` merge driver.
+
+**Done when:** a conflicting state rebase resolves itself within one firing
+without a human, or fails in a way that names itself in an alert.
 
 ## 3. Features
 

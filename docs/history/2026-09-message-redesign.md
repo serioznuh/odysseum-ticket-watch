@@ -21,8 +21,9 @@ day one and then silence.
 
 Correction to the entry above. All 129 of 2026-09-02's 403 responses (43 runs
 × 3 retries) were on `/api/show/{slug}/showtimes/…`, the first at 11:44:57 —
-none on a catalogue endpoint, and no `Error from IP` in the log at all. The sustained outage was Pathé's origin refusing
-a *listing*, not Akamai refusing the IP. (The `{"error":"Error from IP …"}`
+none on a catalogue endpoint, and no `Error from IP` in the log at all.
+The sustained outage was Pathé's origin refusing a *listing*, not Akamai
+refusing the IP. (The `{"error":"Error from IP …"}`
 body recorded above is a real observation of the Akamai block, but it is not
 what kept the watcher down.) `pathe_cause` mapped every 403 to "blocking your
 IP", so the alert asserted a cause it could not know and the misdiagnosis
