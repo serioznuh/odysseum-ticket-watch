@@ -48,7 +48,7 @@ datacenter IPs (verified: 403 from Actions, 200 from a home IP, same code):
 Safety nets so it never dies silently: 🔴 after 3 consecutive Pathé failures,
 🔴 if nothing has succeeded for 18 h — **then every 24 h until it recovers**, so
 a long outage cannot fall out of mind — and 💤 a weekly heartbeat. Each names
-the cause it can prove (IP block, CI datacenter range, or a silent Mac).
+the cause it can prove (IP block, CI range, origin refusal, or a silent Mac).
 
 ### Cinesa target
 
