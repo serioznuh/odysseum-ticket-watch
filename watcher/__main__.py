@@ -96,6 +96,14 @@ def pathe_cause(error: str, *, ci: bool = False) -> tuple[str, str]:
     every one of the Mac's 403s as the expected datacenter block.
     """
     summary, status = summarize_pathe_error(error)
+    if status == 403 and "refused by origin" in error:
+        # Pathé's own nginx declining a listing, which no amount of waiting or
+        # re-running fixes and which has nothing to do with the IP. Kept ahead
+        # of the block branches so CI cannot relabel it a datacenter block.
+        return (
+            "Cause: Pathé is refusing a listing (403), not your IP.",
+            "Check the logs — the listing may not be schedulable yet.",
+        )
     if status == 403:
         if ci:
             # Pathé blocks GitHub datacenter IPs outright, so this one will not
@@ -431,7 +439,14 @@ def run(argv: list[str] | None = None) -> int:
             # Store the status without the failing URL: fetch_snapshot hits
             # several endpoints, and an outage that flapped between them would
             # otherwise rewrite state — and commit and push — every 15 min.
-            recorded = f"HTTP {status}" if status else summary[:120]
+            # The marker survives into state (still URL-free, still one stable
+            # string per outage) so the cloud pass reports the right cause too.
+            if status and "refused by origin" in str(e):
+                recorded = f"HTTP {status} refused by origin"
+            elif status:
+                recorded = f"HTTP {status}"
+            else:
+                recorded = summary[:120]
             if st.get("last_error") != recorded:
                 st["last_error"] = recorded
             # With adaptive cadence, retries come every 15 min — require both

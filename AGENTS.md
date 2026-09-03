@@ -13,7 +13,7 @@ Stack: Python 3.9+ stdlib + `httpx`, no framework. Package `watcher/` (entry:
 ## Commands
 
 - Lint: `.venv/bin/ruff check .`
-- Tests: `.venv/bin/python -m pytest -q` (currently 115 passing)
+- Tests: `.venv/bin/python -m pytest -q` (currently 125 passing)
 - Manual run: `source .env && .venv/bin/python -m watcher --mode check --dry-run`
 - Telegram smoke test: `source .env && .venv/bin/python -m watcher --test-telegram`
 - Secrets are env-only: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — locally in a

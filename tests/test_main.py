@@ -152,6 +152,33 @@ def test_stale_finding_distinguishes_ip_block_from_a_silent_mac():
     assert "Cause: the Mac hasn't completed a check — off, asleep, or can't push." in quiet_msg.lines
 
 
+def test_error_finding_does_not_blame_the_ip_for_an_origin_refusal():
+    """On 2026-09-02 a listing Pathé declined to serve was reported as an IP
+    block, which sent the owner after a network problem that did not exist."""
+    error = (
+        "HTTP 403 refused by origin from "
+        f"https://www.pathe.fr/api/show/{'dune-x-55289'}/showtimes/cinema-pathe-odysseum"
+        " — 'No movie allowed !'"
+    )
+
+    finding = cli.build_error_finding(Cfg, BLIND_STATE, error, NOW)
+
+    assert "Cause: Pathé is refusing a listing (403), not your IP." in finding.lines
+    assert "blocking your IP" not in "\n".join(finding.lines)
+
+
+def test_origin_refusal_keeps_its_cause_in_ci_and_across_the_stale_repeat():
+    """CI must not relabel it a datacenter block, and the 24 h repeat has to
+    stay grammatical after the 'still' rewrite."""
+    st = dict(BLIND_STATE, error_alerted=True, last_error="HTTP 403 refused by origin")
+
+    ci_cause, _ = cli.pathe_cause("HTTP 403 refused by origin", ci=True)
+    repeat = cli.build_stale_finding(Cfg, st, timedelta(days=2), "k", 2)
+
+    assert ci_cause == "Cause: Pathé is refusing a listing (403), not your IP."
+    assert "Cause: Pathé is still refusing a listing (403), not your IP." in repeat.lines
+
+
 def test_stale_finding_ignores_a_stale_cause_from_a_finished_outage():
     """last_error without error_alerted means the local half is not currently
     failing — the recorded cause is from an outage that already recovered."""

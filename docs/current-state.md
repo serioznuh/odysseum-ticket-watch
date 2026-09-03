@@ -36,10 +36,16 @@ A single-user Telegram watcher covering **two independent targets**:
   listing/format baselines advance only after the corresponding alert is delivered.
   `last_error` records the failure cause for the cloud pass and is rewritten
   only when the text changes, so a steady outage still writes state once.
+- **Pathé failure model** — the catalogue calls (`/shows`, `/cinema/…/shows`)
+  are the health signal and still fail the check. Per-show showtimes calls are
+  best-effort: one listing cannot blind the watch. Pathé's origin answers a
+  403 with a JSON body (`"No movie allowed !"`) for a listing it will not
+  schedule yet — told apart from an Akamai bot 403 by that body, read as "no
+  sessions", and reported as an origin refusal rather than an IP block.
 - **Code** — Python package `watcher/` (`pathe.py` and `cinesa.py` API clients,
   `cdp.py` browser token step, `news.py`, `detect.py`, `state.py`, `notify.py`
   Telegram, `config.py`, `__main__.py` CLI); config in `config.toml`; tests in
-  `tests/` (115 passing).
+  `tests/` (125 passing).
 
 ## Cinesa specifics
 

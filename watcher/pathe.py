@@ -40,7 +40,37 @@ def make_client() -> httpx.Client:
     return httpx.Client(headers=HEADERS, timeout=20.0, follow_redirects=True)
 
 
-def get_json(client: httpx.Client, path: str, *, allow_404: bool = False) -> Any:
+def origin_refusal(r: httpx.Response) -> str | None:
+    """The origin's own message for a 403 it answered itself, else None.
+
+    Pathé's nginx answers some 403s with a short JSON string — `"No movie
+    allowed !"` — for a listing it will not serve showtimes for yet: a special
+    event that is announced but not schedulable. That is "no data yet", not a
+    block. Akamai's bot 403 looks nothing like it (an HTML challenge page that
+    never reaches the origin), so the body is what separates the two.
+
+    Verified 2026-09-03: a new IMAX 70 mm listing 403'd at every cinema while
+    six other films at Odysseum returned live showtimes from the same client,
+    IP and second.
+    """
+    if r.status_code != 403:
+        return None
+    if not r.headers.get("content-type", "").startswith("application/json"):
+        return None
+    try:
+        body = r.json()
+    except ValueError:
+        return None
+    return " ".join(body.split())[:80] if isinstance(body, str) else None
+
+
+def get_json(
+    client: httpx.Client,
+    path: str,
+    *,
+    allow_404: bool = False,
+    allow_refusal: bool = False,
+) -> Any:
     url = path if path.startswith("http") else BASE + path
     last_error: Exception | None = None
     for attempt in range(3):
@@ -48,6 +78,16 @@ def get_json(client: httpx.Client, path: str, *, allow_404: bool = False) -> Any
             r = client.get(url)
             if r.status_code == 404 and allow_404:
                 return None
+            refusal = origin_refusal(r)
+            if refusal is not None:
+                if allow_refusal:
+                    log.info("Pathé serves no showtimes for %s yet (403 %r)", url, refusal)
+                    return None
+                # Deterministic, so there is nothing to retry. The marker keeps
+                # the outage alert from blaming the IP for the origin's call.
+                raise RuntimeError(
+                    f"HTTP 403 refused by origin from {url} — {refusal!r}"
+                )
             r.raise_for_status()
             return r.json()
         except (httpx.HTTPError, ValueError) as e:
@@ -86,21 +126,37 @@ def fetch_snapshot(client: httpx.Client, cfg: Any) -> detect.Snapshot:
 
     entries: dict[str, dict] = {}
     showtimes: dict[str, dict] = {}
+    degraded: list[str] = []
     for show in matched:
         slug = show.get("slug", "")
         if slug in cinema_shows:
             entries[slug] = cinema_shows[slug]
-        st = get_json(client, f"/show/{slug}/showtimes/{cfg.cinema_slug}", allow_404=True)
+        try:
+            st = get_json(
+                client,
+                f"/show/{slug}/showtimes/{cfg.cinema_slug}",
+                allow_404=True,
+                allow_refusal=True,
+            )
+        except RuntimeError as e:
+            # One listing must never blind the whole watch. The catalogue calls
+            # above are the health signal; a single show's showtimes are not,
+            # and degrading it to "no sessions" can only delay a real alert by
+            # one firing — it can never invent one.
+            log.warning("showtimes for %s unavailable, continuing: %s", slug, e)
+            degraded.append(slug)
+            st = None
         if isinstance(st, dict) and st:
             showtimes[slug] = st
         time.sleep(0.3)  # be polite
 
     log.info(
-        "snapshot: %d matched listing(s) %s | at %s: %d listed, %d with sessions",
+        "snapshot: %d matched listing(s) %s | at %s: %d listed, %d with sessions%s",
         len(matched),
         sorted(matched_slugs),
         cfg.cinema_slug,
         len(entries),
         len(showtimes),
+        f" | showtimes unavailable for {sorted(degraded)}" if degraded else "",
     )
     return detect.Snapshot(matched_shows=matched, cinema_entries=entries, showtimes=showtimes)
