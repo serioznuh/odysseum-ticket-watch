@@ -102,7 +102,7 @@ def pathe_cause(error: str, *, ci: bool = False) -> tuple[str, str]:
         # of the block branches so CI cannot relabel it a datacenter block.
         return (
             "Cause: Pathé is refusing a listing (403), not your IP.",
-            "Check the logs — the listing may not be schedulable yet.",
+            "Expected on event listings; check the logs for which call failed.",
         )
     if status == 403:
         if ci:

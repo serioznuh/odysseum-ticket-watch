@@ -17,6 +17,43 @@ heartbeat is nested under `if snap is not None`, so it stops precisely when
 the watcher is blind. Three weeks of downtime would have meant two messages on
 day one and then silence.
 
+## 2026-09-03 — The 2 Sep outage was never an IP block
+
+Correction to the entry above. All 129 of 2026-09-02's 403 responses (43 runs
+× 3 retries) were on `/api/show/{slug}/showtimes/…`, the first at 11:44:57 —
+none on a catalogue endpoint, and no `Error from IP` in the log at all.
+The sustained outage was Pathé's origin refusing a *listing*, not Akamai
+refusing the IP. (The `{"error":"Error from IP …"}`
+body recorded above is a real observation of the Akamai block, but it is not
+what kept the watcher down.) `pathe_cause` mapped every 403 to "blocking your
+IP", so the alert asserted a cause it could not know and the misdiagnosis
+survived a day and a half.
+
+Root cause: a new event listing — `dune-troisieme-partie-projection-imax-70mm`
+— appeared at 11:44 and its showtimes call answered `403 "No movie allowed !"`.
+`get_json` treated that as fatal, so `fetch_snapshot` aborted before detection.
+One refused listing blinded the whole watcher for 38 h, across exactly
+the window that published `salesOpeningDatetime` for **2026-09-09 09:00**. Four
+alerts were never sent (sale date on two listings, two new 70 mm listings) and
+`sale_target` stayed `null`, so the cloud reminder ladder was armed on nothing.
+
+The endpoint serves only `isMovie: true` listings; the refusal is permanent for
+event listings, not a "not yet" — `l-odyssee-projection-imax-70mm-54413` is
+bookable at Odysseum and still 403s.
+
+A second, worse fault surfaced while deploying the fix: `local-check.sh` pulled
+only inside its push gate, so a clone could only receive code after writing a
+state change. A blind run writes identical state — nothing to commit, nothing
+to push, nothing to pull. **The deploy path depended on the watcher being
+healthy**, so the fix for an outage could not reach the machine having it. The
+production clone sat on the broken commit until pulled by hand.
+
+Fixed in PR #12 and its follow-up: match the refusal on its message (the
+observed Akamai block is *also* JSON, so "403 with a JSON body" is not enough),
+make every per-listing call best-effort while the catalogue calls stay the
+health signal, report an origin refusal as itself, and pull unconditionally.
+Left open as OTW-13: a persistent per-listing failure still reports as healthy.
+
 ## What changed
 
 - **All 19 message types rewritten.** State first, cause second, action last.

@@ -40,18 +40,26 @@ def make_client() -> httpx.Client:
     return httpx.Client(headers=HEADERS, timeout=20.0, follow_redirects=True)
 
 
+REFUSAL_MESSAGE = "no movie allowed"
+
+
 def origin_refusal(r: httpx.Response) -> str | None:
-    """The origin's own message for a 403 it answered itself, else None.
+    """Pathé's own "not a movie" message for a 403, else None.
 
-    Pathé's nginx answers some 403s with a short JSON string — `"No movie
-    allowed !"` — for a listing it will not serve showtimes for yet: a special
-    event that is announced but not schedulable. That is "no data yet", not a
-    block. Akamai's bot 403 looks nothing like it (an HTML challenge page that
-    never reaches the origin), so the body is what separates the two.
+    The showtimes endpoint serves only `isMovie: true` listings. Every *event*
+    listing (`isMovie: false`) — the dedicated "Projection IMAX 70mm" and
+    "La Séance 70mm" entries — is refused with a short JSON string,
+    `"No movie allowed !"`, which is the API saying "not a movie", not
+    "not yet". Measured 2026-09-03: `l-odyssee-projection-imax-70mm-54413` is
+    bookable at Odysseum *right now* and still 403s, so this never clears and
+    bookability for an event listing has to come from the cinema programme
+    entry instead.
 
-    Verified 2026-09-03: a new IMAX 70 mm listing 403'd at every cinema while
-    six other films at Odysseum returned live showtimes from the same client,
-    IP and second.
+    Matched on the message, not merely on "403 with a JSON string body": the
+    Akamai block this project has actually observed is also JSON
+    (`{"error":"Error from IP …"}` — an object, 2026-09-02), and a bot 403 that
+    happened to carry a bare string must stay a hard failure rather than be
+    read as "no sessions".
     """
     if r.status_code != 403:
         return None
@@ -61,7 +69,10 @@ def origin_refusal(r: httpx.Response) -> str | None:
         body = r.json()
     except ValueError:
         return None
-    return " ".join(body.split())[:80] if isinstance(body, str) else None
+    if not isinstance(body, str):
+        return None
+    message = " ".join(body.split())[:80]
+    return message if REFUSAL_MESSAGE in message.lower() else None
 
 
 def get_json(
@@ -81,7 +92,8 @@ def get_json(
             refusal = origin_refusal(r)
             if refusal is not None:
                 if allow_refusal:
-                    log.info("Pathé serves no showtimes for %s yet (403 %r)", url, refusal)
+                    # Expected and permanent for event listings, not an outage.
+                    log.info("Pathé serves no showtimes for event listing %s (403 %r)", url, refusal)
                     return None
                 # Deterministic, so there is nothing to retry. The marker keeps
                 # the outage alert from blaming the IP for the origin's call.
@@ -97,6 +109,21 @@ def get_json(
     raise RuntimeError(f"Pathé API request failed for {url}: {last_error}")
 
 
+def show_detail(client: httpx.Client, slug: str) -> dict | None:
+    """One listing's detail, best-effort.
+
+    Per-show calls must never fail the whole snapshot — that is precisely the
+    2026-09-02 bug. Only the catalogue calls in `fetch_snapshot` are the health
+    signal, so a single listing failing here degrades to "no detail" and the
+    caller falls back to what the catalogue already told us.
+    """
+    try:
+        return get_json(client, f"/show/{slug}", allow_404=True, allow_refusal=True)
+    except RuntimeError as e:
+        log.warning("detail for %s unavailable, continuing: %s", slug, e)
+        return None
+
+
 def fetch_snapshot(client: httpx.Client, cfg: Any) -> detect.Snapshot:
     """Fetch every Pathé signal we watch, in ~4-8 small requests."""
     payload = get_json(client, "/shows")
@@ -105,7 +132,7 @@ def fetch_snapshot(client: httpx.Client, cfg: Any) -> detect.Snapshot:
         s for s in all_shows if detect.show_matches(s, cfg.match_patterns, cfg.primary_slug)
     ]
     if not any(s.get("slug") == cfg.primary_slug for s in matched):
-        detail = get_json(client, f"/show/{cfg.primary_slug}", allow_404=True)
+        detail = show_detail(client, cfg.primary_slug)
         if detail:
             matched.append(detail)
         else:
@@ -120,7 +147,7 @@ def fetch_snapshot(client: httpx.Client, cfg: Any) -> detect.Snapshot:
         if slug not in matched_slugs and detect.show_matches(
             {"slug": slug}, cfg.match_patterns, cfg.primary_slug
         ):
-            detail = get_json(client, f"/show/{slug}", allow_404=True)
+            detail = show_detail(client, slug)
             matched.append(detail or {"slug": slug, "title": slug})
             matched_slugs.add(slug)
 
@@ -140,9 +167,11 @@ def fetch_snapshot(client: httpx.Client, cfg: Any) -> detect.Snapshot:
             )
         except RuntimeError as e:
             # One listing must never blind the whole watch. The catalogue calls
-            # above are the health signal; a single show's showtimes are not,
-            # and degrading it to "no sessions" can only delay a real alert by
-            # one firing — it can never invent one.
+            # above are the health signal; a single show's showtimes are not.
+            # Bookability still reaches detection through the programme entry
+            # (`isBookable`), which is how an event listing is seen at all — so
+            # this degrades detail, not the sale signal. A *persistent* failure
+            # here is still reported as healthy though (OTW-13).
             log.warning("showtimes for %s unavailable, continuing: %s", slug, e)
             degraded.append(slug)
             st = None

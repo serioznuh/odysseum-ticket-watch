@@ -45,6 +45,10 @@ datacenter IPs (verified: 403 from Actions, 200 from a home IP, same code):
 | your Mac — launchd, adaptive cadence | full Pathé + news check; pushes `state/state.json` | needs a residential IP |
 | GitHub Actions — every 15 min | reminder ladder + supervision, reading the shared state | needs 24/7 uptime; no Pathé access required |
 
+Not every 403 is a block: the showtimes endpoint serves only `isMovie` films, so
+event listings (the 70 mm ones) always answer `"No movie allowed !"`, and their
+bookability is read off the cinema programme. Only catalogue calls fail a check.
+
 Safety nets so it never dies silently: 🔴 after 3 consecutive Pathé failures,
 🔴 if nothing has succeeded for 18 h — **then every 24 h until it recovers**, so
 a long outage cannot fall out of mind — and 💤 a weekly heartbeat. Each names
@@ -190,21 +194,17 @@ Secrets are env-only (never in config.toml): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHA
 ## Example alerts
 
 ```
-🎟️ Ticket sale opening announced
-Listing: Dune : Troisième partie : Projection IMAX 70mm
-Sales open: Thu 05 Nov 2026, 08:00 (Paris time)
-Watched cinema: Pathé Odysseum, Montpellier
-Format of this listing: IMAX 70 mm (1.43:1)
-Confidence: HIGH — official Pathé API field salesOpeningDatetime.
-🔗 https://www.pathe.fr/evenements/dune-troisieme-partie-projection-imax-70mm-...
+🎟️ Sale opens Wed 9 Sep, 09:00
+Dune : Troisième partie · IMAX 70 mm (1.43:1) · Pathé Odysseum
+Reminders set: 24 h, 2 h and 15 min before.
+Opening time is national — seats can go in minutes.
+🔗 https://www.pathe.fr/evenements/dune-troisieme-partie-projection-imax-70mm-55289
 ```
 
 ```
-⏰ Reminder: ticket sale opens in ~15 minutes
-🎬 Dune : Troisième partie
-🗓️ Opening: Thu 05 Nov 2026, 08:00 (Paris time)
-🏛️ Pathé Odysseum, Montpellier
-Be ready: sign in on pathe.fr, save a payment method.
+⏰ Sale opens in 15 minutes — 09:00
+Dune : Troisième partie · Pathé Odysseum, Montpellier
+Have pathe.fr open and be signed in.
 👉 https://www.pathe.fr/films/dune-troisieme-partie-50828
 ```
 

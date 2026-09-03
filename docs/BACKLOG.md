@@ -25,6 +25,8 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-10 | Cinesa VPN 403 repeatedly launches headed Chrome | P1 | S | Bugs | [x] |
 | OTW-11 | Make Cinesa Chrome refresh normally imperceptible | P2 | S | UX & design | [x] |
 | OTW-12 | `reminders_cover` can over-promise on two same-pass events | P3 | S | Bugs | [ ] |
+| OTW-13 | A persistent per-listing Pathé failure is reported as healthy | P2 | S | Bugs | [ ] |
+| OTW-14 | An aborted state rebase can wedge the push until a human intervenes | P3 | S | Bugs | [ ] |
 
 ## 1. Critical — security & breakage
 
@@ -121,6 +123,71 @@ launches Chrome at most once per cooldown window (at least 60 min), turning the
 VPN off lets the original cached token recover without another mint, a 401 still
 forces renewal, and the three-failure alert says to disable VPN/proxy and wait
 for the automatic retry.
+
+### OTW-13 · A persistent per-listing Pathé failure is reported as healthy
+
+**Problem:** `fetch_snapshot` now swallows per-listing failures so one listing
+cannot blind the watch (the 2026-09-02 outage). The `degraded` list it builds
+reaches only a `log.info` — nothing in state, the heartbeat or any alert. Since
+`__main__.run` refreshes `last_check_ok`, zeroes `failure_streak`, clears
+`error_alerted` and may send RECOVERED whenever the catalogue calls succeed, a
+*permanently* failing showtimes call reports full health forever. The commit
+that introduced it claimed the degradation "can only delay a real alert by one
+firing", which holds for a transient failure but not a persistent one.
+
+Today this is masked: `analyze_pathe` fires TICKETS_AVAILABLE on `days` **or**
+the programme entry's `isBookable`, and that entry comes from a still-fatal
+catalogue call — so the sale signal survives. What is silently lost is session
+detail and the `refCmd` deep booking link.
+
+**Fix sketch:** carry `degraded` out of `fetch_snapshot` on `detect.Snapshot`,
+and either name the affected listings in the weekly heartbeat or raise a
+supervision finding once a listing has degraded for N consecutive checks.
+Two traps: expected refusals (`origin_refusal`, which returns cleanly and is
+never added to `degraded`) must not count, or the 70 mm listings alert forever;
+and `show_detail()` swallows its own failures inside the helper, so they never
+reach `degraded` at all — a permanently failing *detail* call is invisible too,
+and carrying only `degraded` out would miss it.
+
+**Related, same area:** a swallowed showtimes failure can also *invent* an
+alert. `analyze_pathe` and `update_from_snapshot` fall back to
+`classify_format(title, slug)` when `days` is empty but the entry is bookable,
+so a format never actually seen can enter `present` and fire TICKETS_AVAILABLE
+off a failure rather than a change. Narrow today (`dune-troisieme-partie-50828`
+classifies as `other`, so it needs "no standard sessions ever at Odysseum"),
+but it contradicts the claim that degradation can never invent an alert.
+
+**Files:** `watcher/pathe.py` (`fetch_snapshot`), `watcher/detect.py`
+(`Snapshot`), `watcher/__main__.py` (`build_heartbeat`).
+
+**Done when:** a persistent per-listing failure is visible to the user without
+reading logs, and a test covers "catalogue healthy + one listing failing
+forever" not reporting unqualified health.
+
+### OTW-14 · An aborted state rebase can wedge the push until a human intervenes
+
+**Problem:** `local-check.sh` now aborts a failed rebase rather than leaving
+conflict markers in `state.json` (which would make `load_state` start fresh and
+re-send every alert). Correct, but the local state commit survives unpushed, so
+the following `git push` is rejected non-fast-forward and `set -e` exits the
+script 1. The same conflict then recurs on every firing and local state stops
+reaching origin until someone resolves it by hand.
+
+Not urgent: measured, a realistic divergence (cloud adds an `alerts` key while
+the Mac updates `last_check_ok`) auto-merges cleanly, so this needs both halves
+touching adjacent keys. It also degrades to a *self-announcing* failure — the
+cloud pass sees a frozen `last_check_ok` and fires its stale alert — rather
+than the silent state-destroying one it replaced.
+
+**Fix sketch:** on a rebase abort, log the conflict loudly and either retry with
+a state-file merge driver that unions `alerts` keys and takes the newer
+`last_check_ok`, or drop the local state commit and re-derive it next firing
+(the snapshot is cheap; state is a cache, not a ledger).
+
+**Files:** `scripts/local-check.sh`; possibly a `.gitattributes` merge driver.
+
+**Done when:** a conflicting state rebase resolves itself within one firing
+without a human, or fails in a way that names itself in an alert.
 
 ## 3. Features
 
