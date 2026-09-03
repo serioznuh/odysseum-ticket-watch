@@ -23,9 +23,13 @@ CINEMA = "cinema-pathe-odysseum"
 REFUSAL = httpx.Response(
     403, headers={"content-type": "application/json"}, text='"No movie allowed !"'
 )
-# What Akamai's bot manager returns instead — same status, nothing else alike.
-BOT_BLOCK = httpx.Response(
-    403, headers={"content-type": "text/html"}, text="<html>Access Denied</html>"
+# The Akamai block this project has actually observed (2026-09-02): also 403,
+# also JSON — a bare `text/html` stand-in would let a real regression through.
+BOT_BLOCK = httpx.Response(403, json={"error": "Error from IP 79.116.217.215"})
+# A bot 403 carrying a bare JSON *string* must stay fatal too: matching on
+# "any JSON string" would read a block as "no sessions" and go quiet.
+BOT_BLOCK_STRING = httpx.Response(
+    403, headers={"content-type": "application/json"}, text='"Error from IP 79.116.217.215"'
 )
 
 
@@ -51,13 +55,12 @@ def test_origin_refusal_reads_the_message_out_of_a_json_403():
 
 def test_origin_refusal_ignores_a_bot_block_and_healthy_responses():
     # The whole point is telling these two 403s apart: one is Pathé declining a
-    # listing, the other is the IP being blocked. Only the body separates them.
+    # non-movie listing, the other is the IP being blocked. Only the body says
+    # which, so the match is on the message — not on "403 with a JSON body".
     assert pathe.origin_refusal(BOT_BLOCK) is None
+    assert pathe.origin_refusal(BOT_BLOCK_STRING) is None
     assert pathe.origin_refusal(httpx.Response(200, json={"shows": []})) is None
-    # A JSON *object* is some other API error; not our narrow case.
-    assert pathe.origin_refusal(
-        httpx.Response(403, json={"error": "forbidden"})
-    ) is None
+    assert pathe.origin_refusal(httpx.Response(403, text="Access Denied")) is None
 
 
 def test_allow_refusal_reads_a_refused_listing_as_no_data():
@@ -92,19 +95,44 @@ def test_refusal_without_allow_refusal_is_marked_and_not_retried():
     assert len(calls) == 1
 
 
-def test_a_real_bot_block_still_fails_loudly_after_retrying():
+@pytest.mark.parametrize("blocked", [BOT_BLOCK, BOT_BLOCK_STRING])
+def test_a_real_bot_block_still_fails_loudly_after_retrying(blocked):
+    """A block must never be mistaken for "no sessions" — including the
+    string-bodied variant, which `allow_refusal` would otherwise swallow."""
     calls = []
 
     def handler(request):
         calls.append(request.url.path)
-        return BOT_BLOCK
+        return blocked
 
     with pytest.raises(RuntimeError) as excinfo:
-        pathe.get_json(client_for(handler), "/shows")
+        pathe.get_json(client_for(handler), "/shows", allow_refusal=True)
 
     assert "refused by origin" not in str(excinfo.value)
     assert "403" in str(excinfo.value)
     assert len(calls) == 3
+
+
+def test_a_failing_detail_call_does_not_blind_the_snapshot():
+    """The other half of the 2026-09-02 bug: `/show/{slug}` was unguarded, so a
+    listing visible only on the cinema programme could still abort everything."""
+    programme = {"shows": {"dune-troisieme-partie-imax-70mm-9999": {"isBookable": True}}}
+
+    def handler(request):
+        path = request.url.path
+        if path.endswith("/api/shows"):
+            return httpx.Response(200, json={"shows": []})
+        if path.endswith(f"/cinema/{CINEMA}/shows"):
+            return httpx.Response(200, json=programme)
+        return httpx.Response(500)
+
+    snap = pathe.fetch_snapshot(client_for(handler), Cfg)
+
+    # Falls back to the slug the programme already gave us, rather than dying.
+    assert [s["slug"] for s in snap.matched_shows] == [
+        "dune-troisieme-partie-imax-70mm-9999"
+    ]
+    assert snap.cinema_entries["dune-troisieme-partie-imax-70mm-9999"]["isBookable"]
 
 
 def test_one_refused_listing_does_not_blind_the_whole_snapshot():

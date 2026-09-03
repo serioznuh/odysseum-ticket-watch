@@ -36,16 +36,27 @@ A single-user Telegram watcher covering **two independent targets**:
   listing/format baselines advance only after the corresponding alert is delivered.
   `last_error` records the failure cause for the cloud pass and is rewritten
   only when the text changes, so a steady outage still writes state once.
-- **Pathé failure model** — the catalogue calls (`/shows`, `/cinema/…/shows`)
-  are the health signal and still fail the check. Per-show showtimes calls are
-  best-effort: one listing cannot blind the watch. Pathé's origin answers a
-  403 with a JSON body (`"No movie allowed !"`) for a listing it will not
-  schedule yet — told apart from an Akamai bot 403 by that body, read as "no
-  sessions", and reported as an origin refusal rather than an IP block.
+- **Pathé failure model** — only the catalogue calls (`/shows`,
+  `/cinema/…/shows`) are the health signal and can fail the check. Every
+  per-listing call (detail and showtimes) is best-effort, so one listing can
+  never blind the watch — that was the 2026-09-02 outage. The showtimes
+  endpoint serves only `isMovie: true` listings and refuses every *event*
+  listing with `403 "No movie allowed !"`; this is permanent, not a "not yet"
+  (measured: an event listing bookable at Odysseum today still 403s), so the
+  70 mm listings are watched through their cinema-programme `isBookable`
+  entry, and no `refCmd` deep link is available for them. The refusal is
+  matched on that message — the observed Akamai block is *also* JSON
+  (`{"error":"Error from IP …"}`) — and is reported as an origin refusal
+  rather than an IP block. A persistent per-listing failure is still reported
+  as healthy (OTW-13).
+- **Deploying needs no state change** — `local-check.sh` pulls on every firing.
+  It used to pull only when it had a state commit to push, which deadlocked:
+  a blind run writes identical state, so nothing was pushed and nothing pulled,
+  and the fix for an outage could not reach the clone that needed it.
 - **Code** — Python package `watcher/` (`pathe.py` and `cinesa.py` API clients,
   `cdp.py` browser token step, `news.py`, `detect.py`, `state.py`, `notify.py`
   Telegram, `config.py`, `__main__.py` CLI); config in `config.toml`; tests in
-  `tests/` (125 passing).
+  `tests/` (127 passing).
 
 ## Cinesa specifics
 
@@ -98,7 +109,7 @@ A single-user Telegram watcher covering **two independent targets**:
 - Manual runs from a clone: `source .env && .venv/bin/python -m watcher
   --mode check [--dry-run]`; `--test-telegram` for a smoke test.
 - Deploying = pushing to `main`: the `~/.ticket-watch` clone pulls on its next
-  active firing; Actions picks it up on the next cron tick.
+  firing, healthy or not; Actions picks it up on the next cron tick.
 
 ## Boundaries
 

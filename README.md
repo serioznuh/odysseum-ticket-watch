@@ -45,9 +45,9 @@ datacenter IPs (verified: 403 from Actions, 200 from a home IP, same code):
 | your Mac — launchd, adaptive cadence | full Pathé + news check; pushes `state/state.json` | needs a residential IP |
 | GitHub Actions — every 15 min | reminder ladder + supervision, reading the shared state | needs 24/7 uptime; no Pathé access required |
 
-Not every 403 is a block: Pathé's origin answers `"No movie allowed !"` for a
-listing it will not schedule yet, read as "no sessions". Only the catalogue
-calls fail the check — one listing can never blind it.
+Not every 403 is a block: the showtimes endpoint serves only `isMovie` films, so
+event listings (the 70 mm ones) always answer `"No movie allowed !"`, and their
+bookability is read off the cinema programme. Only catalogue calls fail a check.
 
 Safety nets so it never dies silently: 🔴 after 3 consecutive Pathé failures,
 🔴 if nothing has succeeded for 18 h — **then every 24 h until it recovers**, so

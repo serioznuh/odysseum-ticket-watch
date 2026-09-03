@@ -25,6 +25,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-10 | Cinesa VPN 403 repeatedly launches headed Chrome | P1 | S | Bugs | [x] |
 | OTW-11 | Make Cinesa Chrome refresh normally imperceptible | P2 | S | UX & design | [x] |
 | OTW-12 | `reminders_cover` can over-promise on two same-pass events | P3 | S | Bugs | [ ] |
+| OTW-13 | A persistent per-listing Pathé failure is reported as healthy | P2 | S | Bugs | [ ] |
 
 ## 1. Critical — security & breakage
 
@@ -121,6 +122,35 @@ launches Chrome at most once per cooldown window (at least 60 min), turning the
 VPN off lets the original cached token recover without another mint, a 401 still
 forces renewal, and the three-failure alert says to disable VPN/proxy and wait
 for the automatic retry.
+
+### OTW-13 · A persistent per-listing Pathé failure is reported as healthy
+
+**Problem:** `fetch_snapshot` now swallows per-listing failures so one listing
+cannot blind the watch (the 2026-09-02 outage). The `degraded` list it builds
+reaches only a `log.info` — nothing in state, the heartbeat or any alert. Since
+`__main__.run` refreshes `last_check_ok`, zeroes `failure_streak`, clears
+`error_alerted` and may send RECOVERED whenever the catalogue calls succeed, a
+*permanently* failing showtimes call reports full health forever. The commit
+that introduced it claimed the degradation "can only delay a real alert by one
+firing", which holds for a transient failure but not a persistent one.
+
+Today this is masked: `analyze_pathe` fires TICKETS_AVAILABLE on `days` **or**
+the programme entry's `isBookable`, and that entry comes from a still-fatal
+catalogue call — so the sale signal survives. What is silently lost is session
+detail and the `refCmd` deep booking link.
+
+**Fix sketch:** carry `degraded` out of `fetch_snapshot` on `detect.Snapshot`,
+and either name the affected listings in the weekly heartbeat or raise a
+supervision finding once a listing has degraded for N consecutive checks.
+Expected refusals (`origin_refusal`, which returns cleanly and is never added
+to `degraded`) must not count — otherwise the 70 mm listings alert forever.
+
+**Files:** `watcher/pathe.py` (`fetch_snapshot`), `watcher/detect.py`
+(`Snapshot`), `watcher/__main__.py` (`build_heartbeat`).
+
+**Done when:** a persistent per-listing failure is visible to the user without
+reading logs, and a test covers "catalogue healthy + one listing failing
+forever" not reporting unqualified health.
 
 ## 3. Features
 
