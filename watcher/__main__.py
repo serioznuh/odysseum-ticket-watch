@@ -19,7 +19,7 @@ import re
 import sys
 from datetime import datetime, timedelta
 
-from . import __version__, cinesa, detect, news, notify, pathe
+from . import __version__, cinesa, coalesce, detect, news, notify, pathe
 from . import state as state_mod
 from .config import load_config
 from .detect import TZ_PARIS, Finding
@@ -524,18 +524,38 @@ def run(argv: list[str] | None = None) -> int:
                 cin.pop("blind_since", None)
                 findings.extend(detect.analyze_cinesa(csnap, st, cfg, now))
 
+        pending: list[Finding] = []
         for f in findings:
             if state_mod.already_sent(st, f.key):
                 log.debug("suppressed duplicate alert %s", f.key)
                 continue
+            if any(p.key == f.key for p in pending):
+                # Same key twice in one pass — a listing the catalogue returned
+                # twice. Harmless before merging (the first send marked it), but
+                # it would repeat itself inside a merged message.
+                log.debug("dropped repeated finding %s", f.key)
+                continue
+            pending.append(f)
+
+        for alert in coalesce.merge(pending, cfg):
+            f = alert.finding
+            if alert.merged:
+                log.info(
+                    "merged %d findings into one alert (keys=%s)",
+                    len(alert.keys),
+                    " ".join(alert.keys),
+                )
             log.info("alert [%s] %s (key=%s)", f.kind, f.title, f.key)
+            # One loud member is enough to buzz: merging must never silence an
+            # alert that would have arrived with sound on its own.
             if notify.send_telegram(
                 cfg,
                 notify.render_finding(f),
                 dry_run=args.dry_run,
-                silent=notify.is_silent(cfg, f.kind),
+                silent=all(notify.is_silent(cfg, k) for k in alert.kinds),
             ):
-                state_mod.mark_sent(st, f.key, now)
+                for key in alert.keys:
+                    state_mod.mark_sent(st, key, now)
                 sent_any = True
 
         # The error flag flips only once the alert really went out, so a failed
@@ -562,8 +582,20 @@ def run(argv: list[str] | None = None) -> int:
                 for f in findings
                 if f.kind in ("NEW_LISTING", "TICKETS_AVAILABLE")
             )
+            # `sales` is SALE_DATE's baseline and fails on its own: recording an
+            # opening that was never announced retired the alert for good.
+            sale_delivered = all(
+                state_mod.already_sent(st, f.key)
+                for f in findings
+                if f.kind in ("SALE_DATE", "SALE_DATE_CHANGED")
+            )
             state_mod.update_from_snapshot(
-                st, snap, cfg, now, advance_one_shot=one_shot_delivered
+                st,
+                snap,
+                cfg,
+                now,
+                advance_one_shot=one_shot_delivered,
+                advance_sales=sale_delivered,
             )
             if not sent_any and heartbeat_due(st, now, cfg.heartbeat_days):
                 hb = build_heartbeat(cfg, snap, st, now)

@@ -27,10 +27,59 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-12 | `reminders_cover` can over-promise on two same-pass events | P3 | S | Bugs | [ ] |
 | OTW-13 | A persistent per-listing Pathé failure is reported as healthy | P2 | S | Bugs | [ ] |
 | OTW-14 | An aborted state rebase can wedge the push until a human intervenes | P3 | S | Bugs | [ ] |
+| OTW-16 | One run fans out a burst of near-identical alerts | P1 | S | Bugs | [x] |
+| OTW-17 | A merged sale message mixing new and moved openings reads oddly | P3 | S | UX & design | [ ] |
 
 ## 1. Critical — security & breakage
 
 ## 2. Bugs
+
+### OTW-17 · A merged sale message mixing new and moved openings reads oddly
+**Priority:** P3 · **Effort:** S
+**Problem:** When one listing's opening is announced for the first time and
+another listing *moves* to that same minute, `coalesce` merges them (same
+`sale_datetime`). The title says CHANGED, and the body carries both
+"Reminders set: …" and "Reminders rescheduled automatically.", plus a "Was: …"
+line that does not say which listing it belongs to. Every fact is true and the
+actionable content — time, formats, link — is correct, so this is readability,
+not a wrong alert. Raised in review of OTW-16 and reproduced. Also applies to
+several listings moving from *different* previous times.
+**Fix sketch:** either split the group by whether the member changed (two
+honest messages, since "just announced" and "moved" are different news), or
+give the sale group its own body builder that attributes each varying line to
+its format label. `watcher/coalesce.py` (`group_of`, `_merge_bodies`).
+Splitting alone does not fix several listings moving from different times.
+**Done when:** no merged sale message states two contradictory reminder lines,
+and a "Was: …" line names the listing it describes.
+
+
+### OTW-16 · One run fans out a burst of near-identical alerts
+**Priority:** P1 · **Effort:** S
+**Problem:** Findings are analysed per listing and per date, and `run()` sends
+one Telegram message per finding. Nothing merges findings raised in the *same*
+pass that a human reads as one piece of news, so a single run buzzes the phone
+several times with near-identical messages. Observed twice, both confirmed
+from `state/state.json` timestamps: 2026-09-03 21:46 sent four messages (two
+"Sale opens Wed 9 Sep, 09:00" differing only by listing, two "New listing:
+IMAX 70 mm"), and 2026-08-06 15:08 sent two identical "IMAX tickets open"
+messages, one per watched Cinesa date. Per-key dedup across runs was working;
+the gap is within a run.
+**Fix:** Merge after the already-sent filter so a group only holds findings
+about to go out, and mark every member key on success (none on failure).
+Dedup keys and per-item analysis stay exactly as they are — changing a key
+format would re-send every past alert of that shape.
+**Done when:** the two bursts above produce two messages and one message
+respectively, every original key is still written to state, a failed send
+retries the whole group, and merging cannot silence an alert that would
+otherwise have buzzed.
+**Done (2026-09-04):** added `watcher/coalesce.py`, merging same-datetime sale
+openings, new listings, bookable-now formats and Cinesa target dates.
+`Finding.merge_item` names each item in the merged text. Also fixed a bug the
+work exposed: `state["sales"]` advanced even when the SALE_DATE send failed,
+which retired the sale announcement — the watcher's whole point — permanently
+(`advance_sales`). Dropped the Cinesa `👉` line that repeated the URL
+`render_finding` already appends.
+
 
 ### OTW-07 · Stale-check alert says "Pathé" but the whole local half is down
 **Priority:** P3 · **Effort:** S
