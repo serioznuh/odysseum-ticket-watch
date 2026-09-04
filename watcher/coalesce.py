@@ -62,15 +62,20 @@ def group_of(f: Finding) -> tuple | None:
 
     A finding with no `merge_item` never merges: the title builders below name
     the items, and one that cannot be named would silently vanish from a
-    merged message while its key was still marked sent.
+    merged message while its key was still marked sent. A kind with no
+    `_GROUPS` entry never merges either — one message per finding is the old
+    behaviour and costs nothing, where raising here would abort the send loop
+    and take every other alert in the run down with it.
     """
     if f.merge_item is None:
         return None
     if f.kind in SALE_KINDS:
         # Same film, same cinema, same minute: one opening, however many
         # listings carry it. A different minute is different news.
-        return ("sale", f.sale_datetime) if f.sale_datetime else None
-    if f.kind in ITEM_GROUP_KINDS:
+        if not (f.sale_datetime and "sale" in _GROUPS):
+            return None
+        return ("sale", f.sale_datetime)
+    if f.kind in ITEM_GROUP_KINDS and f.kind in _GROUPS:
         return (f.kind,)
     return None
 
@@ -239,7 +244,10 @@ class _GroupSpec:
 
     title: Callable[[list[Finding], Any], str]
     head: Callable[[list[Finding], Any], str] | None = None
-    # Replaces the per-member lines with a single line naming every item.
+    # Replaces *every* per-member line with the lines it returns, so a group
+    # that folds must render each member's whole contribution itself. Adding a
+    # second varying line to a folded finding without extending its fold drops
+    # that line from merged messages. Shared lines are still appended after.
     fold: Callable[[list[Finding]], list[str]] | None = None
 
 

@@ -28,10 +28,30 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-13 | A persistent per-listing Pathé failure is reported as healthy | P2 | S | Bugs | [ ] |
 | OTW-14 | An aborted state rebase can wedge the push until a human intervenes | P3 | S | Bugs | [ ] |
 | OTW-16 | One run fans out a burst of near-identical alerts | P1 | S | Bugs | [x] |
+| OTW-17 | A merged sale message mixing new and moved openings reads oddly | P3 | S | UX & design | [ ] |
 
 ## 1. Critical — security & breakage
 
 ## 2. Bugs
+
+### OTW-17 · A merged sale message mixing new and moved openings reads oddly
+**Priority:** P3 · **Effort:** S
+**Problem:** When one listing's opening is announced for the first time and
+another listing *moves* to that same minute, `coalesce` merges them (same
+`sale_datetime`). The title says CHANGED, and the body carries both
+"Reminders set: …" and "Reminders rescheduled automatically.", plus a "Was: …"
+line that does not say which listing it belongs to. Every fact is true and the
+actionable content — time, formats, link — is correct, so this is readability,
+not a wrong alert. Raised in review of OTW-16 and reproduced. Also applies to
+several listings moving from *different* previous times.
+**Fix sketch:** either split the group by whether the member changed (two
+honest messages, since "just announced" and "moved" are different news), or
+give the sale group its own body builder that attributes each varying line to
+its format label. `watcher/coalesce.py` (`group_of`, `_merge_bodies`).
+Splitting alone does not fix several listings moving from different times.
+**Done when:** no merged sale message states two contradictory reminder lines,
+and a "Was: …" line names the listing it describes.
+
 
 ### OTW-16 · One run fans out a burst of near-identical alerts
 **Priority:** P1 · **Effort:** S

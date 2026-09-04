@@ -332,3 +332,18 @@ def test_every_merged_message_still_names_its_film_and_cinema():
             assert Cfg.film_title in alert.finding.lines[0]
             assert Cfg.cinema_name in alert.finding.lines[0]
     assert "Pathé Odysseum" in texts(coalesce.merge(pathe_burst(), Cfg))[0]
+
+
+def test_a_kind_with_no_merge_spec_is_delivered_unmerged(monkeypatch):
+    """A missing spec must cost one merged message, never the whole run:
+    `merge` sits before every send, so raising here would take out the run's
+    other alerts too."""
+    monkeypatch.delitem(coalesce._GROUPS, "NEW_LISTING")
+    findings = [
+        finding("NEW_LISTING", "new_show:a", item=detect.FMT_OTHER),
+        finding("NEW_LISTING", "new_show:b", item=detect.FMT_IMAX70),
+    ]
+
+    alerts = coalesce.merge(findings, Cfg)
+
+    assert [a.keys for a in alerts] == [["new_show:a"], ["new_show:b"]]
