@@ -14,7 +14,7 @@ Stack: Python 3.9+ stdlib + `httpx`, no framework. Package `watcher/` (entry:
 ## Commands
 
 - Lint: `.venv/bin/ruff check .`
-- Tests: `.venv/bin/python -m pytest -q` (currently 141 passing)
+- Tests: `.venv/bin/python -m pytest -q` (currently 144 passing)
 - Manual run: `source .env && .venv/bin/python -m watcher --mode check --dry-run`
 - Telegram smoke test: `source .env && .venv/bin/python -m watcher --test-telegram`
 - Secrets are env-only: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — locally in a
@@ -99,6 +99,11 @@ Use the lowest-risk check that proves the change — details in
   target can never be mistaken for this one.
 - Outage alerts are the one deliberate exception to send-once: the cloud pass
   repeats a `stale:` alert every 24h while blind, silently after the first.
+- The reminder failover must never become eligible for a rung before the local
+  owner's worst-case first firing — one full launchd interval after that rung's
+  window opens. `state.LOCAL_FIRING_INTERVAL_MINUTES` mirrors the plist's
+  `StartInterval` and a test pins the two together; changing either means
+  changing both.
 - News matching stays strict (sale wording required; format keywords need a
   venue mention) — loosening it needs user approval.
 - Times shown to the user are Paris time; state timestamps are Paris-local

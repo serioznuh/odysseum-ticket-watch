@@ -30,10 +30,13 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Cloud half** — `.github/workflows/watch.yml` cron `*/15`: supervision, plus
   reminders as a **failover** rather than as their owner. It passes
   `--reminder-grace-minutes 25` (> the local 15-min interval), so it only sends
-  a reminder the Mac demonstrably missed; the wait is capped at half a rung's
-  window, so the 15-min warning keeps a failover instead of falling off the
-  ladder. Two writers stay off `reminders_sent` because of that grace *and*
-  because `local-check.sh` pulls before it runs — a Mac waking from sleep sees
+  a reminder the Mac demonstrably missed; that wait is floored at the local
+  firing interval, so the failover can never reach a rung before the owner's
+  worst-case first firing. The 15-min warning's window is exactly one interval
+  wide and has no slack to share, so it belongs to the Mac alone and a Mac that
+  sleeps through it is covered by the "sale is open" ping instead. Two writers
+  stay off `reminders_sent` because of that ordering *and* because
+  `local-check.sh` pulls before it runs — a Mac waking from sleep sees
   what the cloud sent before deciding. Measured to 2026-09-03 this cron fired
   10.9% of its schedule (median gap 58 min, max 11.5 h), which is why the
   ladder is no longer cloud-owned (OTW-15). The scheduled pass never calls

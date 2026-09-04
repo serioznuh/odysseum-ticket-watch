@@ -458,3 +458,78 @@ def test_cloud_grace_stays_out_of_the_owners_way(tmp_path, monkeypatch):
     assert sent == []
     saved = json.loads(state.read_text(encoding="utf-8"))
     assert saved["reminders_sent"][target] == ["120", "1440"]
+
+
+def _scripted_clock(*readings: datetime):
+    """A stand-in for `datetime` whose `now()` returns `readings` in order, the
+    last one repeating. Subclassing keeps every other use of the name working.
+
+    `run()` reads the clock twice — once at the top, once at the reminder
+    ladder — and what these tests pin down is that the ladder uses the *second*
+    reading, taken after the network block rather than before it.
+    """
+    queue = list(readings)
+
+    class ScriptedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    return ScriptedClock
+
+
+def test_the_ladder_reads_the_clock_after_the_check_rather_than_before_it(
+    tmp_path, monkeypatch
+):
+    """`now` is taken before the Pathé/news/Cinesa block, which can burn minutes
+    on a bad connection (Pathé retries every request three times against a 20 s
+    timeout, over several requests). Wording the ladder from that stale reading
+    lets a run which started at T-14 send the 15-min warning when the sale is
+    already open — the one alert that must never be wrong. Here the run starts
+    14 min before the opening and reaches the ladder a minute after it, so the
+    GO ping is the only correct send."""
+    sent: list[str] = []
+    config, state, target = _reminder_fixture(tmp_path, monkeypatch, sent)
+    opening = datetime.fromisoformat(target)
+    monkeypatch.setattr(
+        cli,
+        "datetime",
+        _scripted_clock(opening - timedelta(minutes=14), opening + timedelta(minutes=1)),
+    )
+
+    assert cli.run(
+        ["--config", str(config), "--state", str(state),
+         "--mode", "check", "--adaptive-cadence"]
+    ) == 0
+
+    assert len(sent) == 1
+    assert "SALE IS OPEN" in sent[0]
+    assert "Sale opens in" not in sent[0]  # what the run-start clock would have sent
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert "open" in saved["reminders_sent"][target]
+
+
+def test_a_slow_run_counts_down_from_where_it_finished(tmp_path, monkeypatch):
+    """The same seam, one rung earlier: run-start and ladder clocks that pick the
+    same reminder must still word it from the later one. A run that started at
+    T-14 and reaches the ladder at T-2 has two minutes to announce, not
+    fourteen — the countdown is what the user acts on."""
+    sent: list[str] = []
+    config, state, target = _reminder_fixture(tmp_path, monkeypatch, sent)
+    opening = datetime.fromisoformat(target)
+    monkeypatch.setattr(
+        cli,
+        "datetime",
+        _scripted_clock(opening - timedelta(minutes=14), opening - timedelta(minutes=2)),
+    )
+
+    assert cli.run(
+        ["--config", str(config), "--state", str(state),
+         "--mode", "check", "--adaptive-cadence"]
+    ) == 0
+
+    assert len(sent) == 1
+    assert "Sale opens in 2 minutes" in sent[0]
+    assert "14 minutes" not in sent[0]  # the run-start clock's countdown
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert "15" in saved["reminders_sent"][target]

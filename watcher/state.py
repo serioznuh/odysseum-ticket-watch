@@ -222,18 +222,39 @@ def update_from_cinesa(
         cin["last_change"] = now.isoformat()
 
 
+# The local half's firing interval: launchd's StartInterval (900 s) in
+# scripts/com.odysseum.ticket-watch.plist, which a test pins this constant to.
+# The ladder's owner fires on that timer, so this is also the worst-case delay
+# between a rung's window opening and the owner's first chance at that rung.
+LOCAL_FIRING_INTERVAL_MINUTES = 15
+
+
 def _failover_eligible_at(dt: datetime, offset: int, grace_minutes: float) -> datetime:
     """When a failover caller may send the `offset` reminder.
 
-    A rung's window is only `offset` minutes wide, so a flat grace can swallow
-    it whole: at grace 25 the 15-min warning became eligible at `dt + 10 min`,
-    past the opening, where the 'open' branch takes over — the most
-    time-critical rung had *no* cloud failover at all (OTW-15 round 2). The
-    wait is therefore capped at half the window, so the owner keeps the first
-    half of every rung and the failover always gets the second half. Rungs
-    wider than twice the grace (2 h and 24 h here) keep the full margin.
+    The owner (grace 0) may send the moment a window opens. A failover must not
+    be able to, or both halves send the same rung — the two-writer race the
+    grace exists to prevent. The owner fires on a timer, so its *worst case*
+    first chance at a rung is one full LOCAL_FIRING_INTERVAL_MINUTES after that
+    rung's window opens; anything earlier is racing it, not failing over for it.
+
+    The wait is therefore floored at that interval and capped at the rung's own
+    width, which decides each rung by construction — a new offset in
+    `config.toml` included:
+
+    * a rung wider than the interval keeps the whole grace (2 h and 24 h here);
+    * a rung no wider than it — the 15-min warning — gets no turn of its own.
+      Eligibility lands on the opening itself, which the pre-opening branch of
+      `due_reminders` can never reach, so the 'open' ping is what the failover
+      delivers for such a rung. A 15-min-wide window against a 15-min firing
+      period has no slack to share: splitting it (OTW-15 round 2 capped the
+      wait at half a window) put the cloud at T-7.5, ahead of the owner's
+      worst case of T.
     """
-    return dt - timedelta(minutes=offset - min(grace_minutes, offset / 2))
+    if grace_minutes <= 0:
+        return dt - timedelta(minutes=offset)  # the owner: as soon as it opens
+    wait = min(max(grace_minutes, LOCAL_FIRING_INTERVAL_MINUTES), offset)
+    return dt - timedelta(minutes=offset - wait)
 
 
 def due_reminders(
@@ -256,11 +277,10 @@ def due_reminders(
     make reminders cloud-only; the other half is `scripts/local-check.sh`
     pulling before it runs, so the Mac sees the failover's sends — see OTW-15.
 
-    Grace delays *eligibility* only, and never past the middle of the rung it
-    delays (see `_failover_eligible_at`), so every configured offset stays
-    reachable however large the grace is. The 6h cutoff on the 'open' ping
-    stays anchored to the sale time itself, so a failover grace can never
-    shorten how late that ping may still be sent.
+    Grace delays *eligibility* only, and never to a point where it could beat
+    the owner to a rung (see `_failover_eligible_at`). The 6h cutoff on the
+    'open' ping stays anchored to the sale time itself, so a failover grace can
+    never shorten how late that ping may still be sent.
     """
     if state.get("tickets_available"):
         return []

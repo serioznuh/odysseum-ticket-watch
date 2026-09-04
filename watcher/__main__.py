@@ -598,11 +598,23 @@ def run(argv: list[str] | None = None) -> int:
     # the */15 workflow ran 100 times of the 920 it implies (10.9%), median gap
     # 58 min, mean 139 min, max 693 min — enough to skip the 15-min warning
     # outright, or to sleep through the opening.
+    #
+    # Read the clock AGAIN here. `now` was taken before the Pathé/news/Cinesa
+    # block, which can burn minutes on a bad connection — Pathé alone retries
+    # every request three times against a 20 s timeout, over several requests —
+    # and the ladder is the one thing in this function whose correctness is
+    # measured in minutes. A run that starts at T-16 and reaches this line at
+    # T+5 must send the "SALE IS OPEN" ping, not the 15-min warning worded from
+    # a clock that has already expired. Every other `now` here stays the
+    # run-start reading on purpose: `last_check_ok`, the dedup keys and the
+    # staleness arithmetic all record *when this batch ran*, and a single run's
+    # bookkeeping has to agree with itself.
+    ladder_now = datetime.now(TZ_PARIS)
     due = state_mod.due_reminders(
-        st, cfg.reminder_offsets_minutes, now, args.reminder_grace_minutes
+        st, cfg.reminder_offsets_minutes, ladder_now, args.reminder_grace_minutes
     )
     for r in due:
-        text = notify.render_reminder(r["offset"], r["target"], cfg, now)
+        text = notify.render_reminder(r["offset"], r["target"], cfg, ladder_now)
         log.info("reminder due: %s before %s", r["offset"], r["target"])
         if notify.send_telegram(cfg, text, dry_run=args.dry_run):
             state_mod.mark_reminder(st, r["target"], r["offset"], cfg.reminder_offsets_minutes)

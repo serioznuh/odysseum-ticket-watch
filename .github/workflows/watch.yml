@@ -77,10 +77,12 @@ jobs:
             # never the owner: it only sends a reminder whose window opened 25+
             # min ago, i.e. one the local half (launchd, every 15 min) already
             # missed. 25 > 15 leaves margin for a slightly late local run.
-            # due_reminders caps that wait at half a rung's window, so the
-            # 15-min warning — whose window is only 15 min wide — still has a
-            # failover instead of being skipped outright (OTW-15); changing
-            # this number is covered by a test against config.toml's offsets.
+            # due_reminders floors that wait at the local firing interval, so
+            # the failover can never reach a rung before the Mac's worst-case
+            # first firing; the 15-min warning is only one interval wide, so it
+            # stays the Mac's alone and the "sale is open" ping is what covers a
+            # Mac asleep through it (OTW-15). Changing this number is covered by
+            # a test against config.toml's offsets and the launchd plist.
             # It applies to check mode too — reminders are computed in both
             # modes, and a manual dispatch from here is still the cloud.
             python -m watcher --mode "${{ steps.mode.outputs.mode }}" --reminder-grace-minutes 25 ${{ inputs.dry_run == true && '--dry-run' || '' }}
