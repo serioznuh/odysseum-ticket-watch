@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from watcher import detect
 from watcher import state as state_mod
+from watcher.config import load_config
 from watcher.detect import Snapshot
 from watcher.state import (
     DEFAULT_STATE,
@@ -185,6 +188,204 @@ def test_open_ping_after_target_once_with_grace():
     st2 = fresh_state()
     st2["sale_target"] = iso_in(timedelta(hours=-7))  # beyond 6h grace
     assert due_reminders(st2, OFFSETS, NOW) == []
+
+
+# --------------------------------------------------- reminder failover (OTW-15)
+# `grace_minutes` is what lets the cloud pass be a failover rather than a second
+# owner of the ladder: it only reports a reminder the local half already missed.
+
+def test_grace_zero_matches_the_no_grace_call():
+    """The local half owns the ladder and passes no grace — that path must stay
+    byte-for-byte the behaviour the ladder had before OTW-15."""
+    for delta in (timedelta(hours=23), timedelta(minutes=90), timedelta(minutes=10),
+                  timedelta(hours=-1), timedelta(hours=-7)):
+        st = fresh_state()
+        st["sale_target"] = iso_in(delta)
+        assert due_reminders(st, OFFSETS, NOW, 0.0) == due_reminders(st, OFFSETS, NOW)
+
+
+def test_grace_holds_a_freshly_opened_window_back():
+    st = fresh_state()
+    target = iso_in(timedelta(minutes=118))  # the 2h window opened 2 min ago
+    st["sale_target"] = target
+    mark_reminder(st, target, 1440, OFFSETS)  # the owner sent the 24h one yesterday
+
+    # The owner fires as soon as the window opens...
+    assert [d["offset"] for d in due_reminders(st, OFFSETS, NOW, 0)] == [120]
+    # ...the failover stays quiet until its grace has elapsed.
+    assert due_reminders(st, OFFSETS, NOW, 25) == []
+    late = NOW + timedelta(minutes=23)  # window opened 25 min ago; nobody sent it
+    assert [d["offset"] for d in due_reminders(st, OFFSETS, late, 25)] == [120]
+
+
+def test_grace_falls_back_to_an_older_offset_the_owner_never_sent():
+    """Grace narrows what the failover may send, so the most imminent offset can
+    be held back while an older unsent one is not. Sending that older reminder
+    is right: the Mac slept through it, so the user never got it — and its
+    wording is time-aware, so it does not misstate the countdown."""
+    st = fresh_state()
+    st["sale_target"] = iso_in(timedelta(minutes=118))  # 24h reminder never sent
+    assert [d["offset"] for d in due_reminders(st, OFFSETS, NOW, 25)] == [1440]
+
+
+def test_grace_never_widens_the_open_pings_six_hour_cutoff():
+    """Grace delays eligibility; it must not push the 'open' ping's absolute
+    deadline out, or a failover could shout GO long after the sale opened."""
+    st = fresh_state()
+    st["sale_target"] = iso_in(timedelta(hours=-1))
+    assert due_reminders(st, OFFSETS, NOW, 25) == [{"offset": "open", "target": st["sale_target"]}]
+
+    just_opened = fresh_state()
+    just_opened["sale_target"] = iso_in(timedelta(minutes=-10))
+    assert due_reminders(just_opened, OFFSETS, NOW, 25) == []   # owner's turn, not ours
+
+    # 6h12m past opening: still shut at grace 0, and must stay shut at grace 25.
+    # Subtracting the grace from the age instead of the eligibility time would
+    # read this as 5h47m and re-open the window.
+    stale = fresh_state()
+    stale["sale_target"] = iso_in(timedelta(hours=-6, minutes=-12))
+    assert due_reminders(stale, OFFSETS, NOW, 0) == []
+    assert due_reminders(stale, OFFSETS, NOW, 25) == []
+
+
+def test_grace_never_runs_ahead_of_the_owner_on_a_negative_value():
+    """A negative grace would make the failover *earlier* than the owner rather
+    than later — opening the 2 h rung before its window does. It clamps to 0."""
+    st = fresh_state()
+    target = iso_in(timedelta(minutes=130))  # the 2 h window opens in 10 min
+    st["sale_target"] = target
+    mark_reminder(st, target, 1440, OFFSETS)  # the 24 h rung is already spent
+
+    assert due_reminders(st, OFFSETS, NOW) == []  # nothing is due for the owner
+    # ...and no negative grace may drag the 2 h rung forward for the failover.
+    assert due_reminders(st, OFFSETS, NOW, -20) == []
+    assert due_reminders(st, OFFSETS, NOW, -60) == []
+
+
+def test_a_rung_no_wider_than_the_owners_interval_gets_no_failover_turn():
+    """The 15-min warning's window is exactly as wide as the local half's firing
+    interval, so the owner's worst-case first chance at it lands on the opening
+    itself and there is no moment inside the window a failover can take without
+    possibly beating it. Round 2 gave the failover the second half of every
+    window, which put the cloud 7.5 min ahead of that worst case — the
+    two-writer race the grace exists to prevent. The rung is the owner's alone
+    now, and a sleeping Mac is covered by the 'open' ping instead."""
+    target = iso_in(timedelta(minutes=15))  # the 15-min window opens right now
+    st = fresh_state()
+    st["sale_target"] = target
+    for spent in (1440, 120):
+        mark_reminder(st, target, spent, OFFSETS)
+
+    assert [d["offset"] for d in due_reminders(st, OFFSETS, NOW, 0)] == [15]  # owner
+    half_window = NOW + timedelta(minutes=7, seconds=30)  # where round 2 sent it
+    assert due_reminders(st, OFFSETS, half_window, 25) == []
+    last_moment = NOW + timedelta(minutes=15) - timedelta(seconds=1)
+    assert due_reminders(st, OFFSETS, last_moment, 25) == []
+    # ...and what the failover does deliver for that rung is the GO ping.
+    opened = NOW + timedelta(minutes=15 + 25)
+    assert [d["offset"] for d in due_reminders(st, OFFSETS, opened, 25)] == ["open"]
+
+    # The 2 h rung is wider than the interval, so it keeps the whole grace.
+    wide = fresh_state()
+    wide_target = iso_in(timedelta(minutes=120))
+    wide["sale_target"] = wide_target
+    mark_reminder(wide, wide_target, 1440, OFFSETS)
+    assert due_reminders(wide, OFFSETS, NOW + timedelta(minutes=24), 25) == []
+    at_grace = NOW + timedelta(minutes=25)
+    assert [d["offset"] for d in due_reminders(wide, OFFSETS, at_grace, 25)] == [120]
+
+
+def _shipped_grace(root: Path) -> float:
+    workflow = (root / ".github" / "workflows" / "watch.yml").read_text(encoding="utf-8")
+    match = re.search(r"--reminder-grace-minutes\s+([0-9.]+)", workflow)
+    assert match, "the cloud pass no longer passes --reminder-grace-minutes"
+    return float(match.group(1))
+
+
+def _launchd_interval_minutes(root: Path) -> float:
+    plist = (root / "scripts" / "com.odysseum.ticket-watch.plist").read_text(encoding="utf-8")
+    match = re.search(r"<key>StartInterval</key>\s*<integer>(\d+)</integer>", plist)
+    assert match, "the launchd job no longer declares a StartInterval"
+    return int(match.group(1)) / 60
+
+
+def test_shipped_grace_keeps_the_owner_first_on_every_configured_offset():
+    """The ordering invariant, read from production: the offsets in
+    `config.toml`, the grace `watch.yml` passes, and the interval the launchd
+    job actually fires on.
+
+    The local half owns the ladder but fires on a timer, so its worst-case first
+    chance at a rung is one full interval after that rung's window opens. Until
+    then the failover must report nothing, or both halves send the same
+    reminder. No rung may fall off the ladder in exchange, so each one is also
+    checked to be either deliverable by the failover inside its own window or
+    covered by the 'open' ping. Changing any of the three production numbers
+    re-checks both halves of that here."""
+    root = Path(__file__).resolve().parent.parent
+    offsets = sorted(load_config(root / "config.toml").reminder_offsets_minutes)
+    grace = _shipped_grace(root)
+    interval = _launchd_interval_minutes(root)
+    assert interval == state_mod.LOCAL_FIRING_INTERVAL_MINUTES, (
+        f"launchd fires every {interval:g} min but watcher.state assumes "
+        f"{state_mod.LOCAL_FIRING_INTERVAL_MINUTES:g} — the failover's ordering "
+        "is derived from that interval"
+    )
+
+    for i, offset in enumerate(offsets):
+        target = iso_in(timedelta(minutes=offset))  # this rung's window opens now
+        st = fresh_state()
+        st["sale_target"] = target
+        for spent in (o for o in offsets if o > offset):
+            mark_reminder(st, target, spent, offsets)
+
+        assert [d["offset"] for d in due_reminders(st, offsets, NOW, 0)] == [offset]  # owner
+        blackout = min(interval, offset)
+        for step in range(int(blackout * 2)):  # every 30 s of it
+            t = NOW + timedelta(seconds=30 * step)
+            assert due_reminders(st, offsets, t, grace) == [], (
+                f"the failover can send the {offset}-minute reminder {step / 2:g} min "
+                f"into its window, ahead of the local half's worst-case first firing "
+                f"at {blackout:g} min"
+            )
+
+        if offset > interval:
+            # Reachable up to the last moment before the next rung takes over.
+            latest = NOW + timedelta(minutes=offset - (offsets[i - 1] if i else 0))
+            assert [
+                d["offset"] for d in due_reminders(st, offsets, latest - timedelta(seconds=1), grace)
+            ] == [offset], (
+                f"the {offset}-minute reminder is undeliverable by the cloud failover "
+                f"at --reminder-grace-minutes {grace:g}"
+            )
+        else:
+            # Too narrow to share with the owner: the GO ping is its coverage.
+            opened = NOW + timedelta(minutes=offset + grace)
+            assert [d["offset"] for d in due_reminders(st, offsets, opened, grace)] == ["open"], (
+                f"the {offset}-minute rung has no failover turn and no 'open' ping either"
+            )
+
+
+def test_no_offset_lets_the_failover_move_before_the_owner_whatever_the_grace():
+    """The same ordering, as a property of the formula rather than of the three
+    offsets configured today: a rung added to `config.toml`, or some other
+    failover handed some other grace, must not be able to reintroduce the race.
+    A rung too narrow for the owner's worst case to fit inside its window gets
+    no failover turn at all rather than an early one."""
+    interval = state_mod.LOCAL_FIRING_INTERVAL_MINUTES
+    for offsets in ([1440, 120, 15], [1440, 120, 30, 15, 5], [90], [1440, 20]):
+        for offset in offsets:
+            target = iso_in(timedelta(minutes=offset))
+            st = fresh_state()
+            st["sale_target"] = target
+            for spent in (o for o in offsets if o > offset):
+                mark_reminder(st, target, spent, offsets)
+            for grace in (0.5, 5, 15, 25, 90, 10_000):
+                for step in range(int(min(interval, offset) * 2)):  # every 30 s
+                    t = NOW + timedelta(seconds=30 * step)
+                    assert due_reminders(st, offsets, t, grace) == [], (
+                        f"offsets={offsets} offset={offset} grace={grace:g}: the failover "
+                        f"fires {step / 2:g} min into a window the owner is still due to serve"
+                    )
 
 
 class CadenceCfg:

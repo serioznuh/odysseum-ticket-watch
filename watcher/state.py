@@ -232,11 +232,65 @@ def update_from_cinesa(
         cin["last_change"] = now.isoformat()
 
 
-def due_reminders(state: dict, offsets_minutes: list[int], now: datetime) -> list[dict]:
+# The local half's firing interval: launchd's StartInterval (900 s) in
+# scripts/com.odysseum.ticket-watch.plist, which a test pins this constant to.
+# The ladder's owner fires on that timer, so this is also the worst-case delay
+# between a rung's window opening and the owner's first chance at that rung.
+LOCAL_FIRING_INTERVAL_MINUTES = 15
+
+
+def _failover_eligible_at(dt: datetime, offset: int, grace_minutes: float) -> datetime:
+    """When a failover caller may send the `offset` reminder.
+
+    The owner (grace 0) may send the moment a window opens. A failover must not
+    be able to, or both halves send the same rung — the two-writer race the
+    grace exists to prevent. The owner fires on a timer, so its *worst case*
+    first chance at a rung is one full LOCAL_FIRING_INTERVAL_MINUTES after that
+    rung's window opens; anything earlier is racing it, not failing over for it.
+
+    The wait is therefore floored at that interval and capped at the rung's own
+    width, which decides each rung by construction — a new offset in
+    `config.toml` included:
+
+    * a rung wider than the interval keeps the whole grace (2 h and 24 h here);
+    * a rung no wider than it — the 15-min warning — gets no turn of its own.
+      Eligibility lands on the opening itself, which the pre-opening branch of
+      `due_reminders` can never reach, so the 'open' ping is what the failover
+      delivers for such a rung. A 15-min-wide window against a 15-min firing
+      period has no slack to share: splitting it (OTW-15 round 2 capped the
+      wait at half a window) put the cloud at T-7.5, ahead of the owner's
+      worst case of T.
+    """
+    if grace_minutes <= 0:
+        return dt - timedelta(minutes=offset)  # the owner: as soon as it opens
+    wait = min(max(grace_minutes, LOCAL_FIRING_INTERVAL_MINUTES), offset)
+    return dt - timedelta(minutes=offset - wait)
+
+
+def due_reminders(
+    state: dict,
+    offsets_minutes: list[int],
+    now: datetime,
+    grace_minutes: float = 0.0,
+) -> list[dict]:
     """Return at most one due reminder: the most imminent unsent offset, or the
     'open' ping once the sale time has passed (within a 6h grace window).
 
     Reminders stop entirely once tickets are known to be available.
+
+    `grace_minutes` makes the caller a *failover* instead of the ladder's owner:
+    it only reports a reminder whose window opened at least that long ago. The
+    local half (launchd, every 15 min) passes 0 and owns the ladder; the cloud
+    pass passes a grace longer than that firing interval, so it only steps in
+    for a reminder the local half demonstrably did not send in time. That is
+    half of what removes the two-writer race on `reminders_sent` which used to
+    make reminders cloud-only; the other half is `scripts/local-check.sh`
+    pulling before it runs, so the Mac sees the failover's sends — see OTW-15.
+
+    Grace delays *eligibility* only, and never to a point where it could beat
+    the owner to a rung (see `_failover_eligible_at`). The 6h cutoff on the
+    'open' ping stays anchored to the sale time itself, so a failover grace can
+    never shorten how late that ping may still be sent.
     """
     if state.get("tickets_available"):
         return []
@@ -246,9 +300,13 @@ def due_reminders(state: dict, offsets_minutes: list[int], now: datetime) -> lis
         return []
     dt = detect.as_aware(dt)
     sent = set(state.get("reminders_sent", {}).get(iso, []))
+    grace_minutes = max(0.0, grace_minutes)
 
     if now >= dt:
-        if "open" not in sent and (now - dt) <= timedelta(hours=6):
+        # The 'open' ping has no window to be squeezed out of — only the 6h
+        # cutoff below — so the grace applies to it whole.
+        opens_at = dt + timedelta(minutes=grace_minutes)
+        if "open" not in sent and now >= opens_at and (now - dt) <= timedelta(hours=6):
             return [{"offset": "open", "target": iso}]
         return []
 
@@ -257,7 +315,7 @@ def due_reminders(state: dict, offsets_minutes: list[int], now: datetime) -> lis
     active = [
         o
         for o in sorted(offsets_minutes)
-        if now >= dt - timedelta(minutes=o) and str(o) not in sent
+        if now >= _failover_eligible_at(dt, o, grace_minutes) and str(o) not in sent
     ]
     if active:
         return [{"offset": min(active), "target": iso}]

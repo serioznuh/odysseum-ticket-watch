@@ -394,6 +394,160 @@ def test_recorded_cause_drops_the_failing_url():
     assert cli.summarize_pathe_error("HTTP 403")[1] == 403
 
 
+# ------------------------------------------------- reminder ownership (OTW-15)
+
+REMINDER_CONFIG_TOML = """
+[film]
+primary_slug = "dune-troisieme-partie"
+
+[cinema]
+slug = "montpellier-multiplexe-odysseum"
+
+[news]
+enabled = false
+
+[cinesa]
+enabled = false
+"""
+
+
+def _reminder_fixture(tmp_path, monkeypatch, sent: list):
+    """State on the eve of the sale: 24h and 2h reminders already delivered, the
+    15-min one still owed, and a Pathé check fresh enough for the cadence guard
+    to skip. Cinesa is off, the default."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat")
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda cfg, text, **kw: sent.append(text) or True
+    )
+    config = tmp_path / "config.toml"
+    config.write_text(REMINDER_CONFIG_TOML, encoding="utf-8")
+
+    now = datetime.now(TZ_PARIS)
+    # The extra 30 s keeps the floored countdown on "10 minutes" for the whole
+    # test rather than tipping to 9 on the clock ticking between here and run().
+    target = (now + timedelta(minutes=10, seconds=30)).isoformat()
+    st = json.loads(json.dumps(DEFAULT_STATE))
+    st["last_check_ok"] = now.isoformat()
+    st["sale_target"] = target
+    st["reminders_sent"] = {target: ["120", "1440"]}
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps(st), encoding="utf-8")
+    return config, state, target
+
+
+def test_local_half_sends_the_reminder_the_cadence_guard_used_to_swallow(
+    tmp_path, monkeypatch
+):
+    """Reminders were cloud-only, and the cloud cron ran ~11% of its schedule.
+    The local half owns them now — including on a firing where the adaptive
+    guard skips Pathé, which with Cinesa off used to return before the ladder."""
+    sent: list[str] = []
+    config, state, target = _reminder_fixture(tmp_path, monkeypatch, sent)
+
+    assert cli.run(
+        ["--config", str(config), "--state", str(state),
+         "--mode", "check", "--adaptive-cadence"]
+    ) == 0
+
+    assert len(sent) == 1
+    assert "Sale opens in 10 minutes" in sent[0]  # actual time left...
+    assert "in 15 minutes" not in sent[0]         # ...not the offset's label
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert "15" in saved["reminders_sent"][target]
+
+
+def test_cloud_grace_stays_out_of_the_owners_way(tmp_path, monkeypatch):
+    """Same state, the cloud pass: the 15-min window opened 5 min ago, inside
+    the 25-min grace, so the failover leaves it to the Mac."""
+    sent: list[str] = []
+    config, state, target = _reminder_fixture(tmp_path, monkeypatch, sent)
+
+    assert cli.run(
+        ["--config", str(config), "--state", str(state),
+         "--mode", "remind", "--reminder-grace-minutes", "25"]
+    ) == 0
+
+    assert sent == []
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["reminders_sent"][target] == ["120", "1440"]
+
+
+def _scripted_clock(*readings: datetime):
+    """A stand-in for `datetime` whose `now()` returns `readings` in order, the
+    last one repeating. Subclassing keeps every other use of the name working.
+
+    `run()` reads the clock twice — once at the top, once at the reminder
+    ladder — and what these tests pin down is that the ladder uses the *second*
+    reading, taken after the network block rather than before it.
+    """
+    queue = list(readings)
+
+    class ScriptedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    return ScriptedClock
+
+
+def test_the_ladder_reads_the_clock_after_the_check_rather_than_before_it(
+    tmp_path, monkeypatch
+):
+    """`now` is taken before the Pathé/news/Cinesa block, which can burn minutes
+    on a bad connection (Pathé retries every request three times against a 20 s
+    timeout, over several requests). Wording the ladder from that stale reading
+    lets a run which started at T-14 send the 15-min warning when the sale is
+    already open — the one alert that must never be wrong. Here the run starts
+    14 min before the opening and reaches the ladder a minute after it, so the
+    GO ping is the only correct send."""
+    sent: list[str] = []
+    config, state, target = _reminder_fixture(tmp_path, monkeypatch, sent)
+    opening = datetime.fromisoformat(target)
+    monkeypatch.setattr(
+        cli,
+        "datetime",
+        _scripted_clock(opening - timedelta(minutes=14), opening + timedelta(minutes=1)),
+    )
+
+    assert cli.run(
+        ["--config", str(config), "--state", str(state),
+         "--mode", "check", "--adaptive-cadence"]
+    ) == 0
+
+    assert len(sent) == 1
+    assert "SALE IS OPEN" in sent[0]
+    assert "Sale opens in" not in sent[0]  # what the run-start clock would have sent
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert "open" in saved["reminders_sent"][target]
+
+
+def test_a_slow_run_counts_down_from_where_it_finished(tmp_path, monkeypatch):
+    """The same seam, one rung earlier: run-start and ladder clocks that pick the
+    same reminder must still word it from the later one. A run that started at
+    T-14 and reaches the ladder at T-2 has two minutes to announce, not
+    fourteen — the countdown is what the user acts on."""
+    sent: list[str] = []
+    config, state, target = _reminder_fixture(tmp_path, monkeypatch, sent)
+    opening = datetime.fromisoformat(target)
+    monkeypatch.setattr(
+        cli,
+        "datetime",
+        _scripted_clock(opening - timedelta(minutes=14), opening - timedelta(minutes=2)),
+    )
+
+    assert cli.run(
+        ["--config", str(config), "--state", str(state),
+         "--mode", "check", "--adaptive-cadence"]
+    ) == 0
+
+    assert len(sent) == 1
+    assert "Sale opens in 2 minutes" in sent[0]
+    assert "14 minutes" not in sent[0]  # the run-start clock's countdown
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert "15" in saved["reminders_sent"][target]
+
+
 # --------------------------------------------------------------- merged delivery
 
 DUPLICATE_SALE = "2026-11-05T08:00:00+01:00"

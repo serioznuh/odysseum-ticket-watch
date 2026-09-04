@@ -353,8 +353,18 @@ def run(argv: list[str] | None = None) -> int:
         "--adaptive-cadence",
         action="store_true",
         help="check mode: compute the Pathé freshness threshold from the sale-target"
-        " proximity (war-room mode near the opening); reminders are left to the"
-        " cloud pass. Does not gate the Cinesa half, which runs every time",
+        " proximity (war-room mode near the opening). Does not gate the reminder"
+        " ladder or the Cinesa half, which run every time",
+    )
+    parser.add_argument(
+        "--reminder-grace-minutes",
+        type=float,
+        default=0.0,
+        metavar="MINUTES",
+        help="failover mode: only send a reminder whose window opened at least this"
+        " long ago. The local half omits it (grace 0 — it fires every 15 min and"
+        " owns the ladder); the cloud pass passes more than that firing interval,"
+        " so it only sends what the local half missed",
     )
     parser.add_argument("--test-telegram", action="store_true", help="send a test message and exit")
     parser.add_argument("--verbose", action="store_true")
@@ -393,8 +403,11 @@ def run(argv: list[str] | None = None) -> int:
     # The cadence guard governs the Pathé half only. Cinesa is a single small
     # call against a host that is neither bot-gated nor rate-limited, and the
     # point is catching a schedule change within minutes — so it runs on every
-    # firing. When Pathé is not due and Cinesa is off, the run is still the
-    # original zero-network no-op.
+    # firing. When Pathé is not due and Cinesa is off, the whole check block is
+    # skipped and the run stays the original zero-network no-op — but it must
+    # still fall through to the reminder ladder below, which the local half now
+    # owns (OTW-15). Cinesa is off by default, so an early `return 0` here would
+    # swallow the 15-min warning on any firing the cadence guard calls fresh.
     pathe_due = True
     if args.mode == "check":
         threshold = args.skip_if_checked_within
@@ -408,14 +421,12 @@ def run(argv: list[str] | None = None) -> int:
                 " [adaptive tier]" if args.adaptive_cadence else "",
             )
             pathe_due = False
-            if not cfg.cinesa_enabled:
-                return 0
         elif args.adaptive_cadence:
             log.info("adaptive cadence tier: check when older than %.2fh — running", threshold)
 
     sent_any = False
 
-    if args.mode == "check":
+    if args.mode == "check" and (pathe_due or cfg.cinesa_enabled):
         findings: list[Finding] = []
         snap: detect.Snapshot | None = None
         client = pathe.make_client()
@@ -607,19 +618,41 @@ def run(argv: list[str] | None = None) -> int:
                 ):
                     st["last_heartbeat"] = now.isoformat()
 
-    # Reminders and supervision are owned by the cloud pass; adaptive local
-    # runs skip them so two writers never race on the same state keys.
-    due = [] if args.adaptive_cadence else state_mod.due_reminders(
-        st, cfg.reminder_offsets_minutes, now
+    # The reminder ladder is owned by the LOCAL half: launchd fires it every
+    # 15 min — the resolution a 15-min warning needs — and it runs with grace 0.
+    # The cloud pass is the failover for a sleeping Mac and passes
+    # --reminder-grace-minutes, so it only sends what the local half did not.
+    # Two things keep two writers off `reminders_sent`, and both are needed:
+    # that grace, and `scripts/local-check.sh` pulling *before* it runs — a
+    # clone that has not pulled cannot see what the failover already sent.
+    # Reminders used to be cloud-only for exactly that reason, but the cron is
+    # far too unreliable to own them: measured over the 9.6 days to 2026-09-03
+    # the */15 workflow ran 100 times of the 920 it implies (10.9%), median gap
+    # 58 min, mean 139 min, max 693 min — enough to skip the 15-min warning
+    # outright, or to sleep through the opening.
+    #
+    # Read the clock AGAIN here. `now` was taken before the Pathé/news/Cinesa
+    # block, which can burn minutes on a bad connection — Pathé alone retries
+    # every request three times against a 20 s timeout, over several requests —
+    # and the ladder is the one thing in this function whose correctness is
+    # measured in minutes. A run that starts at T-16 and reaches this line at
+    # T+5 must send the "SALE IS OPEN" ping, not the 15-min warning worded from
+    # a clock that has already expired. Every other `now` here stays the
+    # run-start reading on purpose: `last_check_ok`, the dedup keys and the
+    # staleness arithmetic all record *when this batch ran*, and a single run's
+    # bookkeeping has to agree with itself.
+    ladder_now = datetime.now(TZ_PARIS)
+    due = state_mod.due_reminders(
+        st, cfg.reminder_offsets_minutes, ladder_now, args.reminder_grace_minutes
     )
     for r in due:
-        text = notify.render_reminder(r["offset"], r["target"], cfg, now)
+        text = notify.render_reminder(r["offset"], r["target"], cfg, ladder_now)
         log.info("reminder due: %s before %s", r["offset"], r["target"])
         if notify.send_telegram(cfg, text, dry_run=args.dry_run):
             state_mod.mark_reminder(st, r["target"], r["offset"], cfg.reminder_offsets_minutes)
 
     # Supervision: alert when the Pathé check (running on another machine
-    # than the cloud reminder pass) stopped reporting.
+    # than this cloud pass) stopped reporting.
     if not args.adaptive_cadence and state_mod.is_check_stale(st, cfg.stale_check_hours, now):
         last_ok = detect.as_aware(detect.parse_iso(st.get("last_check_ok")))
         blind = now - last_ok

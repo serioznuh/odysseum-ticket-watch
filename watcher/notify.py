@@ -98,6 +98,39 @@ def _when_phrase(target_iso: str, now: datetime | None = None) -> str:
     return dt.strftime("%a %d %b, ") + clock
 
 
+def _countdown(target_iso: str, now: datetime | None, label: str) -> str:
+    """How long is *actually* left until the opening, not the offset it was
+    scheduled at.
+
+    A reminder can be delivered well after its window opened — the cloud
+    failover only steps in once the local half has missed one (OTW-15) — and a
+    message that still says "in 2 hours" 25 minutes before the sale is a lie
+    the user acts on. Falls back to the scheduled `label` when `now` is unknown.
+
+    Everything is rounded *down* so the phrase never claims more time than
+    there is; the exact opening clock time is printed right beside it anyway.
+
+    Below a day the leftover minutes are spelled out, because the 2 h rung is
+    normally delivered at T-105…T-120 on the 15-min grid and a bare "1 hour"
+    understates it by up to 59 minutes. Above a day they are dropped: the
+    absolute date sits beside the phrase and carries that precision already.
+    """
+    dt = detect.parse_iso(target_iso)
+    if dt is None or now is None:
+        return label
+    minutes = int((detect.as_aware(dt) - detect.as_aware(now)).total_seconds() // 60)
+    if minutes <= 0:
+        return "moments"
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    hours, rest = divmod(minutes, 60)
+    if hours < 24:
+        phrase = f"{hours} hour{'s' if hours != 1 else ''}"
+        return f"{phrase} {rest} min" if rest else phrase
+    days = hours // 24
+    return f"{days} day{'s' if days != 1 else ''}"
+
+
 def render_reminder(
     offset: int | str, target_iso: str, cfg: Any, now: datetime | None = None
 ) -> str:
@@ -121,15 +154,17 @@ def render_reminder(
         minutes = None
 
     if minutes == 15:
+        left = _countdown(target_iso, now, OFFSET_LABELS[15])
         return (
-            f"⏰ <b>Sale opens in 15 minutes — {esc(_clock(target_iso))}</b>\n"
+            f"⏰ <b>Sale opens in {esc(left)} — {esc(_clock(target_iso))}</b>\n"
             f"{who}\n"
             "Have pathe.fr open and be signed in.\n"
             f"👉 {url}"
         )
     if minutes == 120:
+        left = _countdown(target_iso, now, OFFSET_LABELS[120])
         return (
-            f"⏰ <b>Sale opens in 2 hours — {esc(_clock(target_iso))}</b>\n"
+            f"⏰ <b>Sale opens in {esc(left)} — {esc(_clock(target_iso))}</b>\n"
             f"{who}\n"
             "Sign in on pathe.fr and save a card now.\n"
             f"👉 {url}"
@@ -142,9 +177,12 @@ def render_reminder(
             f"👉 {url}"
         )
 
+    # Same staleness trap as the near offsets: the label describes when this
+    # reminder was *scheduled*, not how long is left when it is delivered.
     label = OFFSET_LABELS.get(minutes, f"{offset} minutes")
     return (
-        f"⏰ <b>Sale opens in ~{esc(label)} — {esc(_when_phrase(target_iso, now))}</b>\n"
+        f"⏰ <b>Sale opens in ~{esc(_countdown(target_iso, now, label))}"
+        f" — {esc(_when_phrase(target_iso, now))}</b>\n"
         f"{who}\n"
         f"👉 {url}"
     )

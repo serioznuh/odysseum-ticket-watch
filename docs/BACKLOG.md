@@ -27,6 +27,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-12 | `reminders_cover` can over-promise on two same-pass events | P3 | S | Bugs | [ ] |
 | OTW-13 | A persistent per-listing Pathé failure is reported as healthy | P2 | S | Bugs | [ ] |
 | OTW-14 | An aborted state rebase can wedge the push until a human intervenes | P3 | S | Bugs | [ ] |
+| OTW-15 | Reminders ride a cloud cron that fires ~11% of its schedule | P0 | M | Bugs | [x] |
 | OTW-16 | One run fans out a burst of near-identical alerts | P1 | S | Bugs | [x] |
 | OTW-17 | A merged sale message mixing new and moved openings reads oddly | P3 | S | UX & design | [ ] |
 
@@ -237,6 +238,85 @@ a state-file merge driver that unions `alerts` keys and takes the newer
 
 **Done when:** a conflicting state rebase resolves itself within one firing
 without a human, or fails in a way that names itself in an alert.
+
+### OTW-15 · Reminders ride a cloud cron that fires ~11% of its schedule
+**Priority:** P0 · **Effort:** M
+**Problem:** `run()` computed reminders as `[] if args.adaptive_cadence else
+due_reminders(...)`, and the local half always passes `--adaptive-cadence` — so
+the ladder was deliberately cloud-only, keeping two writers off
+`state["reminders_sent"]`. But `.github/workflows/watch.yml` does not run on
+its `*/15` schedule: measured over the 9.6 days to 2026-09-03 it fired 100
+times where the cron implies 920 (10.9%), median gap 58 min, mean 139 min, max
+693 min (11.5 h); only 2 of 99 gaps were ≤ 20 min. `due_reminders` returns at
+most one reminder per call, so the 15-min warning was likely to be skipped
+outright and a single bad gap could span the sale opening — 2026-09-09 09:00,
+six days out when this was found. Second defect in the same path:
+`render_reminder` built its countdown from the offset *label*, so a reminder
+delivered late announced "Sale opens in 2 hours" with minutes left.
+**Fix:** Invert ownership instead of trying to make the cron reliable. The
+local half owns the ladder (launchd fires every 15 min — the resolution a
+15-min warning needs) and passes no grace. `due_reminders` gains
+`grace_minutes`: it reports only a reminder whose window opened at least that
+long ago, which makes a caller a *failover* rather than a second owner. The
+workflow passes `--reminder-grace-minutes 25`, comfortably above the local
+firing interval, so the cloud sends only what the Mac missed. `notify._countdown`
+renders the real remaining time (floored, so it never promises time that is
+gone, with the leftover minutes spelled out below a day), falling back to the
+offset label when `now` is unknown.
+**Three defects the review caught in that fix:** (1) a flat grace swallows a rung
+narrower than itself — at grace 25 the 15-min warning became eligible at
+`dt + 10 min`, past the opening, where the 'open' branch takes over, so the most
+time-critical rung had *no* cloud failover at all. Handing the failover the
+second half of every window (round 2) restored reachability but broke the
+ordering the grace exists for: half of a 15-min window is 7.5 min, ahead of the
+owner's worst-case first firing at 15 min, so the cloud could beat the Mac to
+the rung it was only meant to cover for. `_failover_eligible_at` now floors the
+wait at the local firing interval and caps it at the rung's own width, which
+settles every rung by construction — rungs wider than the interval keep the
+whole grace, and the 15-min rung, exactly one interval wide with no slack to
+share, is the owner's alone with the 'open' ping as its failover cover. The
+tests read all three production numbers (offsets from `config.toml`, grace from
+`watch.yml`, interval from the launchd plist) and assert the ordering for
+offsets nobody has configured yet, so a new rung cannot reintroduce the race.
+(2) Grace is temporal separation, not exclusion: `scripts/local-check.sh` ran
+the watcher *before* pulling, so a Mac waking from sleep could not see a
+reminder the cloud had sent and would re-send it — or, having marked a different
+offset, conflict on the rebase and leave its commit unpushed (OTW-14's wedge).
+The script now pulls before the run as well as after. (3) The ladder was worded
+from the `now` captured before the Pathé/news/Cinesa block, which can burn
+minutes on retries — a run starting at T-14 and reaching the ladder at T+1 would
+send the 15-min warning after the sale had opened. The ladder re-reads the
+clock; every other `now` stays the run-start reading so a single run's
+bookkeeping still agrees with itself.
+**Trap found while implementing:** the cadence guard's `return 0` — taken when
+Pathé is fresh and Cinesa is off, and `config.toml` has `cinesa.enabled =
+false` — sat *before* the reminder block, so the local half would have kept
+swallowing the ladder on most firings. The check block is now guarded by that
+same condition rather than returning, preserving the zero-network no-op while
+letting control reach the reminders.
+**Done when:** the local half sends reminders on a firing where the adaptive
+guard skips Pathé and Cinesa is off; a grace larger than the elapsed time
+suppresses a reminder for a failover caller and releases it once that time has
+passed; no configured offset lets the failover act before the owner's worst-case
+first firing, and none is left with no failover cover at all; grace never widens
+the 'open' ping's 6 h cutoff, which stays anchored to the sale time; a reminder
+reports the time actually left when it is actually sent; and the local half sees
+the cloud's state before deciding what to send.
+**Done (2026-09-04):** all of the above, with regression tests in
+`tests/test_state.py` (grace semantics, including grace 0 ≡ the old call, the
+owner-first ordering read from production, and the same ordering as a property
+of the formula), `tests/test_notify.py` (countdown granularity and the
+late-reminder wording) and `tests/test_main.py` (a `run()` firing that the
+cadence guard used to return out of, and a slow run whose ladder must use the
+clock it finished on). Verified by dry-run against the real `config.toml`: a
+fresh Pathé check skips the network and still fires the reminder that is due,
+worded from the actual remaining time.
+**Residual risk:** the cloud can still duplicate a reminder the local half sent
+but has not yet pushed — the window is the local run's own duration plus its
+push, and the 25-min grace covers all but a pathological case. A cloud send
+whose *own* push fails is likewise invisible to the Mac. Neither is worth more
+machinery than the two-sided pull; a state-file merge driver (OTW-14) would
+close the remainder.
 
 ## 3. Features
 

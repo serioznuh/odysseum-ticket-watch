@@ -3,8 +3,9 @@
 Telegram watcher that alerts (in advance) when tickets for *Dune : Troisième partie*
 go on sale at Pathé Odysseum (Montpellier, IMAX 70 mm), then counts down to the
 opening. Single user: the repo owner. Runs as a hybrid: local launchd job on the
-owner's Mac (full Pathé + news check) + GitHub Actions every 15 min (reminders +
-supervision). It never buys tickets.
+owner's Mac (full Pathé + news check, and it owns the reminder ladder) + GitHub
+Actions every 15 min (supervision + reminder failover for a sleeping Mac). It
+never buys tickets.
 
 Stack: Python 3.9+ stdlib + `httpx`, no framework. Package `watcher/` (entry:
 `python -m watcher`), config in `config.toml`, dedup/reminder state in
@@ -13,7 +14,7 @@ Stack: Python 3.9+ stdlib + `httpx`, no framework. Package `watcher/` (entry:
 ## Commands
 
 - Lint: `.venv/bin/ruff check .`
-- Tests: `.venv/bin/python -m pytest -q` (currently 149 passing)
+- Tests: `.venv/bin/python -m pytest -q` (currently 166 passing)
 - Manual run: `source .env && .venv/bin/python -m watcher --mode check --dry-run`
 - Telegram smoke test: `source .env && .venv/bin/python -m watcher --test-telegram`
 - Secrets are env-only: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — locally in a
@@ -33,9 +34,12 @@ Core facts agents need before editing:
   and never calls Pathé (a manual `check` dispatch would, and gets 403'd).
 - Both halves **commit `state/state.json` to `main`** (`[skip ci]`). Always
   `git pull --rebase` before committing; never rewrite pushed history.
-- The adaptive-cadence guard in `scripts/local-check.sh` governs the **Pathé +
-  news half only** and must stay before its network/git activity. The Cinesa
-  half runs on every firing by design.
+- The adaptive-cadence guard governs the **Pathé + news half only** and must
+  stay before that half's network activity. The Cinesa half and the reminder
+  ladder run on every firing by design.
+- `scripts/local-check.sh` pulls **both before and after** the watcher run. The
+  pre-run pull is not redundant: without it the Mac cannot see a reminder the
+  cloud failover sent while it slept, and re-sends it or wedges the rebase.
 
 ### Cinesa half (second target)
 
@@ -101,6 +105,11 @@ Use the lowest-risk check that proves the change — details in
   `formats_seen`, `sales`) advances only once that alert was delivered.
 - Outage alerts are the one deliberate exception to send-once: the cloud pass
   repeats a `stale:` alert every 24h while blind, silently after the first.
+- The reminder failover must never become eligible for a rung before the local
+  owner's worst-case first firing — one full launchd interval after that rung's
+  window opens. `state.LOCAL_FIRING_INTERVAL_MINUTES` mirrors the plist's
+  `StartInterval` and a test pins the two together; changing either means
+  changing both.
 - News matching stays strict (sale wording required; format keywords need a
   venue mention) — loosening it needs user approval.
 - Times shown to the user are Paris time; state timestamps are Paris-local

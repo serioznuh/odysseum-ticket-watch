@@ -4,8 +4,12 @@
 # (launchd), NOT here: Akamai blocks www.pathe.fr/api from GitHub's
 # datacenter IPs (verified 2026-07-06 — 403 on every request that succeeds
 # from a residential IP). The local check pushes state/state.json back to
-# this repo; this workflow reads it to fire the 24h/2h/15min pre-sale
-# reminders, and alerts if the local check stops running (stale state).
+# this repo; this workflow reads it to alert if the local check stops running
+# (stale state), and to stand in as the *failover* for the 24h/2h/15min
+# pre-sale reminders — the local half owns those, because this cron is far too
+# unreliable to own them: measured over the 9.6 days to 2026-09-03 it ran 100
+# times of the 920 that "*/15" implies (10.9%), median gap 58 min, max 11.5 h
+# (OTW-15).
 #
 # NOTE on private repos: the 15-min pass bills ~1 GitHub Actions minute per
 # run (~2900 min/month), above the 2000-min free tier. Keep the repo public
@@ -69,7 +73,19 @@ jobs:
           if [ "${{ steps.mode.outputs.mode }}" = "test" ]; then
             python -m watcher --test-telegram
           else
-            python -m watcher --mode "${{ steps.mode.outputs.mode }}" ${{ inputs.dry_run == true && '--dry-run' || '' }}
+            # --reminder-grace-minutes makes this pass the reminder FAILOVER,
+            # never the owner: it only sends a reminder whose window opened 25+
+            # min ago, i.e. one the local half (launchd, every 15 min) already
+            # missed. 25 > 15 leaves margin for a slightly late local run.
+            # due_reminders floors that wait at the local firing interval, so
+            # the failover can never reach a rung before the Mac's worst-case
+            # first firing; the 15-min warning is only one interval wide, so it
+            # stays the Mac's alone and the "sale is open" ping is what covers a
+            # Mac asleep through it (OTW-15). Changing this number is covered by
+            # a test against config.toml's offsets and the launchd plist.
+            # It applies to check mode too — reminders are computed in both
+            # modes, and a manual dispatch from here is still the cloud.
+            python -m watcher --mode "${{ steps.mode.outputs.mode }}" --reminder-grace-minutes 25 ${{ inputs.dry_run == true && '--dry-run' || '' }}
           fi
 
       - name: Persist state
