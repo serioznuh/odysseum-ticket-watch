@@ -21,14 +21,21 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Local half** — launchd agent `com.odysseum.ticket-watch` in the
   `~/.ticket-watch` clone fires `scripts/local-check.sh` every 15 min. An
   adaptive-cadence guard decides if a full Pathé + news check is due (≈4 h
-  baseline, tightening to every firing around the announced opening). The
-  **Cinesa check runs on every firing** — one small call, not bot-gated. Runs
-  from a residential IP: Akamai blocks Pathé from datacenter IPs, and
-  Cloudflare challenges Cinesa from them.
-- **Cloud half** — `.github/workflows/watch.yml` cron `*/15`: reminder ladder +
-  supervision only, reading shared state; the scheduled pass never calls Pathé
-  (a manual `check` dispatch would, but is 403'd from datacenter IPs). It never
-  calls Cinesa either.
+  baseline, tightening to every firing around the announced opening); it gates
+  neither the **Cinesa check** — one small call, not bot-gated — nor the
+  **reminder ladder**, both of which run on every firing. This half *owns* the
+  ladder: 15-min firings are the resolution a 15-min warning needs. Runs from a
+  residential IP: Akamai blocks Pathé from datacenter IPs, and Cloudflare
+  challenges Cinesa from them.
+- **Cloud half** — `.github/workflows/watch.yml` cron `*/15`: supervision, plus
+  reminders as a **failover** rather than as their owner. It passes
+  `--reminder-grace-minutes 25` (> the local 15-min interval), so it only sends
+  a reminder the Mac demonstrably missed — that, not a skip, is what keeps two
+  writers off `reminders_sent`. Measured to 2026-09-03 this cron fired 10.9% of
+  its schedule (median gap 58 min, max 11.5 h), which is why the ladder is no
+  longer cloud-owned (OTW-15). The scheduled pass never calls Pathé (a manual
+  `check` dispatch would, but is 403'd from datacenter IPs). It never calls
+  Cinesa either.
 - **Shared state** — `state/state.json`, committed to `main` by both halves
   (`[skip ci]`); serves as dedup memory and reminder bookkeeping. The Cinesa
   half writes only on real change, so the 15-min cadence causes no commit churn.

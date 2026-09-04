@@ -42,8 +42,8 @@ datacenter IPs (verified: 403 from Actions, 200 from a home IP, same code):
 
 | Where | What | Why |
 |---|---|---|
-| your Mac — launchd, adaptive cadence | full Pathé + news check; pushes `state/state.json` | needs a residential IP |
-| GitHub Actions — every 15 min | reminder ladder + supervision, reading the shared state | needs 24/7 uptime; no Pathé access required |
+| your Mac — launchd, every 15 min | Pathé + news check (adaptive cadence); **owns the reminder ladder**; pushes `state/state.json` | needs a residential IP |
+| GitHub Actions — cron `*/15`, ~11% reliable | supervision + reminder **failover** (25 min grace), reading the shared state | covers a sleeping Mac; no Pathé access required |
 
 Not every 403 is a block: the showtimes endpoint serves only `isMovie` films, so
 event listings (the 70 mm ones) always answer `"No movie allowed !"`, and their

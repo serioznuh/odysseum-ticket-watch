@@ -27,6 +27,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-12 | `reminders_cover` can over-promise on two same-pass events | P3 | S | Bugs | [ ] |
 | OTW-13 | A persistent per-listing Pathé failure is reported as healthy | P2 | S | Bugs | [ ] |
 | OTW-14 | An aborted state rebase can wedge the push until a human intervenes | P3 | S | Bugs | [ ] |
+| OTW-15 | Reminders ride a cloud cron that fires ~11% of its schedule | P0 | M | Bugs | [x] |
 
 ## 1. Critical — security & breakage
 
@@ -188,6 +189,49 @@ a state-file merge driver that unions `alerts` keys and takes the newer
 
 **Done when:** a conflicting state rebase resolves itself within one firing
 without a human, or fails in a way that names itself in an alert.
+
+### OTW-15 · Reminders ride a cloud cron that fires ~11% of its schedule
+**Priority:** P0 · **Effort:** M
+**Problem:** `run()` computed reminders as `[] if args.adaptive_cadence else
+due_reminders(...)`, and the local half always passes `--adaptive-cadence` — so
+the ladder was deliberately cloud-only, keeping two writers off
+`state["reminders_sent"]`. But `.github/workflows/watch.yml` does not run on
+its `*/15` schedule: measured over the 9.6 days to 2026-09-03 it fired 100
+times where the cron implies 920 (10.9%), median gap 58 min, mean 139 min, max
+693 min (11.5 h); only 2 of 99 gaps were ≤ 20 min. `due_reminders` returns at
+most one reminder per call, so the 15-min warning was likely to be skipped
+outright and a single bad gap could span the sale opening — 2026-09-09 09:00,
+six days out when this was found. Second defect in the same path:
+`render_reminder` built its countdown from the offset *label*, so a reminder
+delivered late announced "Sale opens in 2 hours" with minutes left.
+**Fix:** Invert ownership instead of trying to make the cron reliable. The
+local half owns the ladder (launchd fires every 15 min — the resolution a
+15-min warning needs) and passes no grace. `due_reminders` gains
+`grace_minutes`: it reports only a reminder whose window opened at least that
+long ago, which makes a caller a *failover* rather than a second owner. The
+workflow passes `--reminder-grace-minutes 25`, comfortably above the local
+firing interval, so the cloud sends only what the Mac missed — that, not the
+skip, is what now prevents the two-writer race. `notify._countdown` renders the
+real remaining time (floored, so it never promises time that is gone), falling
+back to the offset label when `now` is unknown.
+**Trap found while implementing:** the cadence guard's `return 0` — taken when
+Pathé is fresh and Cinesa is off, and `config.toml` has `cinesa.enabled =
+false` — sat *before* the reminder block, so the local half would have kept
+swallowing the ladder on most firings. The check block is now guarded by that
+same condition rather than returning, preserving the zero-network no-op while
+letting control reach the reminders.
+**Done when:** the local half sends reminders on a firing where the adaptive
+guard skips Pathé and Cinesa is off; a grace larger than the elapsed time
+suppresses a reminder for a failover caller and releases it once that time has
+passed; grace never widens the 'open' ping's 6 h cutoff, which stays anchored
+to the sale time; and a late reminder reports the time actually left.
+**Done (2026-09-04):** all of the above, with regression tests in
+`tests/test_state.py` (grace semantics, including grace 0 ≡ the old call),
+`tests/test_notify.py` (countdown granularity and the late-reminder wording)
+and `tests/test_main.py` (a `run()` firing that the cadence guard used to
+return out of). Verified by dry-run against the real `config.toml`: a fresh
+Pathé check skips the network and still fires the 2 h reminder, worded from the
+actual remaining time.
 
 ## 3. Features
 
