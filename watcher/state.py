@@ -222,11 +222,28 @@ def update_from_cinesa(
         cin["last_change"] = now.isoformat()
 
 
-def due_reminders(state: dict, offsets_minutes: list[int], now: datetime) -> list[dict]:
+def due_reminders(
+    state: dict,
+    offsets_minutes: list[int],
+    now: datetime,
+    grace_minutes: float = 0.0,
+) -> list[dict]:
     """Return at most one due reminder: the most imminent unsent offset, or the
     'open' ping once the sale time has passed (within a 6h grace window).
 
     Reminders stop entirely once tickets are known to be available.
+
+    `grace_minutes` makes the caller a *failover* instead of the ladder's owner:
+    it only reports a reminder whose window opened at least that long ago. The
+    local half (launchd, every 15 min) passes 0 and owns the ladder; the cloud
+    pass passes a grace longer than that firing interval, so it only steps in
+    for a reminder the local half demonstrably did not send in time. That is
+    what removes the two-writer race on `reminders_sent` which used to make
+    reminders cloud-only — see OTW-15.
+
+    Grace delays *eligibility* only. The 6h cutoff on the 'open' ping stays
+    anchored to the sale time itself, so a failover grace can never shorten how
+    late that ping may still be sent.
     """
     if state.get("tickets_available"):
         return []
@@ -236,9 +253,10 @@ def due_reminders(state: dict, offsets_minutes: list[int], now: datetime) -> lis
         return []
     dt = detect.as_aware(dt)
     sent = set(state.get("reminders_sent", {}).get(iso, []))
+    grace = timedelta(minutes=max(0.0, grace_minutes))
 
     if now >= dt:
-        if "open" not in sent and (now - dt) <= timedelta(hours=6):
+        if "open" not in sent and now >= dt + grace and (now - dt) <= timedelta(hours=6):
             return [{"offset": "open", "target": iso}]
         return []
 
@@ -247,7 +265,7 @@ def due_reminders(state: dict, offsets_minutes: list[int], now: datetime) -> lis
     active = [
         o
         for o in sorted(offsets_minutes)
-        if now >= dt - timedelta(minutes=o) and str(o) not in sent
+        if now >= dt - timedelta(minutes=o) + grace and str(o) not in sent
     ]
     if active:
         return [{"offset": min(active), "target": iso}]

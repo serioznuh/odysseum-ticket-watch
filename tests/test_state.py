@@ -187,6 +187,70 @@ def test_open_ping_after_target_once_with_grace():
     assert due_reminders(st2, OFFSETS, NOW) == []
 
 
+# --------------------------------------------------- reminder failover (OTW-15)
+# `grace_minutes` is what lets the cloud pass be a failover rather than a second
+# owner of the ladder: it only reports a reminder the local half already missed.
+
+def test_grace_zero_matches_the_no_grace_call():
+    """The local half owns the ladder and passes no grace — that path must stay
+    byte-for-byte the behaviour the ladder had before OTW-15."""
+    for delta in (timedelta(hours=23), timedelta(minutes=90), timedelta(minutes=10),
+                  timedelta(hours=-1), timedelta(hours=-7)):
+        st = fresh_state()
+        st["sale_target"] = iso_in(delta)
+        assert due_reminders(st, OFFSETS, NOW, 0.0) == due_reminders(st, OFFSETS, NOW)
+
+
+def test_grace_holds_a_freshly_opened_window_back():
+    st = fresh_state()
+    target = iso_in(timedelta(minutes=118))  # the 2h window opened 2 min ago
+    st["sale_target"] = target
+    mark_reminder(st, target, 1440, OFFSETS)  # the owner sent the 24h one yesterday
+
+    # The owner fires as soon as the window opens...
+    assert [d["offset"] for d in due_reminders(st, OFFSETS, NOW, 0)] == [120]
+    # ...the failover stays quiet until its grace has elapsed.
+    assert due_reminders(st, OFFSETS, NOW, 25) == []
+    late = NOW + timedelta(minutes=23)  # window opened 25 min ago; nobody sent it
+    assert [d["offset"] for d in due_reminders(st, OFFSETS, late, 25)] == [120]
+
+
+def test_grace_falls_back_to_an_older_offset_the_owner_never_sent():
+    """Grace narrows what the failover may send, so the most imminent offset can
+    be held back while an older unsent one is not. Sending that older reminder
+    is right: the Mac slept through it, so the user never got it — and its
+    wording is time-aware, so it does not misstate the countdown."""
+    st = fresh_state()
+    st["sale_target"] = iso_in(timedelta(minutes=118))  # 24h reminder never sent
+    assert [d["offset"] for d in due_reminders(st, OFFSETS, NOW, 25)] == [1440]
+
+
+def test_grace_never_widens_the_open_pings_six_hour_cutoff():
+    """Grace delays eligibility; it must not push the 'open' ping's absolute
+    deadline out, or a failover could shout GO long after the sale opened."""
+    st = fresh_state()
+    st["sale_target"] = iso_in(timedelta(hours=-1))
+    assert due_reminders(st, OFFSETS, NOW, 25) == [{"offset": "open", "target": st["sale_target"]}]
+
+    just_opened = fresh_state()
+    just_opened["sale_target"] = iso_in(timedelta(minutes=-10))
+    assert due_reminders(just_opened, OFFSETS, NOW, 25) == []   # owner's turn, not ours
+
+    # 6h12m past opening: still shut at grace 0, and must stay shut at grace 25.
+    # Subtracting the grace from the age instead of the eligibility time would
+    # read this as 5h47m and re-open the window.
+    stale = fresh_state()
+    stale["sale_target"] = iso_in(timedelta(hours=-6, minutes=-12))
+    assert due_reminders(stale, OFFSETS, NOW, 0) == []
+    assert due_reminders(stale, OFFSETS, NOW, 25) == []
+
+
+def test_grace_ignores_a_negative_value():
+    st = fresh_state()
+    st["sale_target"] = iso_in(timedelta(minutes=10))
+    assert due_reminders(st, OFFSETS, NOW, -60) == due_reminders(st, OFFSETS, NOW)
+
+
 class CadenceCfg:
     cadence_baseline_hours = 4.0
     cadence_within_week_hours = 2.0
