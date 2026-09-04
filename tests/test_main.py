@@ -250,7 +250,13 @@ class PatheCheckRunner:
             return result
 
         self.monkeypatch.setattr(pathe, "fetch_snapshot", fake_fetch)
-        self.monkeypatch.setattr(notify, "send_telegram", lambda *a, **kw: delivered)
+        self.sent = []
+
+        def fake_send(cfg, text, **kw):
+            self.sent.append(text)
+            return delivered
+
+        self.monkeypatch.setattr(notify, "send_telegram", fake_send)
         assert (
             cli.run(
                 [
@@ -285,7 +291,7 @@ def test_pathe_outage_stops_rewriting_state_once_capped(tmp_path, monkeypatch):
 def test_failed_pathe_one_shot_alerts_are_retried_on_the_next_run(
     tmp_path, monkeypatch
 ):
-    """One-shot baselines move only after NEW_LISTING/TICKETS_AVAILABLE delivery."""
+    """Every alert baseline moves only once the alert it gates was delivered."""
     runner = PatheCheckRunner(tmp_path, monkeypatch)
     sale = "2026-11-05T08:00:00+01:00"
     show = {
@@ -307,15 +313,22 @@ def test_failed_pathe_one_shot_alerts_are_retried_on_the_next_run(
     st = runner.run(snap, delivered=False)
     assert st["shows_seen"] == []
     assert st["formats_seen"] == {}
-    assert st["sales"] == {show["slug"]: sale}  # sale truth is deliberately ungated
-    assert st["tickets_available"] is True      # current session truth is ungated
+    # `sales` used to be recorded here regardless ("sale truth is ungated"),
+    # which armed the reminder ladder one run sooner — at the price of marking
+    # the opening known, so SALE_DATE was never raised again and the single
+    # alert this watcher exists for was lost to one failed send.
+    assert st["sales"] == {}
+    assert st["tickets_available"] is True  # current session truth is still ungated
 
     st = runner.run(snap, delivered=True)
     assert st["shows_seen"] == [show["slug"]]
     assert st["formats_seen"] == {show["slug"]: ["imax70"]}
+    assert st["sales"] == {show["slug"]: sale}
+    assert st["sale_target"] == sale  # the ladder is armed, one run later
     assert set(st["alerts"]) == {
         f"new_show:{show['slug']}",
         f"tickets:{show['slug']}:imax70",
+        f"sale:{show['slug']}:{sale}",
     }
 
 
@@ -379,3 +392,89 @@ def test_recorded_cause_drops_the_failing_url():
     assert f"HTTP {a[1]}" == f"HTTP {b[1]}" == "HTTP 403"
     # And the stored short form still yields its status when re-read.
     assert cli.summarize_pathe_error("HTTP 403")[1] == 403
+
+
+# --------------------------------------------------------------- merged delivery
+
+DUPLICATE_SALE = "2026-11-05T08:00:00+01:00"
+
+
+def two_listings_one_opening() -> Snapshot:
+    """What produced the 2026-09-03 burst: two listings, one opening time."""
+    return Snapshot(
+        matched_shows=[
+            {
+                "slug": "dune-troisieme-partie",
+                "title": "Dune : Troisième partie",
+                "salesOpeningDatetime": DUPLICATE_SALE,
+                "isMovie": True,
+            },
+            {
+                "slug": "dune-troisieme-partie-projection-imax-70mm",
+                "title": "Dune - Troisième partie : Projection IMAX 70mm",
+                "salesOpeningDatetime": DUPLICATE_SALE,
+                "isMovie": False,
+            },
+        ]
+    )
+
+
+def test_one_opening_on_two_listings_sends_one_message_and_marks_both_keys(
+    tmp_path, monkeypatch
+):
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+
+    state = runner.run(two_listings_one_opening(), delivered=True)
+
+    sale_keys = [k for k in state["alerts"] if k.startswith("sale:")]
+    assert len(sale_keys) == 2  # dedup memory unchanged: still one key per listing
+    # …but the user's phone buzzed once for the opening, not twice.
+    openings = [t for t in runner.sent if "Sale opens" in t]
+    assert len(openings) == 1
+    assert "IMAX 70 mm (1.43:1), Standard / other" in openings[0]
+
+
+def test_a_failed_merged_send_marks_no_key_and_retries_the_whole_group(
+    tmp_path, monkeypatch
+):
+    """Half a group marked sent would leave the other half alone forever."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+
+    state = runner.run(two_listings_one_opening(), delivered=False)
+    assert [k for k in state["alerts"] if k.startswith("sale:")] == []
+
+    state = runner.run(two_listings_one_opening(), delivered=True)
+    assert len([k for k in state["alerts"] if k.startswith("sale:")]) == 2
+    assert len([t for t in runner.sent if "Sale opens" in t]) == 1
+
+
+def test_an_already_announced_listing_does_not_rejoin_the_group(
+    tmp_path, monkeypatch
+):
+    """Merging runs after the already-sent filter, so a second listing
+    appearing later is announced on its own — not alongside old news."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    first = Snapshot(matched_shows=[two_listings_one_opening().matched_shows[0]])
+
+    runner.run(first, delivered=True)
+    was = json.loads(runner.state.read_text())["alerts"]
+
+    state = runner.run(two_listings_one_opening(), delivered=True)
+
+    # The first listing's alert keeps its original timestamp — not re-sent.
+    key = "sale:dune-troisieme-partie:" + DUPLICATE_SALE
+    assert state["alerts"][key] == was[key]
+    openings = [t for t in runner.sent if "Sale opens" in t]
+    assert len(openings) == 1
+    assert "IMAX 70 mm (1.43:1) ·" in openings[0]  # only the new listing
+
+
+def test_a_listing_returned_twice_is_announced_once(tmp_path, monkeypatch):
+    """A catalogue that repeats a slug must not repeat it inside a message."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    show = two_listings_one_opening().matched_shows[1]
+
+    runner.run(Snapshot(matched_shows=[show, dict(show)]), delivered=True)
+
+    assert len([t for t in runner.sent if "Sale opens" in t]) == 1
+    assert len([t for t in runner.sent if "New listing" in t]) == 1

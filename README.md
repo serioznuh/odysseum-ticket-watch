@@ -23,10 +23,11 @@ Barcelona — see [Cinesa target](#cinesa-target)):
 - 📉 **IMAX disappeared** (confirmed over two checks) / 📈 **IMAX is back**
 
 Every alert names its **film and cinema** first, so a second watch target is
-never mistaken for this one, plus the source URL and detected format. Findings
-are sent **once**, deduplicated forever via `state/state.json` — except the
-outage reminder, which repeats daily by design. News leads, heartbeats,
-recoveries and "still blind" repeats are **silent** (`alerts.silent_kinds`).
+never mistaken for this one, plus its source URL and format. Findings are sent
+**once**, deduplicated forever via `state/state.json` — bar the outage
+reminder, daily by design. Same-run findings that are one piece of news share
+**one message**. News leads, heartbeats, recoveries and "still blind" repeats
+are **silent** (`alerts.silent_kinds`).
 
 ## How it works
 
@@ -195,7 +196,7 @@ Secrets are env-only (never in config.toml): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHA
 
 ```
 🎟️ Sale opens Wed 9 Sep, 09:00
-Dune : Troisième partie · IMAX 70 mm (1.43:1) · Pathé Odysseum
+Dune : Troisième partie · IMAX 70 mm (1.43:1), Standard / other · Pathé Odysseum
 Reminders set: 24 h, 2 h and 15 min before.
 Opening time is national — seats can go in minutes.
 🔗 https://www.pathe.fr/evenements/dune-troisieme-partie-projection-imax-70mm-55289

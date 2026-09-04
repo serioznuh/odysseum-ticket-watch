@@ -126,6 +126,7 @@ def update_from_snapshot(
     cfg: Any,
     now: datetime,
     advance_one_shot: bool = True,
+    advance_sales: bool = True,
 ) -> None:
     """Record the Pathé snapshot as the new baseline (call after alerting).
 
@@ -133,18 +134,27 @@ def update_from_snapshot(
     and `formats_seen`) while still recording sales and current ticket
     availability: the caller passes it when a NEW_LISTING or TICKETS_AVAILABLE
     finding was generated but not delivered, so the next run raises it again.
+
+    `advance_sales=False` does the same for `sales`, which is the baseline
+    behind SALE_DATE: recording an opening is what makes it "known", so doing
+    that after a failed send retired the sale alert — the watcher's whole
+    point — permanently. It is a separate flag because the two baselines fail
+    independently, and holding `sales` back also holds back `sale_target` and
+    the reminder ladder until the next run.
     """
     if not advance_one_shot:
         log.info(
             "Pathé: one-shot alert not delivered — keeping the previous listing/format baselines"
         )
+    if not advance_sales:
+        log.info("Pathé: sale alert not delivered — keeping the previous sale baseline")
     for show in snap.matched_shows:
         slug = show.get("slug", "")
         if not slug:
             continue
         if advance_one_shot and slug not in state["shows_seen"]:
             state["shows_seen"].append(slug)
-        if show.get("salesOpeningDatetime"):
+        if advance_sales and show.get("salesOpeningDatetime"):
             state["sales"][slug] = show["salesOpeningDatetime"]
 
         days = snap.showtimes.get(slug) or {}

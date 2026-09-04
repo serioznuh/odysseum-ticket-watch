@@ -180,6 +180,11 @@ class Finding:
     lines: list[str]
     url: str
     sale_datetime: str | None = None  # ISO; set only for Pathé API dates (drives reminders)
+    # What tells this finding apart from same-run siblings carrying the same
+    # news: the format class for a Pathé listing, the date for a Cinesa day.
+    # `coalesce` reads it when it merges them into one message. None means the
+    # finding always stands on its own.
+    merge_item: str | None = None
 
 
 def summarize_sessions(show: dict, days: dict[str, list[dict]]) -> dict:
@@ -269,9 +274,10 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                                 else "no sale date published yet."
                             )
                         ),
-                        "Dedicated listings get their own opening — now watching it.",
+                        "Dedicated listings get their own opening — now on the watch list.",
                     ],
                     url=url,
+                    merge_item=listing_fmt,
                 )
             )
 
@@ -323,6 +329,7 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                     lines=lines,
                     url=url,
                     sale_datetime=sale_iso,
+                    merge_item=listing_fmt,
                 )
             )
 
@@ -366,6 +373,7 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                         title=f"BOOK NOW — {FORMAT_LABELS[best]} is live",
                         lines=lines,
                         url=url,
+                        merge_item=best,
                     )
                 )
         elif entry:
@@ -421,10 +429,10 @@ def analyze_cinesa(snap: CinesaSnapshot, state: dict, cfg: Any, now: datetime) -
                     title=f"Your date is open — {fmt_day(target)}, IMAX",
                     lines=[
                         cinesa_line(cfg),
-                        f"{target} is bookable with IMAX in that day's schedule.",
-                        f"👉 {cfg.cinesa_page_url}",
+                        f"Bookable with IMAX: {target}",
                     ],
                     url=cfg.cinesa_page_url,
+                    merge_item=target,
                 )
             )
         else:
@@ -437,10 +445,11 @@ def analyze_cinesa(snap: CinesaSnapshot, state: dict, cfg: Any, now: datetime) -
                     title=f"{fmt_day(target)} opened — but no IMAX",
                     lines=[
                         cinesa_line(cfg),
-                        f"{target} is bookable, with no IMAX session on it.",
-                        "You'll get a loud alert if IMAX appears for it.",
+                        f"Bookable, no IMAX session on it: {target}",
+                        "You'll get a loud alert if IMAX appears.",
                     ],
                     url=cfg.cinesa_page_url,
+                    merge_item=target,
                 )
             )
 
