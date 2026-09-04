@@ -10,7 +10,8 @@ A single-user Telegram watcher covering **two independent targets**:
    deduplicated alerts: sale-date announcements, new listings, bookable-now, a
    24 h / 2 h / 15 min reminder ladder, strictly-filtered news leads, and
    supervision alerts (failure streak, stale state, weekly heartbeat). Every
-   message names its film and cinema on the first line.
+   message names its film and cinema on the first line, and findings that are
+   one piece of news share one message rather than arriving as a burst.
 2. *La odisea* (Nolan) **in IMAX at Cinesa Diagonal Mar, Barcelona** — watches
    the booking calendar for specific wanted dates and for IMAX leaving or
    returning. The film is already showing; what is watched is the schedule
@@ -45,8 +46,9 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Shared state** — `state/state.json`, committed to `main` by both halves
   (`[skip ci]`); serves as dedup memory and reminder bookkeeping. The Cinesa
   half writes only on real change, so the 15-min cadence causes no commit churn.
-  Failure streaks stop changing at their alert threshold, and Pathé's one-shot
-  listing/format baselines advance only after the corresponding alert is delivered.
+  Failure streaks stop changing at their alert threshold, and every Pathé alert
+  baseline — listings, formats and `sales` — advances only after the alert it
+  gates was delivered, so one failed send cannot retire an announcement.
   `last_error` records the failure cause for the cloud pass and is rewritten
   only when the text changes, so a steady outage still writes state once.
 - **Pathé failure model** — only the catalogue calls (`/shows`,
@@ -69,7 +71,7 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Code** — Python package `watcher/` (`pathe.py` and `cinesa.py` API clients,
   `cdp.py` browser token step, `news.py`, `detect.py`, `state.py`, `notify.py`
   Telegram, `config.py`, `__main__.py` CLI); config in `config.toml`; tests in
-  `tests/` (127 passing).
+  `tests/` (166 passing).
 
 ## Cinesa specifics
 

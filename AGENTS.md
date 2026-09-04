@@ -14,7 +14,7 @@ Stack: Python 3.9+ stdlib + `httpx`, no framework. Package `watcher/` (entry:
 ## Commands
 
 - Lint: `.venv/bin/ruff check .`
-- Tests: `.venv/bin/python -m pytest -q` (currently 144 passing)
+- Tests: `.venv/bin/python -m pytest -q` (currently 166 passing)
 - Manual run: `source .env && .venv/bin/python -m watcher --mode check --dry-run`
 - Telegram smoke test: `source .env && .venv/bin/python -m watcher --test-telegram`
 - Secrets are env-only: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — locally in a
@@ -97,6 +97,12 @@ Use the lowest-risk check that proves the change — details in
   loudly — `test_config.py` enforces this.
 - Every alert names its film and cinema on the first line, so a second watch
   target can never be mistaken for this one.
+- Same-run findings that are one piece of news are merged into one message by
+  `watcher/coalesce.py`, *after* the already-sent filter. A merged message
+  marks every member key sent, or none — never a subset, which would strand
+  the rest. Analysis stays one finding per item: keys must not change.
+- A baseline that decides whether an alert is raised (`shows_seen`,
+  `formats_seen`, `sales`) advances only once that alert was delivered.
 - Outage alerts are the one deliberate exception to send-once: the cloud pass
   repeats a `stale:` alert every 24h while blind, silently after the first.
 - The reminder failover must never become eligible for a rung before the local
