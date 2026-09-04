@@ -210,10 +210,23 @@ local half owns the ladder (launchd fires every 15 min — the resolution a
 `grace_minutes`: it reports only a reminder whose window opened at least that
 long ago, which makes a caller a *failover* rather than a second owner. The
 workflow passes `--reminder-grace-minutes 25`, comfortably above the local
-firing interval, so the cloud sends only what the Mac missed — that, not the
-skip, is what now prevents the two-writer race. `notify._countdown` renders the
-real remaining time (floored, so it never promises time that is gone), falling
-back to the offset label when `now` is unknown.
+firing interval, so the cloud sends only what the Mac missed. `notify._countdown`
+renders the real remaining time (floored, so it never promises time that is
+gone, with the leftover minutes spelled out below a day), falling back to the
+offset label when `now` is unknown.
+**Two defects the review caught in that fix:** (1) a flat grace swallows a rung
+narrower than itself — at grace 25 the 15-min warning became eligible at
+`dt + 10 min`, past the opening, where the 'open' branch takes over, so the most
+time-critical rung had *no* cloud failover at all. `_failover_eligible_at` now
+caps the wait at half a rung's window: the owner keeps the first half, the
+failover always gets the second, and rungs wider than twice the grace (2 h,
+24 h) keep the full margin. A test reads the offsets from `config.toml` and the
+grace from `watch.yml` so either number changing re-checks the invariant.
+(2) Grace is temporal separation, not exclusion: `scripts/local-check.sh` ran
+the watcher *before* pulling, so a Mac waking from sleep could not see a
+reminder the cloud had sent and would re-send it — or, having marked a different
+offset, conflict on the rebase and leave its commit unpushed (OTW-14's wedge).
+The script now pulls before the run as well as after.
 **Trap found while implementing:** the cadence guard's `return 0` — taken when
 Pathé is fresh and Cinesa is off, and `config.toml` has `cinesa.enabled =
 false` — sat *before* the reminder block, so the local half would have kept
@@ -223,15 +236,23 @@ letting control reach the reminders.
 **Done when:** the local half sends reminders on a firing where the adaptive
 guard skips Pathé and Cinesa is off; a grace larger than the elapsed time
 suppresses a reminder for a failover caller and releases it once that time has
-passed; grace never widens the 'open' ping's 6 h cutoff, which stays anchored
-to the sale time; and a late reminder reports the time actually left.
+passed; every configured offset stays deliverable by the failover at the grace
+the workflow actually passes; grace never widens the 'open' ping's 6 h cutoff,
+which stays anchored to the sale time; a late reminder reports the time actually
+left; and the local half sees the cloud's state before deciding what to send.
 **Done (2026-09-04):** all of the above, with regression tests in
-`tests/test_state.py` (grace semantics, including grace 0 ≡ the old call),
-`tests/test_notify.py` (countdown granularity and the late-reminder wording)
-and `tests/test_main.py` (a `run()` firing that the cadence guard used to
-return out of). Verified by dry-run against the real `config.toml`: a fresh
-Pathé check skips the network and still fires the 2 h reminder, worded from the
-actual remaining time.
+`tests/test_state.py` (grace semantics, including grace 0 ≡ the old call, the
+half-window cap, and the production-config invariant), `tests/test_notify.py`
+(countdown granularity and the late-reminder wording) and `tests/test_main.py`
+(a `run()` firing that the cadence guard used to return out of). Verified by
+dry-run against the real `config.toml`: a fresh Pathé check skips the network
+and still fires the 2 h reminder, worded from the actual remaining time.
+**Residual risk:** the cloud can still duplicate a reminder the local half sent
+but has not yet pushed — the window is the local run's own duration plus its
+push, and the 25-min grace covers all but a pathological case. A cloud send
+whose *own* push fails is likewise invisible to the Mac. Neither is worth more
+machinery than the two-sided pull; a state-file merge driver (OTW-14) would
+close the remainder.
 
 ## 3. Features
 

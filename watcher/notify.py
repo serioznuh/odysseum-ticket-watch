@@ -107,8 +107,13 @@ def _countdown(target_iso: str, now: datetime | None, label: str) -> str:
     message that still says "in 2 hours" 25 minutes before the sale is a lie
     the user acts on. Falls back to the scheduled `label` when `now` is unknown.
 
-    Whole hours are rounded *down* so the phrase never claims more time than
+    Everything is rounded *down* so the phrase never claims more time than
     there is; the exact opening clock time is printed right beside it anyway.
+
+    Below a day the leftover minutes are spelled out, because the 2 h rung is
+    normally delivered at T-105…T-120 on the 15-min grid and a bare "1 hour"
+    understates it by up to 59 minutes. Above a day they are dropped: the
+    absolute date sits beside the phrase and carries that precision already.
     """
     dt = detect.parse_iso(target_iso)
     if dt is None or now is None:
@@ -118,9 +123,10 @@ def _countdown(target_iso: str, now: datetime | None, label: str) -> str:
         return "moments"
     if minutes < 60:
         return f"{minutes} minute{'s' if minutes != 1 else ''}"
-    hours = minutes // 60
+    hours, rest = divmod(minutes, 60)
     if hours < 24:
-        return f"{hours} hour{'s' if hours != 1 else ''}"
+        phrase = f"{hours} hour{'s' if hours != 1 else ''}"
+        return f"{phrase} {rest} min" if rest else phrase
     days = hours // 24
     return f"{days} day{'s' if days != 1 else ''}"
 

@@ -30,12 +30,15 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Cloud half** — `.github/workflows/watch.yml` cron `*/15`: supervision, plus
   reminders as a **failover** rather than as their owner. It passes
   `--reminder-grace-minutes 25` (> the local 15-min interval), so it only sends
-  a reminder the Mac demonstrably missed — that, not a skip, is what keeps two
-  writers off `reminders_sent`. Measured to 2026-09-03 this cron fired 10.9% of
-  its schedule (median gap 58 min, max 11.5 h), which is why the ladder is no
-  longer cloud-owned (OTW-15). The scheduled pass never calls Pathé (a manual
-  `check` dispatch would, but is 403'd from datacenter IPs). It never calls
-  Cinesa either.
+  a reminder the Mac demonstrably missed; the wait is capped at half a rung's
+  window, so the 15-min warning keeps a failover instead of falling off the
+  ladder. Two writers stay off `reminders_sent` because of that grace *and*
+  because `local-check.sh` pulls before it runs — a Mac waking from sleep sees
+  what the cloud sent before deciding. Measured to 2026-09-03 this cron fired
+  10.9% of its schedule (median gap 58 min, max 11.5 h), which is why the
+  ladder is no longer cloud-owned (OTW-15). The scheduled pass never calls
+  Pathé (a manual `check` dispatch would, but is 403'd from datacenter IPs).
+  It never calls Cinesa either.
 - **Shared state** — `state/state.json`, committed to `main` by both halves
   (`[skip ci]`); serves as dedup memory and reminder bookkeeping. The Cinesa
   half writes only on real change, so the 15-min cadence causes no commit churn.

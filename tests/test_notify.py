@@ -97,10 +97,16 @@ def test_countdown_granularity():
     assert left(minutes=1) == "1 minute"
     assert left(minutes=59) == "59 minutes"
     assert left(minutes=60) == "1 hour"
+    # Below a day the leftover minutes are spelled out: the 2 h rung lands at
+    # T-105…T-120 on the 15-min grid, and a bare "1 hour" understates it badly.
+    assert left(minutes=105) == "1 hour 45 min"
     # Floored, never rounded up: the phrase must not promise time that is gone.
-    assert left(minutes=119) == "1 hour"
+    assert left(minutes=119) == "1 hour 59 min"
     assert left(hours=23) == "23 hours"
+    # Above a day the remainder is dropped — the absolute date is printed beside
+    # the phrase and already carries that precision.
     assert left(hours=25) == "1 day"
+    assert left(hours=47) == "1 day"
     assert left(days=6) == "6 days"
     # Past the opening a numeric offset must not read "0 minutes" or negative.
     assert left(minutes=-5) == "moments"

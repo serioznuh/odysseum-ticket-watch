@@ -7,8 +7,9 @@
 # this repo; this workflow reads it to alert if the local check stops running
 # (stale state), and to stand in as the *failover* for the 24h/2h/15min
 # pre-sale reminders — the local half owns those, because this cron is far too
-# unreliable to (measured over the 9.6 days to 2026-09-03: 100 runs of the 920
-# */15 implies, 10.9%, median gap 58 min, max 11.5 h — OTW-15).
+# unreliable to own them: measured over the 9.6 days to 2026-09-03 it ran 100
+# times of the 920 that "*/15" implies (10.9%), median gap 58 min, max 11.5 h
+# (OTW-15).
 #
 # NOTE on private repos: the 15-min pass bills ~1 GitHub Actions minute per
 # run (~2900 min/month), above the 2000-min free tier. Keep the repo public
@@ -76,6 +77,10 @@ jobs:
             # never the owner: it only sends a reminder whose window opened 25+
             # min ago, i.e. one the local half (launchd, every 15 min) already
             # missed. 25 > 15 leaves margin for a slightly late local run.
+            # due_reminders caps that wait at half a rung's window, so the
+            # 15-min warning — whose window is only 15 min wide — still has a
+            # failover instead of being skipped outright (OTW-15); changing
+            # this number is covered by a test against config.toml's offsets.
             # It applies to check mode too — reminders are computed in both
             # modes, and a manual dispatch from here is still the cloud.
             python -m watcher --mode "${{ steps.mode.outputs.mode }}" --reminder-grace-minutes 25 ${{ inputs.dry_run == true && '--dry-run' || '' }}

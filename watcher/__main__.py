@@ -589,8 +589,10 @@ def run(argv: list[str] | None = None) -> int:
     # The reminder ladder is owned by the LOCAL half: launchd fires it every
     # 15 min — the resolution a 15-min warning needs — and it runs with grace 0.
     # The cloud pass is the failover for a sleeping Mac and passes
-    # --reminder-grace-minutes, so it only sends what the local half did not,
-    # which is what keeps two writers off `reminders_sent` (OTW-15).
+    # --reminder-grace-minutes, so it only sends what the local half did not.
+    # Two things keep two writers off `reminders_sent`, and both are needed:
+    # that grace, and `scripts/local-check.sh` pulling *before* it runs — a
+    # clone that has not pulled cannot see what the failover already sent.
     # Reminders used to be cloud-only for exactly that reason, but the cron is
     # far too unreliable to own them: measured over the 9.6 days to 2026-09-03
     # the */15 workflow ran 100 times of the 920 it implies (10.9%), median gap

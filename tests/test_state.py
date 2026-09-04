@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from watcher import detect
 from watcher import state as state_mod
+from watcher.config import load_config
 from watcher.detect import Snapshot
 from watcher.state import (
     DEFAULT_STATE,
@@ -245,10 +248,70 @@ def test_grace_never_widens_the_open_pings_six_hour_cutoff():
     assert due_reminders(stale, OFFSETS, NOW, 25) == []
 
 
-def test_grace_ignores_a_negative_value():
+def test_grace_never_runs_ahead_of_the_owner_on_a_negative_value():
+    """A negative grace would make the failover *earlier* than the owner rather
+    than later — opening the 2 h rung before its window does. It clamps to 0."""
     st = fresh_state()
-    st["sale_target"] = iso_in(timedelta(minutes=10))
-    assert due_reminders(st, OFFSETS, NOW, -60) == due_reminders(st, OFFSETS, NOW)
+    target = iso_in(timedelta(minutes=130))  # the 2 h window opens in 10 min
+    st["sale_target"] = target
+    mark_reminder(st, target, 1440, OFFSETS)  # the 24 h rung is already spent
+
+    assert due_reminders(st, OFFSETS, NOW) == []  # nothing is due for the owner
+    # ...and no negative grace may drag the 2 h rung forward for the failover.
+    assert due_reminders(st, OFFSETS, NOW, -20) == []
+    assert due_reminders(st, OFFSETS, NOW, -60) == []
+
+
+def test_grace_is_capped_at_half_a_rungs_window():
+    """A flat grace wider than a rung swallows it whole: at grace 25 the 15-min
+    warning became eligible at dt+10, past the opening, where the 'open' branch
+    takes over — so the cloud could never deliver it (OTW-15 round 2). The wait
+    is capped at half the window, and rungs wider than twice the grace keep the
+    full margin."""
+    target = iso_in(timedelta(minutes=15))  # the 15-min window opens right now
+    st = fresh_state()
+    st["sale_target"] = target
+    for spent in (1440, 120):
+        mark_reminder(st, target, spent, OFFSETS)
+
+    assert [d["offset"] for d in due_reminders(st, OFFSETS, NOW, 0)] == [15]  # owner
+    assert due_reminders(st, OFFSETS, NOW + timedelta(minutes=7), 25) == []
+    late = NOW + timedelta(minutes=8)  # past the half-window cap of 7.5 min
+    assert [d["offset"] for d in due_reminders(st, OFFSETS, late, 25)] == [15]
+
+    # The 2 h rung is wide enough for the whole 25 min, so it is unaffected.
+    wide = fresh_state()
+    wide_target = iso_in(timedelta(minutes=120))
+    wide["sale_target"] = wide_target
+    mark_reminder(wide, wide_target, 1440, OFFSETS)
+    assert due_reminders(wide, OFFSETS, NOW + timedelta(minutes=24), 25) == []
+    at_grace = NOW + timedelta(minutes=25)
+    assert [d["offset"] for d in due_reminders(wide, OFFSETS, at_grace, 25)] == [120]
+
+
+def test_shipped_grace_leaves_every_configured_offset_deliverable():
+    """Production invariant, read from production: the grace the cloud pass
+    actually passes must leave every offset in config.toml reachable — at
+    least over the second half of its window — so a change to either number
+    fails here instead of silently dropping a rung's failover."""
+    root = Path(__file__).resolve().parent.parent
+    offsets = load_config(root / "config.toml").reminder_offsets_minutes
+    workflow = (root / ".github" / "workflows" / "watch.yml").read_text(encoding="utf-8")
+    match = re.search(r"--reminder-grace-minutes\s+([0-9.]+)", workflow)
+    assert match, "the cloud pass no longer passes --reminder-grace-minutes"
+    grace = float(match.group(1))
+
+    for offset in sorted(offsets):
+        target = iso_in(timedelta(minutes=offset))  # this rung's window opens now
+        st = fresh_state()
+        st["sale_target"] = target
+        for spent in (o for o in offsets if o > offset):
+            mark_reminder(st, target, spent, offsets)
+        halfway = NOW + timedelta(minutes=offset / 2)
+        assert [d["offset"] for d in due_reminders(st, offsets, halfway, grace)] == [offset], (
+            f"the {offset}-minute reminder is undeliverable by the cloud failover "
+            f"at --reminder-grace-minutes {grace:g}"
+        )
 
 
 class CadenceCfg:

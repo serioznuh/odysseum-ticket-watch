@@ -222,6 +222,20 @@ def update_from_cinesa(
         cin["last_change"] = now.isoformat()
 
 
+def _failover_eligible_at(dt: datetime, offset: int, grace_minutes: float) -> datetime:
+    """When a failover caller may send the `offset` reminder.
+
+    A rung's window is only `offset` minutes wide, so a flat grace can swallow
+    it whole: at grace 25 the 15-min warning became eligible at `dt + 10 min`,
+    past the opening, where the 'open' branch takes over — the most
+    time-critical rung had *no* cloud failover at all (OTW-15 round 2). The
+    wait is therefore capped at half the window, so the owner keeps the first
+    half of every rung and the failover always gets the second half. Rungs
+    wider than twice the grace (2 h and 24 h here) keep the full margin.
+    """
+    return dt - timedelta(minutes=offset - min(grace_minutes, offset / 2))
+
+
 def due_reminders(
     state: dict,
     offsets_minutes: list[int],
@@ -238,12 +252,15 @@ def due_reminders(
     local half (launchd, every 15 min) passes 0 and owns the ladder; the cloud
     pass passes a grace longer than that firing interval, so it only steps in
     for a reminder the local half demonstrably did not send in time. That is
-    what removes the two-writer race on `reminders_sent` which used to make
-    reminders cloud-only — see OTW-15.
+    half of what removes the two-writer race on `reminders_sent` which used to
+    make reminders cloud-only; the other half is `scripts/local-check.sh`
+    pulling before it runs, so the Mac sees the failover's sends — see OTW-15.
 
-    Grace delays *eligibility* only. The 6h cutoff on the 'open' ping stays
-    anchored to the sale time itself, so a failover grace can never shorten how
-    late that ping may still be sent.
+    Grace delays *eligibility* only, and never past the middle of the rung it
+    delays (see `_failover_eligible_at`), so every configured offset stays
+    reachable however large the grace is. The 6h cutoff on the 'open' ping
+    stays anchored to the sale time itself, so a failover grace can never
+    shorten how late that ping may still be sent.
     """
     if state.get("tickets_available"):
         return []
@@ -253,10 +270,13 @@ def due_reminders(
         return []
     dt = detect.as_aware(dt)
     sent = set(state.get("reminders_sent", {}).get(iso, []))
-    grace = timedelta(minutes=max(0.0, grace_minutes))
+    grace_minutes = max(0.0, grace_minutes)
 
     if now >= dt:
-        if "open" not in sent and now >= dt + grace and (now - dt) <= timedelta(hours=6):
+        # The 'open' ping has no window to be squeezed out of — only the 6h
+        # cutoff below — so the grace applies to it whole.
+        opens_at = dt + timedelta(minutes=grace_minutes)
+        if "open" not in sent and now >= opens_at and (now - dt) <= timedelta(hours=6):
             return [{"offset": "open", "target": iso}]
         return []
 
@@ -265,7 +285,7 @@ def due_reminders(
     active = [
         o
         for o in sorted(offsets_minutes)
-        if now >= dt - timedelta(minutes=o) + grace and str(o) not in sent
+        if now >= _failover_eligible_at(dt, o, grace_minutes) and str(o) not in sent
     ]
     if active:
         return [{"offset": min(active), "target": iso}]
