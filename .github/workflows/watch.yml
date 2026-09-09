@@ -75,12 +75,12 @@ jobs:
           else
             # --reminder-grace-minutes makes this pass the reminder FAILOVER,
             # never the owner: it only sends a reminder whose window opened 25+
-            # min ago, i.e. one the local half (launchd, every 15 min) already
-            # missed. 25 > 15 leaves margin for a slightly late local run.
+            # min ago, i.e. one the local half (launchd, every 5 min) already
+            # missed. 25 > 5 leaves margin for a slightly late local run.
             # due_reminders floors that wait at the local firing interval, so
             # the failover can never reach a rung before the Mac's worst-case
-            # first firing; the 15-min warning is only one interval wide, so it
-            # stays the Mac's alone and the "sale is open" ping is what covers a
+            # first firing; the 25-min grace exceeds the 15-min warning window,
+            # so it stays the Mac's alone and the opening-time ping covers a
             # Mac asleep through it (OTW-15). Changing this number is covered by
             # a test against config.toml's offsets and the launchd plist.
             # It applies to check mode too — reminders are computed in both

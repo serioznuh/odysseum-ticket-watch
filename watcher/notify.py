@@ -112,7 +112,7 @@ def _countdown(target_iso: str, now: datetime | None, label: str) -> str:
     there is; the exact opening clock time is printed right beside it anyway.
 
     Below a day the leftover minutes are spelled out, because the 2 h rung is
-    normally delivered at T-105…T-120 on the 15-min grid and a bare "1 hour"
+    normally delivered at T-105…T-120 on the timer grid and a bare "1 hour"
     understates it by up to 59 minutes. Above a day they are dropped: the
     absolute date sits beside the phrase and carries that precision already.
     """

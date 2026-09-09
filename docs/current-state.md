@@ -24,25 +24,25 @@ A single-user Telegram watcher covering **two independent targets**:
 ## Runtime shape
 
 - **Local half** — launchd agent `com.odysseum.ticket-watch` in the
-  `~/.ticket-watch` clone fires `scripts/local-check.sh` every 15 min. An
+  `~/.ticket-watch` clone fires `scripts/local-check.sh` every 5 min. An
   adaptive-cadence guard decides if a full Pathé + news check is due (≈4 h
   baseline, tightening to every firing around the announced opening). Pending
-  future wanted dates override this: check every existing 15-min firing until
+  future wanted dates override this: check every existing 5-min firing until
   their alerts are delivered or the dates pass. No sub-minute guarantee; sleep
   still pauses checks. It gates
   neither the **Cinesa check** — one small call, not bot-gated — nor the
   **reminder ladder**, both of which run on every firing. This half *owns* the
-  ladder: 15-min firings are the resolution a 15-min warning needs. Runs from a
+  ladder: 5-min firings give three chances inside a 15-min warning. Runs from a
   residential IP: Akamai blocks Pathé from datacenter IPs, and Cloudflare
   challenges Cinesa from them.
 - **Cloud half** — `.github/workflows/watch.yml` cron `*/15`: supervision, plus
   reminders as a **failover** rather than as their owner. It passes
-  `--reminder-grace-minutes 25` (> the local 15-min interval), so it only sends
+  `--reminder-grace-minutes 25` (> the local 5-min interval), so it only sends
   a reminder the Mac demonstrably missed; that wait is floored at the local
   firing interval, so the failover can never reach a rung before the owner's
-  worst-case first firing. The 15-min warning's window is exactly one interval
-  wide and has no slack to share, so it belongs to the Mac alone and a Mac that
-  sleeps through it is covered by the "sale is open" ping instead. Two writers
+  worst-case first firing. The cloud grace exceeds the 15-min warning window,
+  so that rung still belongs to the Mac alone; a sleeping Mac is covered by the
+  opening-time ping instead. Two writers
   stay off `reminders_sent` because of that ordering *and* because
   `local-check.sh` pulls before it runs — a Mac waking from sleep sees
   what the cloud sent before deciding. Measured to 2026-09-03 this cron fired
@@ -58,7 +58,7 @@ A single-user Telegram watcher covering **two independent targets**:
   logs now record bookable dates for future availability investigations.
 - **Shared state** — `state/state.json`, committed to `main` by both halves
   (`[skip ci]`); serves as dedup memory and reminder bookkeeping. The Cinesa
-  half writes only on real change, so the 15-min cadence causes no commit churn.
+  half writes only on real change, so the 5-min cadence causes no commit churn.
   Failure streaks stop changing at their alert threshold, and every Pathé alert
   baseline — listings, formats and `sales` — advances only after the alert it
   gates was delivered, so one failed send cannot retire an announcement.
@@ -115,8 +115,8 @@ A single-user Telegram watcher covering **two independent targets**:
   display and so no clamshell mode, meaning a closed lid is simply sleep.
 - The token is refreshed **3 h before expiry**, not at it, and a failed refresh
   falls back to the token still in hand, so one blocked attempt cannot take the
-  half down — it has ~12 firings to succeed, backed off to 30 min apart so a
-  long outage does not mean a Chrome launch every 15 min. A data-API **403**
+  half down — it has many firings to succeed, backed off to 30 min apart so a
+  long outage does not mean a Chrome launch every 5 min. A data-API **403**
   is treated as a likely network/IP rejection: the watcher tries one forced mint,
   then keeps the still-valid token and records a one-hour cooldown in the
   git-ignored credential cache if minting fails. During that window it retries

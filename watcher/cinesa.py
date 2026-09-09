@@ -64,7 +64,7 @@ TOKEN_SKEW_SECONDS = 600
 PROACTIVE_RETRY_SECONDS = 1800
 
 # A 403 from the data host is more likely to be a network/IP rejection than a
-# bad bearer token. Do not launch headed Chrome again on every 15-min firing
+# bad bearer token. Do not launch headed Chrome again on every 5-min firing
 # while that condition persists.
 NETWORK_REJECTION_COOLDOWN_SECONDS = 60 * 60
 

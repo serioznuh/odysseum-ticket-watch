@@ -262,14 +262,11 @@ def test_grace_never_runs_ahead_of_the_owner_on_a_negative_value():
     assert due_reminders(st, OFFSETS, NOW, -60) == []
 
 
-def test_a_rung_no_wider_than_the_owners_interval_gets_no_failover_turn():
-    """The 15-min warning's window is exactly as wide as the local half's firing
-    interval, so the owner's worst-case first chance at it lands on the opening
-    itself and there is no moment inside the window a failover can take without
-    possibly beating it. Round 2 gave the failover the second half of every
-    window, which put the cloud 7.5 min ahead of that worst case — the
-    two-writer race the grace exists to prevent. The rung is the owner's alone
-    now, and a sleeping Mac is covered by the 'open' ping instead."""
+def test_a_rung_no_wider_than_the_cloud_grace_gets_no_failover_turn():
+    """The 25-min cloud grace exceeds the 15-min warning window. Eligibility
+    therefore lands on the opening itself, leaving this rung to the local owner,
+    which now gets three firing opportunities. A sleeping Mac is covered by the
+    opening-time ping instead."""
     target = iso_in(timedelta(minutes=15))  # the 15-min window opens right now
     st = fresh_state()
     st["sale_target"] = target
@@ -285,7 +282,7 @@ def test_a_rung_no_wider_than_the_owners_interval_gets_no_failover_turn():
     opened = NOW + timedelta(minutes=15 + 25)
     assert [d["offset"] for d in due_reminders(st, OFFSETS, opened, 25)] == ["open"]
 
-    # The 2 h rung is wider than the interval, so it keeps the whole grace.
+    # The 2 h rung is wider than the cloud grace, so it keeps the whole grace.
     wide = fresh_state()
     wide_target = iso_in(timedelta(minutes=120))
     wide["sale_target"] = wide_target
@@ -348,7 +345,8 @@ def test_shipped_grace_keeps_the_owner_first_on_every_configured_offset():
                 f"at {blackout:g} min"
             )
 
-        if offset > interval:
+        effective_wait = min(max(grace, interval), offset)
+        if offset > effective_wait:
             # Reachable up to the last moment before the next rung takes over.
             latest = NOW + timedelta(minutes=offset - (offsets[i - 1] if i else 0))
             assert [

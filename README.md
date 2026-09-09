@@ -44,7 +44,7 @@ datacenter IPs (verified: 403 from Actions, 200 from a home IP, same code):
 
 | Where | What | Why |
 |---|---|---|
-| your Mac — launchd, every 15 min | Pathé + news check (adaptive cadence); **owns the reminder ladder**; pushes `state/state.json` | needs a residential IP |
+| your Mac — launchd, every 5 min | Pathé + news check (adaptive cadence); **owns the reminder ladder**; pushes `state/state.json` | needs a residential IP |
 | GitHub Actions — cron `*/15`, ~11% reliable | supervision + reminder **failover** (25 min grace), reading the shared state | covers a sleeping Mac; no Pathé access required |
 
 Not every 403 is a block: the showtimes endpoint serves only `isMovie` films, so
@@ -72,7 +72,7 @@ Cinesa runs Vista's Omnia/Connect platform, split across two hosts:
 | `vwc.cinesa.es/WSVistaWebClient` | open — plain `httpx`, clean JSON | every actual check |
 
 Because the data API is not bot-protected, checks are cheap and run on **every**
-15-min firing — no need to guess when Cinesa publishes. Only the token needs a
+5-min firing — no need to guess when Cinesa publishes. Only the token needs a
 browser: [watcher/cdp.py](watcher/cdp.py) drives a **real, headed** Chrome (offscreen,
 throwaway profile, ~3 s) twice a day. Headless is challenged and never settles, so
 headed is required — and no stealth tooling or challenge-solving is used: if Chrome
@@ -139,12 +139,12 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.odysseum.ticket-watc
 launchctl kickstart gui/$(id -u)/com.odysseum.ticket-watch            # run once now to test
 ```
 
-The agent fires every 15 minutes and decides whether a check is due
+The agent fires every 5 minutes and decides whether a check is due
 (**adaptive cadence**, see `[cadence]` config): roughly every 4 h normally,
 every 2 h in the last week before an announced opening, every 30 min in the
 last 48 h, every firing from 4 h before until 6 h after the opening (new
 sessions appear right then), then every 6 h once the selected format is bookable.
-With wanted dates configured, it checks on **every 15-min firing** until each future date has been announced. This still permits about 15 min of detection
+With wanted dates configured, it checks on **every 5-min firing** until each future date has been announced. This still permits about 5 min of detection
 delay while the Mac is awake; sleeping pauses local checks.
 Everything else is a zero-network no-op (~0.5 s of local CPU; the guard
 reads only locally-written state, and git sync happens on runs that actually

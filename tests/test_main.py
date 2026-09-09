@@ -39,7 +39,7 @@ def test_error_finding_names_the_watch_and_the_ip_block():
         "Dune : Troisième partie · Pathé Odysseum",
         "No sale detection since Sat 18 Jul, 07:11 (7 h 42 m).",
         "Cause: Pathé is blocking your IP (403).",
-        "Retrying every 15 min — usually clears by itself.",
+        "Retrying every 5 min — usually clears by itself.",
     ]
     # The old copy said "disable any VPN or proxy". When the block is the ISP's
     # own IP — as it was on 2 Sep 2026 — that sends the user after a VPN they
@@ -56,7 +56,7 @@ def test_error_finding_keeps_generic_error_actionable_and_single_line():
         "Dune : Troisième partie · Pathé Odysseum",
         "No sale detection since Sat 18 Jul, 07:11 (7 h 42 m).",
         "Cause: temporary DNS failure resolver unavailable",
-        "Retrying every 15 min; check the logs if it persists.",
+        "Retrying every 5 min; check the logs if it persists.",
     ]
 
 
@@ -130,12 +130,12 @@ def test_error_finding_swaps_the_403_hint_in_ci(monkeypatch):
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     in_ci = cli.build_error_finding(Cfg, BLIND_STATE, error, NOW)
 
-    assert "Retrying every 15 min" in "\n".join(local.lines)
+    assert "Retrying every 5 min" in "\n".join(local.lines)
     assert "datacenter" not in "\n".join(local.lines)
 
     assert "GitHub datacenter IPs" in "\n".join(in_ci.lines)
     assert "run the check locally" in "\n".join(in_ci.lines)
-    assert "Retrying every 15 min" not in "\n".join(in_ci.lines)
+    assert "Retrying every 5 min" not in "\n".join(in_ci.lines)
 
 
 def test_stale_finding_distinguishes_ip_block_from_a_silent_mac():
