@@ -10,6 +10,10 @@ title = "Dune : Troisième partie"
 page_url = "https://www.pathe.fr/films/dune-troisieme-partie-50828"
 # Used to ignore the release date when it shows up in news articles.
 release_date = "2026-12-16"
+# Only this format buzzes; each wanted date has independent delivery dedup.
+target_format = "imax70"
+target_dates = ["2026-12-19", "2026-12-20"]
+target_page_url = "https://www.pathe.fr/evenements/dune-troisieme-partie-projection-imax-70mm-55289"
 # Regexes (single-quoted = TOML literal strings) matched against the
 # normalised (lowercase, accent-stripped) "slug title" of EVERY show in the
 # Pathé catalogue. They catch dedicated event listings such as

@@ -643,7 +643,7 @@ def run(argv: list[str] | None = None) -> int:
     # bookkeeping has to agree with itself.
     ladder_now = datetime.now(TZ_PARIS)
     due = state_mod.due_reminders(
-        st, cfg.reminder_offsets_minutes, ladder_now, args.reminder_grace_minutes
+        st, cfg.reminder_offsets_minutes, ladder_now, args.reminder_grace_minutes, cfg=cfg
     )
     for r in due:
         text = notify.render_reminder(r["offset"], r["target"], cfg, ladder_now)

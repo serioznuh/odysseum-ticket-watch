@@ -179,6 +179,18 @@ def fetch_snapshot(client: httpx.Client, cfg: Any) -> detect.Snapshot:
             showtimes[slug] = st
         time.sleep(0.3)  # be polite
 
+    for show in matched:
+        if detect.selected_listing(show, cfg):
+            slug = show.get("slug", "")
+            entry = entries.get(slug) or {}
+            bookable_days = sorted(
+                day for day, info in (entry.get("days") or {}).items()
+                if info.get("bookable") is True or info.get("isBookable") is True
+            )
+            log.info(
+                "programme %s: bookable=%s, bookable dates=%s",
+                slug, bool(entry.get("isBookable") or entry.get("bookable")), bookable_days,
+            )
     log.info(
         "snapshot: %d matched listing(s) %s | at %s: %d listed, %d with sessions%s",
         len(matched),

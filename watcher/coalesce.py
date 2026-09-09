@@ -31,6 +31,7 @@ ITEM_GROUP_KINDS = (
     "NEW_LISTING",
     "TICKETS_AVAILABLE",
     "CINESA_TARGET_DATE",
+    "PATHE_TARGET_DATE",
     "CINESA_TARGET_NO_IMAX",
 )
 
@@ -252,6 +253,12 @@ class _GroupSpec:
 
 
 _GROUPS = {
+    "PATHE_TARGET_DATE": _GroupSpec(
+        title=lambda members, cfg: (
+            f"Your dates are open — {_days(members)}, "
+            f"{detect.FORMAT_LABELS[cfg.pathe_target_format]}"
+        ),
+    ),
     "sale": _GroupSpec(title=_sale_title, head=_sale_head),
     "NEW_LISTING": _GroupSpec(title=_new_listing_title),
     "TICKETS_AVAILABLE": _GroupSpec(title=_tickets_title),
