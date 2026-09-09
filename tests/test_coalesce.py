@@ -113,7 +113,7 @@ def test_the_two_new_listings_become_one_message_naming_both():
     new = next(a for a in coalesce.merge(pathe_burst(), Cfg)
                if a.finding.kind == "NEW_LISTING")
 
-    assert new.finding.title == "New listings: IMAX 70 mm (1.43:1)"
+    assert new.finding.title == "New listings: IMAX 70 mm (1.43:1), Standard / other"
     assert new.finding.lines == [
         "Dune : Troisième partie · Pathé Odysseum, Montpellier",
         "“Dune - Troisième partie : Projection IMAX 70mm”",

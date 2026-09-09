@@ -19,6 +19,7 @@ ICONS = {
     "SALE_DATE": "🎟️",
     "SALE_DATE_CHANGED": "🔁",
     "TICKETS_AVAILABLE": "🚨",
+    "PATHE_TARGET_DATE": "🎫",
     "NEW_LISTING": "🆕",
     "CINEMA_LISTED": "📍",
     "NEWS_LEAD": "📰",
@@ -139,12 +140,16 @@ def render_reminder(
     where = f"{esc(cfg.cinema_name)}, {esc(cfg.cinema_city)}"
     film = esc(cfg.film_title)
     who = f"{film} · {where}"
-    url = esc(cfg.film_page_url)
+    wanted = getattr(cfg, "pathe_target_format", "")
+    if wanted:
+        who += f" · {esc(detect.FORMAT_LABELS[wanted])}"
+    url = esc(getattr(cfg, "pathe_page_url", "") or cfg.film_page_url)
 
     if offset == "open":
         return (
-            "🟢 <b>SALE IS OPEN — GO</b>\n"
+            "⏰ <b>Scheduled sale time reached</b>\n"
             f"{who}\n"
+            "Booking availability is not confirmed yet. Check Pathé.\n"
             f"👉 {url}"
         )
 

@@ -516,7 +516,7 @@ def test_the_ladder_reads_the_clock_after_the_check_rather_than_before_it(
     ) == 0
 
     assert len(sent) == 1
-    assert "SALE IS OPEN" in sent[0]
+    assert "Scheduled sale time reached" in sent[0]
     assert "Sale opens in" not in sent[0]  # what the run-start clock would have sent
     saved = json.loads(state.read_text(encoding="utf-8"))
     assert "open" in saved["reminders_sent"][target]
@@ -632,3 +632,33 @@ def test_a_listing_returned_twice_is_announced_once(tmp_path, monkeypatch):
 
     assert len([t for t in runner.sent if "Sale opens" in t]) == 1
     assert len([t for t in runner.sent if "New listing" in t]) == 1
+
+
+def test_wanted_pathe_dates_retry_together_then_stay_quiet(tmp_path, monkeypatch):
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    runner.config.write_text(CONFIG_TOML.replace(
+        '[film]', '[film]\ntarget_format="imax70"\n'
+        'target_dates=["2026-12-19", "2026-12-20"]'))
+    slug = "dune-troisieme-partie-projection-imax-70mm-55289"
+    snap = Snapshot(
+        matched_shows=[{"slug": slug, "title": "Dune IMAX 70mm", "isMovie": False}],
+        cinema_entries={slug: {"bookable": True, "days": {
+            "2026-12-19": {"bookable": True}, "2026-12-20": {"bookable": True}}}},
+    )
+    # Stable clock: test still exercises wanted dates after calendar December.
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(NOW, NOW))
+    initial = json.loads(runner.state.read_text())
+    initial['shows_seen'] = [slug]
+    initial['formats_seen'] = {slug: ['imax70']}
+    runner.state.write_text(json.dumps(initial))
+    st = runner.run(snap, delivered=False)
+    assert len(runner.sent) == 1
+    assert st['alerts'] == {}
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(NOW, NOW))
+    st = runner.run(snap, delivered=True)
+    assert len(runner.sent) == 1
+    assert '19 Dec' in runner.sent[0] and '20 Dec' in runner.sent[0]
+    assert len([k for k in st['alerts'] if k.startswith('pathe_target:')]) == 2
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(NOW, NOW))
+    runner.run(snap, delivered=True)
+    assert runner.sent == []
