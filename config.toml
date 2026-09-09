@@ -85,9 +85,9 @@ silent_kinds = [
 ]
 
 [cadence]
-# Adaptive check frequency (local launchd job fires every 15 min; these set
+# Adaptive check frequency (local launchd job fires every 5 min; these set
 # how stale the last successful check may be before a new one runs — the
-# 15-min firing interval is the effective floor).
+# 5-min firing interval is the effective floor).
 baseline_hours = 4.0          # nothing announced yet
 within_week_hours = 2.0       # sale opening within 7 days
 final_48h_hours = 0.5         # sale opening within 48 h

@@ -37,7 +37,8 @@ Core facts agents need before editing:
 - The adaptive-cadence guard governs the **Pathé + news half only** and must
   stay before that half's network activity. The Cinesa half and the reminder
   ladder run on every firing by design.
-- `scripts/local-check.sh` pulls **both before and after** the watcher run. The
+- `scripts/local-check.sh` fires every 5 min and pulls **both before and after**
+  the watcher run. The
   pre-run pull is not redundant: without it the Mac cannot see a reminder the
   cloud failover sent while it slept, and re-sends it or wedges the rebase.
 
@@ -57,8 +58,8 @@ Core facts agents need before editing:
 - The token is a **credential**: it lives in git-ignored `.cache/`, mode 0600,
   and must never reach `state/state.json`, logs or commits.
 - Cinesa state lives under the `cinesa` key and is written **only on real
-  change**. Never add a per-run timestamp there: at 15-min cadence it would
-  make `local-check.sh` commit and push ~96 times a day.
+  change**. Never add a per-run timestamp there: at 5-min cadence it would
+  make `local-check.sh` commit and push ~288 times a day.
 - An **empty** Cinesa snapshot is treated as a blip, never as evidence — it
   must not flip `imax_present` or fire an "IMAX gone" alert.
 - Alerts are precision-first: the user rejects noisy notifications. Bad alerts

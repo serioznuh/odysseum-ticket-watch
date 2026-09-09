@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Fires the check script every 15 minutes; the script's adaptive guard
+<!-- Fires the check script every 5 minutes; the script's adaptive guard
      decides whether a new Pathé check is actually due (≈4 h baseline,
-     every 15 min around an announced sale opening) and exits instantly
+     every 5 min around an announced sale opening or while wanted dates are
+     pending) and exits instantly
      otherwise, so most firings are ~2 s no-ops. Missed firings during
      sleep coalesce into one on wake; failed runs retry at the next firing.
 
@@ -26,7 +27,7 @@
         <string>/Users/serhii.afanasiev/.ticket-watch/scripts/local-check.sh</string>
     </array>
     <key>StartInterval</key>
-    <integer>900</integer>
+    <integer>300</integer>
     <key>StandardOutPath</key>
     <string>/Users/serhii.afanasiev/.ticket-watch/logs/launchd.log</string>
     <key>StandardErrorPath</key>

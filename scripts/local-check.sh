@@ -1,11 +1,12 @@
 #!/bin/bash
 # Pathé + Cinesa check, run from a residential IP (both chains block or
 # challenge datacenter IPs). Fired by the com.odysseum.ticket-watch
-# LaunchAgent every 15 min; safe to run manually too.
+# LaunchAgent every 5 min; safe to run manually too.
 #
 # The adaptive guard still gates the Pathé + news half (≈4 h baseline) and
 # still runs ahead of every call that half makes. It gates nothing else: the
-# Cinesa half and the reminder ladder run on EVERY firing. Cinesa is one small
+# Cinesa half and the reminder ladder run on EVERY firing. Cinesa is disabled
+# in the shipped configuration; when enabled it is one small
 # call to an API that is neither bot-gated nor rate-limited, and the point is
 # catching a schedule release within minutes; it writes state only when the
 # schedule actually changes, so unchanged firings stay commit-free and the git

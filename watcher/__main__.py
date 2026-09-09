@@ -114,16 +114,16 @@ def pathe_cause(error: str, *, ci: bool = False) -> tuple[str, str]:
             )
         return (
             "Cause: Pathé is blocking your IP (403).",
-            "Retrying every 15 min — usually clears by itself.",
+            "Retrying every 5 min — usually clears by itself.",
         )
     if status is not None:
         return (
             f"Cause: Pathé returned HTTP {status}.",
-            "Retrying every 15 min; check the logs if it persists.",
+            "Retrying every 5 min; check the logs if it persists.",
         )
     return (
         f"Cause: {summary[:160]}",
-        "Retrying every 15 min; check the logs if it persists.",
+        "Retrying every 5 min; check the logs if it persists.",
     )
 
 
@@ -230,15 +230,15 @@ def build_cinesa_error_finding(
     """Cinesa half is blind. Kept separate from the Pathé error: the two halves
     fail for unrelated reasons and one must never mask the other.
 
-    Cinesa state still carries no per-run success timestamp (at 15-min cadence
-    it would rewrite and push state.json ~96x a day); `since` comes from
+    Cinesa state still carries no per-run success timestamp (at 5-min cadence
+    it would rewrite and push state.json ~288x a day); `since` comes from
     `blind_since`, stamped once when an outage is first confirmed.
     """
     status = _cinesa_error_status(error)
     text = str(error)
     if status == 403:
         cause = "Cause: Cinesa is blocking your IP (403)."
-        tail = "Retrying every 15 min — the cached token is kept."
+        tail = "Retrying every 5 min — the cached token is kept."
     elif status == 401:
         cause = "Cause: Cinesa rejected the token."
         tail = "A fresh token is minted on the next retry."
@@ -247,7 +247,7 @@ def build_cinesa_error_finding(
         tail = "Needs you: check Chrome is installed and the Mac is logged in and awake."
     else:
         cause = f"Cause: {' '.join(text.split())[:160]}"
-        tail = "Retrying every 15 min; check the logs if it persists."
+        tail = "Retrying every 5 min; check the logs if it persists."
     repeat = day > 1
     return Finding(
         kind="WATCHER_STILL_BLIND" if repeat else "WATCHER_ERROR",
@@ -362,7 +362,7 @@ def run(argv: list[str] | None = None) -> int:
         default=0.0,
         metavar="MINUTES",
         help="failover mode: only send a reminder whose window opened at least this"
-        " long ago. The local half omits it (grace 0 — it fires every 15 min and"
+        " long ago. The local half omits it (grace 0 — it fires every 5 min and"
         " owns the ladder); the cloud pass passes more than that firing interval,"
         " so it only sends what the local half missed",
     )
@@ -445,11 +445,11 @@ def run(argv: list[str] | None = None) -> int:
             # The cloud pass never calls Pathé, so it cannot tell "IP blocked"
             # from "the Mac never checked in" — the two need opposite responses.
             # Recording the cause here lets it say which. Written only when the
-            # text changes: a steady outage writes state once, not every 15 min.
+            # text changes: a steady outage writes state once, not every 5 min.
             summary, status = summarize_pathe_error(str(e))
             # Store the status without the failing URL: fetch_snapshot hits
             # several endpoints, and an outage that flapped between them would
-            # otherwise rewrite state — and commit and push — every 15 min.
+            # otherwise rewrite state — and commit and push — every 5 min.
             # The marker survives into state (still URL-free, still one stable
             # string per outage) so the cloud pass reports the right cause too.
             if status and "refused by origin" in str(e):
@@ -460,7 +460,7 @@ def run(argv: list[str] | None = None) -> int:
                 recorded = summary[:120]
             if st.get("last_error") != recorded:
                 st["last_error"] = recorded
-            # With adaptive cadence, retries come every 15 min — require both
+            # With adaptive cadence, retries come every 5 min — require both
             # a failure streak AND 6h without success before crying wolf.
             if (
                 st["failure_streak"] >= cfg.failure_streak_threshold
@@ -513,7 +513,7 @@ def run(argv: list[str] | None = None) -> int:
                 )
                 if cin["failure_streak"] >= cfg.failure_streak_threshold:
                     # Stamped once, when the outage is first confirmed — not per
-                    # run, which at 15-min cadence would push state ~96x a day.
+                    # run, which at 5-min cadence would push state ~288x a day.
                     cin.setdefault("blind_since", now.isoformat())
                     started = detect.parse_iso(cin.get("blind_since")) or now
                     # The key is already day-stamped, so it yields exactly one
@@ -619,7 +619,7 @@ def run(argv: list[str] | None = None) -> int:
                     st["last_heartbeat"] = now.isoformat()
 
     # The reminder ladder is owned by the LOCAL half: launchd fires it every
-    # 15 min — the resolution a 15-min warning needs — and it runs with grace 0.
+    # 5 min — three chances inside a 15-min warning — and it runs with grace 0.
     # The cloud pass is the failover for a sleeping Mac and passes
     # --reminder-grace-minutes, so it only sends what the local half did not.
     # Two things keep two writers off `reminders_sent`, and both are needed:

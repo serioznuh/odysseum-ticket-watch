@@ -453,7 +453,7 @@ def test_first_ever_check_sets_baseline_without_alerting():
 # ----------------------------------------------------------------------- state
 
 def test_unchanged_schedule_leaves_state_untouched():
-    """Guards the 15-min cadence: no spurious diff means no commit/push churn."""
+    """Guards the 5-min cadence: no spurious diff means no commit/push churn."""
     st = fresh_state()
     snap = CinesaSnapshot(days=days(("2026-08-01", True), ("2026-08-25", True)))
     state_mod.update_from_cinesa(st, snap, Cfg, NOW)
@@ -466,7 +466,7 @@ def test_unchanged_schedule_leaves_state_untouched():
 
 def test_confirmed_absence_stops_changing_the_state_file():
     """The streak must not keep counting: it is only ever read as ">= 2", and a
-    growing number would diff (and commit) state.json every 15 minutes for as
+    growing number would diff (and commit) state.json every 5 minutes for as
     long as IMAX stays away."""
     st = fresh_state()
     st["cinesa"]["imax_present"] = True

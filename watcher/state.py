@@ -35,8 +35,8 @@ DEFAULT_STATE: dict = {
     "last_heartbeat": None,
     # Cinesa (Diagonal Mar) half — namespaced so it never collides with Pathé.
     # No per-run timestamp lives here on purpose: the Cinesa check runs on
-    # every 15-min firing, and a field that changed each time would make
-    # local-check.sh commit and push ~96 times a day. Only real changes land.
+    # every 5-min firing, and a field that changed each time would make
+    # local-check.sh commit and push ~288 times a day. Only real changes land.
     "cinesa": {
         "imax_present": None,       # None until the first successful check
         "imax_absent_streak": 0,    # consecutive non-empty checks without IMAX
@@ -232,18 +232,18 @@ def update_from_cinesa(
             cin["imax_present"] = False
 
     # Timestamp only a genuine change, so an unchanged schedule leaves the
-    # state file byte-identical and the 15-min job has nothing to commit.
+    # state file byte-identical and the 5-min job has nothing to commit.
     if {k: v for k, v in cin.items() if k != "last_change"} != {
         k: v for k, v in before.items() if k != "last_change"
     }:
         cin["last_change"] = now.isoformat()
 
 
-# The local half's firing interval: launchd's StartInterval (900 s) in
+# The local half's firing interval: launchd's StartInterval (300 s) in
 # scripts/com.odysseum.ticket-watch.plist, which a test pins this constant to.
 # The ladder's owner fires on that timer, so this is also the worst-case delay
 # between a rung's window opening and the owner's first chance at that rung.
-LOCAL_FIRING_INTERVAL_MINUTES = 15
+LOCAL_FIRING_INTERVAL_MINUTES = 5
 
 
 def _failover_eligible_at(dt: datetime, offset: int, grace_minutes: float) -> datetime:
@@ -259,14 +259,11 @@ def _failover_eligible_at(dt: datetime, offset: int, grace_minutes: float) -> da
     width, which decides each rung by construction — a new offset in
     `config.toml` included:
 
-    * a rung wider than the interval keeps the whole grace (2 h and 24 h here);
-    * a rung no wider than it — the 15-min warning — gets no turn of its own.
-      Eligibility lands on the opening itself, which the pre-opening branch of
-      `due_reminders` can never reach, so the 'open' ping is what the failover
-      delivers for such a rung. A 15-min-wide window against a 15-min firing
-      period has no slack to share: splitting it (OTW-15 round 2 capped the
-      wait at half a window) put the cloud at T-7.5, ahead of the owner's
-      worst case of T.
+    * a rung wider than the effective wait keeps the whole grace (2 h and 24 h here);
+    * a rung no wider than the effective wait gets no failover turn of its own.
+      With the shipped 25-min cloud grace, eligibility for the 15-min warning
+      lands on the opening itself, so the 'open' ping covers it. The local
+      owner now has three firing opportunities inside that window.
     """
     if grace_minutes <= 0:
         return dt - timedelta(minutes=offset)  # the owner: as soon as it opens
@@ -289,7 +286,7 @@ def due_reminders(
 
     `grace_minutes` makes the caller a *failover* instead of the ladder's owner:
     it only reports a reminder whose window opened at least that long ago. The
-    local half (launchd, every 15 min) passes 0 and owns the ladder; the cloud
+    local half (launchd, every 5 min) passes 0 and owns the ladder; the cloud
     pass passes a grace longer than that firing interval, so it only steps in
     for a reminder the local half demonstrably did not send in time. That is
     half of what removes the two-writer race on `reminders_sent` which used to
@@ -337,7 +334,7 @@ def adaptive_staleness_hours(state: dict, cfg: Any, now: datetime) -> float:
     War-room curve around an announced sale opening: tightens as the target
     approaches, stays tight from 4 h before until 6 h after (sessions appear
     right at opening), then relaxes once tickets are known to be bookable.
-    The launchd firing interval (15 min) is the effective floor.
+    The launchd firing interval (5 min) is the effective floor.
     """
     # A different date opening must not slow checks for the still-wanted dates.
     if any(
