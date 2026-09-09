@@ -173,7 +173,14 @@ def update_from_snapshot(
             state["tickets_available"] = True
 
     future = []
-    for iso in state["sales"].values():
+    shows = {s.get("slug"): s for s in snap.matched_shows}
+    selected_sales = {
+        slug: iso for slug, iso in state["sales"].items()
+        if detect.selected_listing(shows.get(slug, {"slug": slug}), cfg)
+    }
+    if state.get("sale_target") not in selected_sales.values():
+        state["sale_target"] = None
+    for iso in selected_sales.values():
         dt = detect.parse_iso(iso)
         if dt and detect.as_aware(dt) > now:
             future.append((detect.as_aware(dt), iso))
@@ -272,11 +279,13 @@ def due_reminders(
     offsets_minutes: list[int],
     now: datetime,
     grace_minutes: float = 0.0,
+    cfg: Any = None,
 ) -> list[dict]:
     """Return at most one due reminder: the most imminent unsent offset, or the
     'open' ping once the sale time has passed (within a 6h grace window).
 
-    Reminders stop entirely once tickets are known to be available.
+    Reminders stop once the selected format is known to be available.
+    Without a format filter, retain the original any-ticket behavior.
 
     `grace_minutes` makes the caller a *failover* instead of the ladder's owner:
     it only reports a reminder whose window opened at least that long ago. The
@@ -292,7 +301,7 @@ def due_reminders(
     'open' ping stays anchored to the sale time itself, so a failover grace can
     never shorten how late that ping may still be sent.
     """
-    if state.get("tickets_available"):
+    if detect.target_format_available(state, cfg):
         return []
     iso = state.get("sale_target")
     dt = detect.parse_iso(iso) if iso else None
@@ -330,6 +339,12 @@ def adaptive_staleness_hours(state: dict, cfg: Any, now: datetime) -> float:
     right at opening), then relaxes once tickets are known to be bookable.
     The launchd firing interval (15 min) is the effective floor.
     """
+    # A different date opening must not slow checks for the still-wanted dates.
+    if any(
+        day >= now.date().isoformat() and not already_sent(state, detect.pathe_date_key(cfg, day))
+        for day in getattr(cfg, "pathe_target_dates", [])
+    ):
+        return 0.0  # every existing launchd firing, even if its interval drifts slightly
     target = detect.parse_iso(state.get("sale_target"))
     if target is not None:
         hours_to_target = (detect.as_aware(target) - now).total_seconds() / 3600
@@ -339,7 +354,7 @@ def adaptive_staleness_hours(state: dict, cfg: Any, now: datetime) -> float:
             return cfg.cadence_final_48h_hours
         if 0 < hours_to_target <= 7 * 24:
             return cfg.cadence_within_week_hours
-    if state.get("tickets_available"):
+    if detect.target_format_available(state, cfg):
         return cfg.cadence_after_tickets_hours
     return cfg.cadence_baseline_hours
 

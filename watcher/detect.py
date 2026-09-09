@@ -35,7 +35,7 @@ FORMAT_LABELS = {
     FMT_OTHER: "Standard / other",
 }
 
-IMAX70_RE = re.compile(r"70\s*mm|1\.43|imax\s*70")
+IMAX70_RE = re.compile(r"70\s*mm|imax[ -]*70\b")
 IMAX_RE = re.compile(r"imax")
 
 
@@ -48,7 +48,7 @@ def norm(text: str | None) -> str:
 
 def classify_format(*texts: str | None) -> str:
     hay = norm(" ".join(t for t in texts if t))
-    if IMAX70_RE.search(hay):
+    if IMAX_RE.search(hay) and IMAX70_RE.search(hay):
         return FMT_IMAX70
     if IMAX_RE.search(hay):
         return FMT_IMAX
@@ -214,15 +214,73 @@ def summarize_sessions(show: dict, days: dict[str, list[dict]]) -> dict:
     }
 
 
-def reminders_cover(sale_iso: str, snap: Snapshot, state: dict, now: datetime) -> bool:
+def selected_listing(show: dict, cfg: Any) -> bool:
+    wanted = getattr(cfg, "pathe_target_format", "")
+    return not wanted or classify_format(show.get("title"), show.get("slug")) == wanted
+
+
+def target_format_available(state: dict, cfg: Any) -> bool:
+    """Use delivered format evidence, including pre-upgrade state; never any-ticket state."""
+    wanted = getattr(cfg, "pathe_target_format", "")
+    if not wanted:
+        return bool(state.get("tickets_available"))
+    return any(wanted in formats for formats in state.get("formats_seen", {}).values())
+
+
+def pathe_date_key(cfg: Any, day: str) -> str:
+    return f"pathe_target:{cfg.cinema_slug}:{cfg.primary_slug}:{cfg.pathe_target_format}:{day}"
+
+
+def target_date_findings(snap: Snapshot, cfg: Any, now: datetime) -> list[Finding]:
+    """A date needs its own bookability AND format evidence, not a listing-wide flag."""
+    targets = set(getattr(cfg, "pathe_target_dates", []))
+    wanted = getattr(cfg, "pathe_target_format", "")
+    found: dict[str, Finding] = {}
+    for show in snap.matched_shows:
+        slug = show.get("slug", "")
+        entry_days = (snap.cinema_entries.get(slug) or {}).get("days") or {}
+        sessions_by_day = snap.showtimes.get(slug) or {}
+        for day in sorted(targets):
+            if day < now.date().isoformat() or day in found:
+                continue
+            entry = entry_days.get(day) or {}
+            bookable = (entry.get("bookable") is True or entry.get("isBookable") is True)
+            fmt = classify_format(show.get("title"), slug, " ".join(entry.get("tags") or []))
+            # Day tags aggregate multiple sessions; IMAX + ordinary 70mm on
+            # separate sessions is not proof of IMAX 70mm. For that format,
+            # the programme must be a dedicated listing. Session evidence below
+            # is safe because its attributes belong to the same session.
+            if wanted == FMT_IMAX70:
+                fmt = classify_format(show.get("title"), slug)
+            confirmed = bookable and fmt == wanted
+            for session in sessions_by_day.get(day, []):
+                session_fmt = classify_format(
+                    show.get("title"), slug, " ".join(session.get("tags") or []),
+                    session.get("auditoriumName"), session.get("specialShowtimeDetails"),
+                )
+                if session.get("status") == "available" and session_fmt == wanted:
+                    confirmed = True
+            if confirmed:
+                found[day] = Finding(
+                    kind="PATHE_TARGET_DATE", key=pathe_date_key(cfg, day), confidence="high",
+                    title=f"Your date is open — {fmt_day(day)}, {FORMAT_LABELS[wanted]}",
+                    lines=[watch_line(cfg), f"Bookable with {FORMAT_LABELS[wanted]}: {day}"],
+                    url=show_url(show), merge_item=day,
+                )
+    return list(found.values())
+
+
+def reminders_cover(
+    sale_iso: str, snap: Snapshot, state: dict, now: datetime, cfg: Any = None,
+) -> bool:
     """Whether the reminder ladder will actually fire for this opening.
 
     `due_reminders` tracks a single `sale_target` — the earliest *future*
-    opening across all matched listings — and stops entirely once tickets are
+    opening across selected listings — and stops once that format is
     known to be bookable. Announcing "reminders set" for anything else was a
     promise the watcher does not keep.
     """
-    if state.get("tickets_available"):
+    if target_format_available(state, cfg):
         return False
     target = parse_iso(sale_iso)
     if target is None or as_aware(target) <= now:
@@ -231,6 +289,7 @@ def reminders_cover(sale_iso: str, snap: Snapshot, state: dict, now: datetime) -
         as_aware(dt)
         for dt in (
             parse_iso(sh.get("salesOpeningDatetime")) for sh in snap.matched_shows
+            if selected_listing(sh, cfg)
         )
         if dt is not None and as_aware(dt) > now
     ]
@@ -240,7 +299,7 @@ def reminders_cover(sale_iso: str, snap: Snapshot, state: dict, now: datetime) -
 # --------------------------------------------------------------------------- Pathé analysis
 
 def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[Finding]:
-    findings: list[Finding] = []
+    findings: list[Finding] = target_date_findings(snap, cfg, now)
     shows_seen = set(state.get("shows_seen", []))
     known_sales: dict = state.get("sales", {})
     formats_seen = {k: set(v) for k, v in state.get("formats_seen", {}).items()}
@@ -253,7 +312,7 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
 
         # 1. Brand-new listing matching the film (e.g. a dedicated
         #    "Projection IMAX 70mm" event page, as Pathé did for L'Odyssée).
-        if slug not in shows_seen and slug != cfg.primary_slug:
+        if selected_listing(show, cfg) and slug not in shows_seen and slug != cfg.primary_slug:
             # A dedicated event page often appears with its opening already
             # set, and the SALE_DATE finding below fires in the same pass.
             new_sale = show.get("salesOpeningDatetime")
@@ -283,7 +342,7 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
 
         # 2. Sale-opening datetime published or changed (THE advance signal).
         sale_iso = show.get("salesOpeningDatetime")
-        if sale_iso and known_sales.get(slug) != sale_iso:
+        if selected_listing(show, cfg) and sale_iso and known_sales.get(slug) != sale_iso:
             changed = slug in known_sales
             display_iso = show.get("showtimesDisplayDatetime")
             sale_dt = parse_iso(sale_iso)
@@ -309,7 +368,7 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                 lines.append(f"Was: {fmt_dt_short(prev)}{moved}.")
             if display_iso and display_iso != sale_iso:
                 lines.append(f"Showtimes visible from {fmt_dt_short(parse_iso(display_iso))}.")
-            if reminders_cover(sale_iso, snap, state, now):
+            if reminders_cover(sale_iso, snap, state, now, cfg):
                 lines.append(
                     "Reminders rescheduled automatically."
                     if changed
@@ -341,6 +400,12 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
             summary = summarize_sessions(show, days)
             present = set(summary["counts"]) if summary["counts"] else {listing_fmt}
             new_fmts = present - formats_seen.get(slug, set())
+            wanted = getattr(cfg, "pathe_target_format", "")
+            if wanted:
+                new_fmts &= {wanted}
+            # Date-specific alerts replace generic "book now" when dates are configured.
+            if getattr(cfg, "pathe_target_dates", []):
+                new_fmts = set()
             if new_fmts:
                 # The alert exists because `new_fmts` appeared; naming the
                 # best format merely *present* would re-announce IMAX 70 mm
@@ -376,7 +441,7 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                         merge_item=best,
                     )
                 )
-        elif entry:
+        elif entry and selected_listing(show, cfg):
             # 4. Listed on the cinema's programme but nothing bookable yet.
             findings.append(
                 Finding(

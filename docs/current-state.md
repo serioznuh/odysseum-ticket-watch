@@ -9,7 +9,11 @@ A single-user Telegram watcher covering **two independent targets**:
    `salesOpeningDatetime` in advance) plus Google News RSS, and sends
    deduplicated alerts: sale-date announcements, new listings, bookable-now, a
    24 h / 2 h / 15 min reminder ladder, strictly-filtered news leads, and
-   supervision alerts (failure streak, stale state, weekly heartbeat). Every
+   supervision alerts (failure streak, stale state, weekly heartbeat).
+   Configured for **IMAX 70mm on December 19–20, 2026**: each date alerts only
+   on day-level bookability or an available session in that format. December 15,
+   standard, 4DX and ordinary 70mm sessions cannot trigger a wanted-date alert.
+   Generic book-now messages are replaced by these date alerts. Every
    message names its film and cinema on the first line, and findings that are
    one piece of news share one message rather than arriving as a burst.
 2. *La odisea* (Nolan) **in IMAX at Cinesa Diagonal Mar, Barcelona** — watches
@@ -22,7 +26,10 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Local half** — launchd agent `com.odysseum.ticket-watch` in the
   `~/.ticket-watch` clone fires `scripts/local-check.sh` every 15 min. An
   adaptive-cadence guard decides if a full Pathé + news check is due (≈4 h
-  baseline, tightening to every firing around the announced opening); it gates
+  baseline, tightening to every firing around the announced opening). Pending
+  future wanted dates override this: check every existing 15-min firing until
+  their alerts are delivered or the dates pass. No sub-minute guarantee; sleep
+  still pauses checks. It gates
   neither the **Cinesa check** — one small call, not bot-gated — nor the
   **reminder ladder**, both of which run on every firing. This half *owns* the
   ladder: 15-min firings are the resolution a 15-min warning needs. Runs from a
@@ -43,6 +50,12 @@ A single-user Telegram watcher covering **two independent targets**:
   ladder is no longer cloud-owned (OTW-15). The scheduled pass never calls
   Pathé (a manual `check` dispatch would, but is 403'd from datacenter IPs).
   It never calls Cinesa either.
+- **Format-specific reminders** — standard tickets no longer cancel the IMAX
+  ladder. Existing `formats_seen` provides the format evidence without manual
+  state edits. The opening-time message says availability is unconfirmed and
+  links to the dedicated event page. Existing dedup keys remain unchanged;
+  wanted-date keys are independent of prior format announcements. Programme
+  logs now record bookable dates for future availability investigations.
 - **Shared state** — `state/state.json`, committed to `main` by both halves
   (`[skip ci]`); serves as dedup memory and reminder bookkeeping. The Cinesa
   half writes only on real change, so the 15-min cadence causes no commit churn.
@@ -71,7 +84,7 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Code** — Python package `watcher/` (`pathe.py` and `cinesa.py` API clients,
   `cdp.py` browser token step, `news.py`, `detect.py`, `state.py`, `notify.py`
   Telegram, `config.py`, `__main__.py` CLI); config in `config.toml`; tests in
-  `tests/` (166 passing).
+  `tests/` (186 passing).
 
 ## Cinesa specifics
 

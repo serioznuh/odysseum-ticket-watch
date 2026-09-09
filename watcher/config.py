@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
@@ -69,6 +69,9 @@ class Config:
     # environment
     telegram_token: str | None
     telegram_chat_id: str | None
+    pathe_target_format: str = ""
+    pathe_target_dates: list[str] = field(default_factory=list)
+    pathe_page_url: str = ""
 
 
 def load_config(path: str | Path) -> Config:
@@ -87,6 +90,19 @@ def load_config(path: str | Path) -> Config:
     if "slug" not in cinema:
         raise ValueError("config: [cinema] slug is required")
 
+    pathe_format = str(film.get("target_format", ""))
+    if pathe_format not in ("", "imax70", "imax", "other"):
+        raise ValueError("config: [film] target_format must be imax70, imax or other")
+    pathe_dates = sorted({str(d) for d in film.get("target_dates", [])})
+    if pathe_dates and not pathe_format:
+        raise ValueError("config: [film] target_dates requires target_format")
+    for value in pathe_dates:
+        try:
+            if date.fromisoformat(value).isoformat() != value:
+                raise ValueError(value)
+        except ValueError:
+            raise ValueError(f"config: [film] target_dates entry {value!r} is not YYYY-MM-DD") from None
+
     cinesa_enabled = bool(cinesa.get("enabled", False))
     if cinesa_enabled:
         for required in ("film_id", "site_id"):
@@ -103,6 +119,10 @@ def load_config(path: str | Path) -> Config:
             ) from None
 
     return Config(
+        pathe_target_format=pathe_format,
+        pathe_target_dates=pathe_dates,
+        pathe_page_url=str(film.get("target_page_url") or film.get("page_url")
+                           or f"https://www.pathe.fr/films/{film['primary_slug']}"),
         primary_slug=film["primary_slug"],
         film_title=film.get("title", film["primary_slug"]),
         film_page_url=film.get(

@@ -9,9 +9,10 @@ and it can watch any film/cinema on pathe.fr by editing [config.toml](config.tom
 ## What it sends you
 
 - 🎟️ **Sale opening announced** — Pathé published the date/time sales open (the key early signal); 🔁 if that datetime changes
-- ⏰ **Reminders** — 24 h / 2 h / 15 min before the opening, plus 🟢 "sales should be open NOW"
+- ⏰ **Reminders** — 24 h / 2 h / 15 min before the opening, plus an unconfirmed-opening reminder at the scheduled time
 - 🆕 **New listing** — a matching catalogue entry appeared (Pathé creates dedicated event pages for 70 mm runs, each with its own sale opening)
-- 📍 **Listed at your cinema** (not bookable yet) → 🚨 **Tickets bookable NOW**, with formats, session dates and a direct booking link
+- 🎫 **Your wanted Pathé date opened** — IMAX 70mm on December 19 or 20; one alert per date, combined if both open together
+- 📍 **Listed at your cinema** (not bookable yet); without wanted dates configured, 🚨 **Tickets bookable NOW** reports new formats
 - 📰 **News lead** — early press hint via Google News (low/medium confidence, strictly filtered — see configuration)
 - 🔴 watcher blind, then a silent **"still blind — day N"** every 24 h until it recovers / ✅ recovery / 💤 weekly heartbeat
 
@@ -142,7 +143,9 @@ The agent fires every 15 minutes and decides whether a check is due
 (**adaptive cadence**, see `[cadence]` config): roughly every 4 h normally,
 every 2 h in the last week before an announced opening, every 30 min in the
 last 48 h, every firing from 4 h before until 6 h after the opening (new
-sessions appear right then), then every 6 h once tickets are bookable.
+sessions appear right then), then every 6 h once the selected format is bookable.
+With wanted dates configured, it checks on **every 15-min firing** until each future date has been announced. This still permits about 15 min of detection
+delay while the Mac is awake; sleeping pauses local checks.
 Everything else is a zero-network no-op (~0.5 s of local CPU; the guard
 reads only locally-written state, and git sync happens on runs that actually
 checked). Failed runs retry at the next firing; missed firings coalesce on
@@ -156,11 +159,14 @@ before editing any working copy.
 | `film.primary_slug` | *(required)* | Film slug, taken from its pathe.fr URL. |
 | `film.title` | slug | Display name used in alerts. |
 | `film.page_url` | derived from slug | Link shown in alerts and reminders. |
+| `film.target_format` | `""` | Optional `imax70`, `imax` or `other` filter for listings, sale announcements and reminders. IMAX 70mm requires both IMAX and 70mm evidence; 1.43:1 alone is insufficient. |
+| `film.target_dates` | `[]` | Wanted `YYYY-MM-DD` dates; requires `target_format`. Replaces generic book-now alerts with date-specific alerts, using day-level bookability or available sessions. |
+| `film.target_page_url` | film page | Reminder link to the dedicated format page. |
 | `film.release_date` | `""` | `YYYY-MM-DD`. News mentioning this date isn't mistaken for a sale date. |
 | `film.match_patterns` | *(see file)* | Regexes (matched on lowercase, accent-stripped slug+title) that catch extra listings, e.g. a dedicated "… : Projection IMAX 70mm" event page. |
 | `cinema.slug` | *(required)* | Cinema slug from `https://www.pathe.fr/api/cinemas`. |
 | `cinema.name`, `cinema.city` | slug, `""` | Shown in alerts; also used as venue words for news filtering. |
-| `reminders.offsets_minutes` | `[1440, 120, 15]` | When to remind before the sale opening. The 🟢 "open now" ping always fires at opening time. |
+| `reminders.offsets_minutes` | `[1440, 120, 15]` | When to remind before the sale opening. At the scheduled time, an unconfirmed-opening reminder is due unless the selected format is already available. |
 | `news.enabled` | `true` | `false` switches the news channel off entirely. Pathé API alerts (sale date, listings, sessions) are unaffected. |
 | `news.min_confidence` | `"low"` | `"low"`: sale wording (réservations, billets, tickets, on sale…), or format keywords (70mm/IMAX) together with a venue mention. `"medium"`: only leads with sale wording **and** an explicit future date — quieter, but a dateless "tickets just went on sale" headline would be dropped. |
 | `news.max_age_days` | `10` | Ignore news older than this. |
@@ -192,21 +198,14 @@ before editing any working copy.
 
 Secrets are env-only (never in config.toml): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
 
-## Example alerts
+## Example date alert
 
 ```
-🎟️ Sale opens Wed 9 Sep, 09:00
-Dune : Troisième partie · IMAX 70 mm (1.43:1), Standard / other · Pathé Odysseum
-Reminders set: 24 h, 2 h and 15 min before.
-Opening time is national — seats can go in minutes.
-🔗 https://www.pathe.fr/evenements/dune-troisieme-partie-projection-imax-70mm-55289
-```
-
-```
-⏰ Sale opens in 15 minutes — 09:00
+🎫 Your dates are open — 19 Dec, 20 Dec, IMAX 70 mm (1.43:1)
 Dune : Troisième partie · Pathé Odysseum, Montpellier
-Have pathe.fr open and be signed in.
-👉 https://www.pathe.fr/films/dune-troisieme-partie-50828
+Bookable with IMAX 70 mm (1.43:1): 2026-12-19
+Bookable with IMAX 70 mm (1.43:1): 2026-12-20
+🔗 https://www.pathe.fr/evenements/dune-troisieme-partie-projection-imax-70mm-55289
 ```
 
 ## Notes & limitations

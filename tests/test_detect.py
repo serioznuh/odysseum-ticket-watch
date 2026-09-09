@@ -104,7 +104,7 @@ def test_show_matches_rejects_other_films():
 def test_classify_format():
     assert detect.classify_format("Dune : Projection IMAX 70mm") == FMT_IMAX70
     assert detect.classify_format("some film", "tags: imax pmr") == FMT_IMAX
-    assert detect.classify_format("IMAX 1.43:1 experience") == FMT_IMAX70
+    assert detect.classify_format("IMAX 1.43:1 experience") == FMT_IMAX
     assert detect.classify_format("Des Minions", "3d 4dx") == FMT_OTHER
 
 
