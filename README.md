@@ -144,8 +144,7 @@ The agent fires every 15 minutes and decides whether a check is due
 every 2 h in the last week before an announced opening, every 30 min in the
 last 48 h, every firing from 4 h before until 6 h after the opening (new
 sessions appear right then), then every 6 h once the selected format is bookable.
-With wanted dates configured, it checks on **every 15-min firing** until each
-future date has been announced. This still permits about 15 min of detection
+With wanted dates configured, it checks on **every 15-min firing** until each future date has been announced. This still permits about 15 min of detection
 delay while the Mac is awake; sleeping pauses local checks.
 Everything else is a zero-network no-op (~0.5 s of local CPU; the guard
 reads only locally-written state, and git sync happens on runs that actually
