@@ -15,7 +15,8 @@
     "sale:dune-troisieme-partie-50828:2026-09-09T09:00:00+02:00": "2026-09-03T21:46:42.176159+02:00",
     "sale:dune-troisieme-partie-projection-imax-70mm-55289:2026-09-09T09:00:00+02:00": "2026-09-03T21:46:42.176159+02:00",
     "sale:la-seance-70mm-dune-troisieme-partie-55319:2026-09-09T09:00:00+02:00": "2026-09-07T10:13:28.131058+02:00",
-    "tickets:dune-troisieme-partie-50828:other": "2026-09-08T18:31:50.937236+02:00"
+    "tickets:dune-troisieme-partie-50828:other": "2026-09-08T18:31:50.937236+02:00",
+    "tickets:dune-troisieme-partie-projection-imax-70mm-55289:imax70": "2026-09-09T09:22:11.207243+02:00"
   },
   "cinesa": {
     "day_count": 36,
@@ -31,9 +32,12 @@
   "formats_seen": {
     "dune-troisieme-partie-50828": [
       "other"
+    ],
+    "dune-troisieme-partie-projection-imax-70mm-55289": [
+      "imax70"
     ]
   },
-  "last_check_ok": "2026-09-09T09:07:04.849929+02:00",
+  "last_check_ok": "2026-09-09T09:22:11.207243+02:00",
   "last_heartbeat": "2026-09-07T23:27:41.311506+02:00",
   "reminders_sent": {
     "2026-09-09T09:00:00+02:00": [
