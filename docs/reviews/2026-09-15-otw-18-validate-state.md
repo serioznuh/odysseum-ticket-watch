@@ -17,4 +17,6 @@ NOTES:
 
 ## Outcome
 <!-- cross-review-merge-state: APPROVED -->
-Done-when: met — fixtures cover unreadable JSON, wrong nested types, unsupported versions, older supported schemas, missing production state and explicit first use (--bootstrap-state); invalid state causes no Telegram sends, no empty-state overwrite and no dry-run mutation; migrations are lossless and idempotent (verified directly against the live production state.json); ruff and pytest pass. Approved after round 1 plus one no-new-round quick-fix pass (309af1b) addressing NOTES 2, 3 and 5. Eligible for merge pending GitHub confirmation.
+Done-when: met
+
+Fixtures cover unreadable JSON, wrong nested types, unsupported versions, older supported schemas, missing production state and explicit first use (--bootstrap-state); invalid state causes no Telegram sends, no empty-state overwrite and no dry-run mutation; migrations are lossless and idempotent (verified directly against the live production state.json); ruff and pytest pass. Approved after round 1 plus one no-new-round quick-fix pass (309af1b) addressing NOTES 2, 3 and 5. Eligible for merge pending GitHub confirmation.
