@@ -30,6 +30,30 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-15 | Reminders ride a cloud cron that fires ~11% of its schedule | P0 | M | Bugs | [x] |
 | OTW-16 | One run fans out a burst of near-identical alerts | P1 | S | Bugs | [x] |
 | OTW-17 | A merged sale message mixing new and moved openings reads oddly | P3 | S | UX & design | [ ] |
+| OTW-18 | Validate state and make recovery explicit | P1 | M | Infra, tooling & docs | [ ] |
+| OTW-19 | Split orchestration into bounded jobs | P2 | M | Infra, tooling & docs | [ ] |
+| OTW-20 | Persist a notification outbox and delivery receipts | P1 | L | Infra, tooling & docs | [ ] |
+| OTW-21 | Separate deployment from runtime-state synchronization | P1 | L | Infra, tooling & docs | [ ] |
+| OTW-22 | Move the local owner to an always-on residential host | P2 | L | Infra, tooling & docs | [ ] |
+
+## Architecture implementation sequence
+
+1. **OTW-18** — validate state before changing how it is stored or delivered.
+2. **OTW-13** — expose partial Pathé failures and preserve evidence quality.
+3. **OTW-19** — extract jobs and protect reminders from slow polling.
+4. **OTW-21 + OTW-14** — separate synchronization from deployment and resolve
+   conflicts without losing delivery history. Design the OTW-20 delivery
+   ownership contract here; implement it with the outbox in the next step.
+5. **OTW-20** — persist pending notifications and confirmed delivery receipts.
+6. **OTW-08** — add cloud news coverage using the shared delivery contract.
+7. **OTW-09** — add reverse supervision of the cloud half.
+8. **OTW-22** — migrate to an approved always-on home host. This can move
+   earlier once OTW-18, OTW-21 and OTW-09 are ready and a host is available.
+
+Remaining independent work: **OTW-12**, **OTW-17**, then **OTW-01**;
+**OTW-04** becomes useful when Cinesa is enabled again. These are not
+dependencies of the architecture sequence. New items remain unchecked until
+their individual acceptance criteria are met.
 
 ## 1. Critical — security & breakage
 
@@ -214,6 +238,12 @@ but it contradicts the claim that degradation can never invent an alert.
 reading logs, and a test covers "catalogue healthy + one listing failing
 forever" not reporting unqualified health.
 
+**Architecture link:** introduce an explicit result carrying data, health and
+diagnostics, distinguishing authoritative empty data, unexpected failure and
+expected refusal. OTW-19 should consume that result without treating catalogue
+success as proof that every listing is healthy. Keep repeated degradation quiet
+unless it changes or meets the existing supervision policy.
+
 ### OTW-14 · An aborted state rebase can wedge the push until a human intervenes
 
 **Problem:** `local-check.sh` now aborts a failed rebase rather than leaving
@@ -229,10 +259,12 @@ touching adjacent keys. It also degrades to a *self-announcing* failure — the
 cloud pass sees a frozen `last_check_ok` and fires its stale alert — rather
 than the silent state-destroying one it replaced.
 
-**Fix sketch:** on a rebase abort, log the conflict loudly and either retry with
-a state-file merge driver that unions `alerts` keys and takes the newer
-`last_check_ok`, or drop the local state commit and re-derive it next firing
-(the snapshot is cheap; state is a cache, not a ledger).
+**Fix sketch:** on a rebase abort, log the conflict loudly and recover through
+a tested, domain-aware state merge, preserving `alerts`, `reminders_sent` and
+the baselines they acknowledge. An unpushed delivery record is not a disposable
+cache: never drop its commit and assume polling can reconstruct what was sent.
+OTW-21 owns the broader synchronization boundary; this item owns recovery from
+the specific rebase wedge and can ship as its first increment.
 
 **Files:** `scripts/local-check.sh`; possibly a `.gitattributes` merge driver.
 
@@ -314,9 +346,11 @@ worded from the actual remaining time.
 **Residual risk:** the cloud can still duplicate a reminder the local half sent
 but has not yet pushed — the window is the local run's own duration plus its
 push, and the 25-min grace covers all but a pathological case. A cloud send
-whose *own* push fails is likewise invisible to the Mac. Neither is worth more
-machinery than the two-sided pull; a state-file merge driver (OTW-14) would
-close the remainder.
+whose *own* push fails is likewise invisible to the Mac. A state-file merge
+driver (OTW-14) repairs conflicting records but cannot undo duplicate messages
+already sent. OTW-20 and OTW-21 address durable delivery and coordination;
+the existing grace and two-sided pull remain necessary until that replacement
+has been verified.
 
 ## 3. Features
 
@@ -356,6 +390,11 @@ the same finding is not re-sent by the next local run, the cloud pass still
 never touches `www.pathe.fr`, and `--mode remind` without the flag behaves
 exactly as today.
 
+**Architecture link:** follow OTW-19, OTW-21 and OTW-20 so the cloud can select
+the news job and share delivery ownership with the local half. Test overlapping
+runs as well as a sequential cloud run followed by a local run. Cloud-safe
+source selection must also cover configured extra pages, not just RSS URLs.
+
 ### OTW-09 · Supervision is one-directional — nothing watches the cloud half
 **Priority:** P2 · **Effort:** M
 **Problem:** If the *local* half dies, the cloud pass says so (`is_check_stale`
@@ -385,6 +424,12 @@ one loud alert from the local half within a bounded window, the fix adds no more
 than ~24 state writes/day, and a normal week of both halves running raises
 nothing. Note the irreducible limit: if both halves die, only the absence of the
 7-day heartbeat is left — worth saying plainly in the README rather than solving.
+
+**Architecture link:** use OTW-19's supervision job and OTW-21's ownership
+rules. After OTW-15, a cloud outage removes reminder failover and supervision;
+local reminders can still run. Distinguish process completion, source health
+and notification delivery health: a quiet successful workflow does not prove
+its Telegram credentials work. OTW-22 should retain this reverse supervision.
 
 ## 4. UX & design
 
@@ -480,3 +525,151 @@ rather than from state.
 **Done when:** the differential test in `tests/test_detect.py` is extended with
 both same-pass scenarios and `reminders_cover` agrees with `due_reminders` in
 each.
+
+### OTW-18 · Validate state and make recovery explicit
+**Priority:** P1 · **Effort:** M
+**Problem:** `load_state` turns unreadable JSON into `DEFAULT_STATE` and renames
+the original file. This loses alert/reminder memory and can resend historical
+notifications; valid JSON with an invalid shape or unsupported version is not
+validated either. Even a dry-run currently reaches this mutating recovery path.
+**Fix sketch:** validate top-level and nested field types, supported versions,
+and timestamps before any detection or delivery. Add explicit, tested migrations
+for older supported schemas. Preserve the original evidence on failure and exit
+with an actionable diagnostic instead of starting with empty dedup memory.
+Provide a documented bootstrap path for a genuinely new installation and an
+explicit recovery path for a damaged or missing production state. An older
+backup may lack recent receipts, so do not silently restore it and resume sends.
+Preserve existing dedup key formats and delivery records through migrations;
+retain the tested legacy stale-key migration. Keep dry-runs read-only.
+**Dependencies:** none; foundation for OTW-20 and OTW-21.
+**Files:** `watcher/state.py`, `watcher/__main__.py`, `tests/test_state.py`,
+`tests/test_main.py`; document bootstrap/recovery in `README.md`.
+**Done when:** fixtures cover unreadable JSON, wrong nested types, unsupported
+versions, older supported schemas, missing production state and explicit first
+use. Invalid state causes no Telegram sends, no empty-state overwrite and no
+dry-run mutation. Valid migrations retain all delivery history and are
+idempotent; the documented recovery procedure reconciles receipts before
+notifications resume. Ruff and pytest pass.
+
+### OTW-19 · Split orchestration into bounded jobs
+**Priority:** P2 · **Effort:** M
+**Problem:** `run()` owns fetching, analysis, delivery, reminders and supervision.
+Reminders wait behind all polling and retries; re-reading the clock fixes their
+wording but cannot recover a warning window consumed by slow requests. News
+selection is also tied to the Pathé cadence, complicating cloud news coverage.
+**Fix sketch:** keep a thin CLI and extract explicit Pathé, news, Cinesa,
+reminder and supervision jobs under one coordinator. Give polling aggregate
+time budgets covering request retries, feed loops and token refresh. Check due
+reminders before polling and recompute them after fresh observations, using
+current time and selected-format evidence without sending a rung twice.
+Keep state mutation coordinated; extracting jobs must not introduce concurrent
+writers. Consume OTW-13's explicit health results. Preserve default cadence and
+source selection until OTW-08 deliberately enables cloud news. Keep Pathé's
+guard before its network activity, Cinesa's real headed-browser lifecycle,
+and the existing local-owner/cloud-grace ordering.
+**Dependencies:** OTW-13; OTW-18 supplies validated input state.
+**Files:** `watcher/__main__.py`, proposed `watcher/runner.py` and
+`watcher/jobs.py`, source clients and `watcher/state.py` as needed,
+`tests/test_main.py`, `tests/test_state.py`; owner doc `docs/current-state.md`.
+**Done when:** fake-clock tests prove slow or failing polling cannot consume an
+entire reminder window, a newly discovered opening is evaluated in the same
+run, and skipped/disabled jobs do not block reminders. Default remind mode
+makes no source requests, cadence/grace tests still pass, Python 3.9 works,
+and no framework is introduced. Ruff, pytest and an affected-flow dry-run pass.
+
+### OTW-20 · Persist a notification outbox and delivery receipts
+**Priority:** P1 · **Effort:** L
+**Problem:** Telegram sends happen before the final state save. A later crash
+can discard successful-send memory; retrying currently also depends on several
+flags that freeze observation baselines. Local memory is not sufficient to
+coordinate delivery with the cloud half.
+**Fix sketch:** persist pending notification records before delivery and save
+confirmed receipts immediately afterward through OTW-21's state boundary.
+Separate current observations from pending work and delivered baselines;
+alert-affecting baselines still advance only after confirmed delivery. Retain
+every existing `Finding.key`; merged messages acknowledge all member keys
+atomically. Store the non-secret delivery receipt, including the Telegram
+message ID when available, and preserve the existing silent/loud policy.
+Exclude tokens, chat IDs and raw Telegram responses from shared records.
+Define expiry and supersession for moved openings, obsolete reminders and
+changed availability so a recovered queue does not replay stale advice.
+Design ownership and failover jointly with OTW-21. A timeout or crash can occur
+after a send succeeds but before its receipt is saved: represent uncertain
+outcomes explicitly and document their recovery policy. An outbox alone must
+not be described as exactly-once delivery or cross-host exclusion.
+**Dependencies:** OTW-18, OTW-19 and OTW-21; settle the shared delivery contract
+during OTW-21 before implementing this item. OTW-08 follows it.
+**Files:** `watcher/state.py`, `watcher/notify.py`, `watcher/coalesce.py`,
+the runner/jobs from OTW-19, proposed `watcher/delivery.py`, related state,
+notification and runner tests; owner doc `docs/current-state.md`.
+**Done when:** fault-injection tests cover restart before send, confirmed send
+followed by a later crash, uncertain send outcomes, failed receipt persistence,
+partial merged-group failure and overlapping local/cloud attempts. Confirmed
+receipts survive restart and synchronization; superseded work is retired
+without changing historical keys; undelivered baselines stay eligible. The
+remaining uncertainty policy is explicit. Ruff, pytest and a dry-run pass.
+
+### OTW-21 · Separate deployment from runtime-state synchronization
+**Priority:** P1 · **Effort:** L
+**Problem:** `local-check.sh` uses the same checkout and pull/rebase cycle for
+code deployment and live state shared with GitHub Actions. A state conflict can
+wedge synchronization (OTW-14) and interfere with later code updates. Runtime
+state mixes delivery history with mutable observations and health fields that
+cannot all be merged by the same rule.
+**Fix sketch:** introduce a small state-store/synchronization boundary and
+separate code updates from runtime synchronization. Choose the simplest
+transport that meets the contract; JSON/Git may remain behind the boundary,
+with a separate state ref/worktree if needed. Assign ownership to observation
+and health domains, merge coherent owner snapshots, and preserve confirmed
+delivery records. Account for intentional removals such as recovery clearing
+an error: generic recursive merging or taking the newest individual fields
+can resurrect an outage or create an inconsistent snapshot.
+Implement OTW-14's recovery without dropping unpushed receipts. Define local
+overlap protection, code/schema compatibility, failed-push recovery, and the
+delivery claim/failover contract used by OTW-20. A merge is reconciliation after
+the fact, not permission for two workers to send simultaneously. Keep the
+current pre-run synchronization and grace protections until their replacements
+are verified; keep credentials out of all shared state and Git history.
+**Dependencies:** OTW-18 and OTW-19; OTW-14 is the first implementation increment,
+not a replacement ID. Design OTW-20's contract here and implement its outbox next.
+**Files:** `scripts/local-check.sh`, `.github/workflows/watch.yml`,
+`watcher/state.py`, proposed `watcher/sync.py`, new temporary-repository
+integration tests; owner doc `docs/current-state.md`.
+**Done when:** two temporary clones exercise conflicting receipts, owner-state
+updates, error recovery, failed pushes, overlapping local invocations and a
+code update while state synchronization is broken. No confirmed receipt is
+lost; conflicts resolve or produce an actionable failure; code deployment is
+independent of a clean runtime-state worktree. Tests document the remaining
+send race and OTW-20's coordination contract without promising exactly-once
+delivery. Ruff, pytest and dry-runs pass; live scheduling/deploy checks follow
+the explicit-approval rules in `docs/verification.md`.
+
+### OTW-22 · Move the local owner to an always-on residential host
+**Priority:** P2 · **Effort:** L
+**Problem:** laptop sleep stops source checks and the local reminder owner.
+Cloud failover cannot fetch Pathé and its scheduled runs have measured long
+gaps. Refactoring the watcher cannot make a sleeping laptop perform checks.
+**Fix sketch:** use an owner-approved always-on machine on a residential
+connection for the local jobs, retaining cloud supervision and reminder
+failover. Confirm host OS compatibility with the scripts before choosing it;
+scope any portability work explicitly. Cinesa is currently disabled: keep
+that setting unless asked otherwise. If enabled, its token step still needs
+the supported real headed Chrome/GUI environment, with no stealth, headless
+replacement or challenge-solving. Provision credentials privately and keep
+token caches private; add startup/restart handling and a cutover/rollback
+procedure. Stop the old local owner, reconcile its final receipts, and then
+synchronize verified state before enabling delivery on the replacement, so
+there is never a second active local sender.
+Retain OTW-09's reverse supervision and update host-specific diagnostics.
+**Dependencies:** OTW-18, OTW-21 and OTW-09; may move earlier in the sequence
+when those are ready and an approved host exists. Purchasing hardware and
+changing production scheduling/cutover require the owner's explicit approval.
+**Files:** `scripts/`, deployment/configuration instructions in `README.md`,
+runtime ownership in `docs/current-state.md`, host-specific messages and tests
+in the runner; never commit credentials or a replacement production state.
+**Done when:** an approved cutover preserves dedup and reminder history, the
+old laptop can remain asleep through an overnight observation period while
+checks continue at the configured cadence, and restart recovery is verified.
+Cloud supervision observes the new owner, reverse supervision remains active,
+rollback is documented, and Cinesa's GUI step is verified if enabled. Ruff,
+pytest, source dry-runs and the approved operational checks pass.
