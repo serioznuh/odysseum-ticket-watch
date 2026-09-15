@@ -280,29 +280,70 @@ def build_cinesa_recovered_finding(cfg, now: datetime) -> Finding:
 
 
 def build_heartbeat(cfg, snap: detect.Snapshot, st: dict, now: datetime) -> Finding:
+    now = detect.as_aware(now).astimezone(TZ_PARIS)
     primary = next(
         (s for s in snap.matched_shows if s.get("slug") == cfg.primary_slug), None
     )
-    sales = st.get("sales", {})
-    sale_line = "no sale date yet"
-    if len(sales) == 1:
-        # One watched listing is the normal case; naming its slug adds nothing.
-        sale_line = "sale opens " + detect.fmt_dt_short(
-            detect.parse_iso(next(iter(sales.values())))
-        )
-    elif sales:
-        parts = [
-            f"{slug}: {detect.fmt_dt_short(detect.parse_iso(iso))}"
-            for slug, iso in sales.items()
-        ]
-        sale_line = "sales open — " + "; ".join(parts)
-    listed = "Listed at the cinema" if snap.cinema_entries else "Not yet listed"
-    bookable = "sessions bookable" if snap.showtimes else "nothing bookable"
+    wanted = cfg.pathe_target_format
+    # `sales` in state is a delivery/dedup baseline, not current evidence. It
+    # deliberately retains withdrawn/old dates. Only a future timestamp on a
+    # live, selected listing belongs in the status, and it is national rather
+    # than a promise that the user's dates will open then.
+    sales = sorted({
+        detect.as_aware(dt)
+        for show in snap.matched_shows if detect.selected_listing(show, cfg)
+        for dt in [detect.parse_iso(show.get("salesOpeningDatetime"))]
+        if dt is not None and detect.as_aware(dt) > now
+    })
+    if sales:
+        label = "opening" if len(sales) == 1 else "openings"
+        sale_line = f"Upcoming national sale {label}: " + "; ".join(
+            detect.fmt_dt_short(dt) for dt in sales
+        ) + "."
+    else:
+        scope = " for this format" if wanted else ""
+        sale_line = f"No upcoming national sale opening published{scope}."
     lines = [
         watch_label(cfg),
-        f"Release {detect.fmt_release(primary) if primary else cfg.release_date} · {sale_line}.",
-        f"{listed} · {bookable} · {detect.plural(len(snap.matched_shows), 'listing')} watched.",
+        f"Release {detect.fmt_release(primary) if primary else cfg.release_date}.",
     ]
+    if wanted:
+        lines.append(f"Watching: {detect.FORMAT_LABELS[wanted]}.")
+    if cfg.pathe_target_dates:
+        # Reuse the alert detector's exact day + format evidence. Sent keys and
+        # the historical formats_seen baseline must not imply current booking.
+        confirmed = {f.key for f in detect.target_date_findings(snap, cfg, now)}
+        for day in cfg.pathe_target_dates:
+            if day < now.date().isoformat():
+                status = "date has passed"
+            elif detect.pathe_date_key(cfg, day) in confirmed:
+                status = "booking confirmed"
+            else:
+                status = "booking not confirmed"
+            lines.append(f"{detect.fmt_day(day)}: {status}.")
+    else:
+        bookable = False
+        for show in snap.matched_shows:
+            slug = show.get("slug", "")
+            entry = snap.cinema_entries.get(slug) or {}
+            if detect.selected_listing(show, cfg) and (
+                entry.get("isBookable") is True or entry.get("bookable") is True
+            ):
+                bookable = True
+            for day, sessions in (snap.showtimes.get(slug) or {}).items():
+                if day < now.date().isoformat():
+                    continue
+                for session in sessions:
+                    fmt = detect.classify_format(
+                        show.get("title"), slug, " ".join(session.get("tags") or []),
+                        session.get("auditoriumName"), session.get("specialShowtimeDetails"),
+                    )
+                    if session.get("status") == "available" and (not wanted or fmt == wanted):
+                        bookable = True
+        status = "booking confirmed" if bookable else "booking not confirmed"
+        listed = "Listed at the cinema" if snap.cinema_entries else "Not yet listed"
+        lines.append(f"{listed} · {status}.")
+    lines += [sale_line, f"{detect.plural(len(snap.matched_shows), 'listing')} watched."]
     if cfg.cinesa_enabled:
         cin = st.get("cinesa", {})
         imax = {True: "IMAX scheduled", False: "no IMAX scheduled"}.get(
@@ -324,7 +365,7 @@ def build_heartbeat(cfg, snap: detect.Snapshot, st: dict, now: datetime) -> Find
         confidence="high",
         title="All quiet — nothing new",
         lines=lines,
-        url=cfg.film_page_url,
+        url=(cfg.pathe_page_url or cfg.film_page_url) if wanted else cfg.film_page_url,
     )
 
 
