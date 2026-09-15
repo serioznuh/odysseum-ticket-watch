@@ -56,6 +56,11 @@ A single-user Telegram watcher covering **two independent targets**:
   links to the dedicated event page. Existing dedup keys remain unchanged;
   wanted-date keys are independent of prior format announcements. Programme
   logs now record bookable dates for future availability investigations.
+- **Heartbeat status** — reports current booking evidence for each wanted date
+  in the selected format, using the same rules as the date alerts. Other dates
+  and formats cannot confirm those bookings. Only future national sale openings
+  from live selected listings appear; old or withdrawn dates retained in dedup
+  state do not. The heartbeat links to the selected format's event page.
 - **Shared state** — `state/state.json`, committed to `main` by both halves
   (`[skip ci]`); serves as dedup memory and reminder bookkeeping. The Cinesa
   half writes only on real change, so the 5-min cadence causes no commit churn.
@@ -84,7 +89,7 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Code** — Python package `watcher/` (`pathe.py` and `cinesa.py` API clients,
   `cdp.py` browser token step, `news.py`, `detect.py`, `state.py`, `notify.py`
   Telegram, `config.py`, `__main__.py` CLI); config in `config.toml`; tests in
-  `tests/` (186 passing).
+  `tests/` (201 passing).
 
 ## Cinesa specifics
 
