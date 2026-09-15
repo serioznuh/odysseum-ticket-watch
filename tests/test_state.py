@@ -7,18 +7,25 @@ import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from watcher import detect
 from watcher import state as state_mod
 from watcher.config import load_config
 from watcher.detect import Snapshot
 from watcher.state import (
+    CURRENT_STATE_VERSION,
     DEFAULT_STATE,
+    StateError,
+    StateMissingError,
     already_sent,
+    bootstrap_state,
     due_reminders,
     load_state,
     mark_reminder,
     mark_sent,
     migrate_stale_keys,
+    migrate_state,
     save_state,
     update_from_snapshot,
 )
@@ -31,6 +38,17 @@ OFFSETS = [1440, 120, 15]
 
 def fresh_state() -> dict:
     return json.loads(json.dumps(DEFAULT_STATE))
+
+
+def legacy_state(version: int | None) -> dict:
+    """Complete pre-Cinesa schema as written before schema version 2."""
+    state = fresh_state()
+    state.pop("cinesa")
+    if version is None:
+        state.pop("version")
+    else:
+        state["version"] = version
+    return state
 
 
 def iso_in(delta: timedelta) -> str:
@@ -46,20 +64,124 @@ def test_state_roundtrip(tmp_path):
     save_state(path, st)
     loaded = load_state(path)
     assert already_sent(loaded, "sale:x:y")
-    assert loaded["version"] == 1
+    assert loaded["version"] == CURRENT_STATE_VERSION
 
 
-def test_corrupt_state_recovers(tmp_path):
+def test_unreadable_json_fails_closed_and_preserves_evidence(tmp_path):
     path = tmp_path / "state.json"
-    path.write_text("{ not json !!!", encoding="utf-8")
-    loaded = load_state(path)
-    assert loaded["alerts"] == {}
-    assert (tmp_path / "state.json.bak").exists()
+    evidence = b"{ not json !!!"
+    path.write_bytes(evidence)
+
+    with pytest.raises(StateError, match="preserved unchanged"):
+        load_state(path)
+
+    assert path.read_bytes() == evidence
+    assert list(tmp_path.iterdir()) == [path]
 
 
-def test_missing_state_is_default(tmp_path):
-    loaded = load_state(tmp_path / "nope.json")
-    assert loaded == DEFAULT_STATE
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda state: state.update(alerts=[]), "alerts: expected object"),
+        (
+            lambda state: state["formats_seen"].update(dune="imax70"),
+            r"formats_seen\['dune'\]: expected array of strings",
+        ),
+        (
+            lambda state: state["cinesa"].update(failure_streak="3"),
+            "cinesa.failure_streak: expected non-negative integer",
+        ),
+        (
+            lambda state: state["reminders_sent"].update(
+                {"2026-09-09T09:00:00+02:00": [15]}
+            ),
+            "expected string",
+        ),
+    ],
+)
+def test_wrong_nested_types_are_rejected(tmp_path, mutate, message):
+    state = fresh_state()
+    mutate(state)
+    path = tmp_path / "state.json"
+    before = json.dumps(state).encode()
+    path.write_bytes(before)
+
+    with pytest.raises(StateError, match=message):
+        load_state(path)
+
+    assert path.read_bytes() == before
+
+
+def test_invalid_timestamp_is_rejected(tmp_path):
+    state = fresh_state()
+    state["alerts"]["sale:dune:x"] = "yesterday"
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(StateError, match="invalid ISO-8601 timestamp"):
+        load_state(path)
+
+
+@pytest.mark.parametrize("version", [-1, CURRENT_STATE_VERSION + 1, 999])
+def test_unsupported_versions_are_rejected(tmp_path, version):
+    state = fresh_state()
+    state["version"] = version
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(StateError, match=f"unsupported state schema {version}"):
+        load_state(path)
+
+
+@pytest.mark.parametrize("version", [None, 1])
+def test_supported_older_schemas_migrate_without_losing_receipts(tmp_path, version):
+    state = legacy_state(version)
+    alert_key = "sale:dune:2026-09-09T09:00:00+02:00"
+    target = "2026-09-09T09:00:00+02:00"
+    state["alerts"][alert_key] = "2026-09-03T21:46:42+02:00"
+    state["reminders_sent"][target] = ["1440", "120"]
+    state["formats_seen"]["dune"] = ["imax70"]
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    migrated = load_state(path)
+
+    assert migrated["version"] == CURRENT_STATE_VERSION
+    assert migrated["alerts"] == state["alerts"]
+    assert migrated["reminders_sent"] == state["reminders_sent"]
+    assert migrated["formats_seen"] == state["formats_seen"]
+    assert migrated["cinesa"] == DEFAULT_STATE["cinesa"]
+    assert migrate_state(migrated) == migrated
+
+
+def test_current_schema_missing_delivery_fields_is_not_treated_as_empty_state(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"version": CURRENT_STATE_VERSION}), encoding="utf-8")
+
+    with pytest.raises(StateError, match="missing required field"):
+        load_state(path)
+
+
+def test_missing_state_requires_explicit_bootstrap(tmp_path):
+    path = tmp_path / "state.json"
+
+    with pytest.raises(StateMissingError, match="--bootstrap-state"):
+        load_state(path)
+
+    assert not path.exists()
+
+
+def test_bootstrap_creates_first_use_state_but_never_overwrites(tmp_path):
+    path = tmp_path / "new" / "state.json"
+
+    assert bootstrap_state(path) == DEFAULT_STATE
+    assert load_state(path) == DEFAULT_STATE
+    before = path.read_bytes()
+
+    with pytest.raises(StateError, match="never replaces"):
+        bootstrap_state(path)
+
+    assert path.read_bytes() == before
 
 
 # ------------------------------------------------------------------ snapshot -> state
@@ -475,9 +597,11 @@ def test_stale_key_migration_is_idempotent_and_leaves_new_keys_alone():
 
 def test_load_state_migrates_on_read(tmp_path):
     p = tmp_path / "state.json"
-    p.write_text(
-        json.dumps({"alerts": {"stale:2026-08-07T09:27:48+02:00": "x"}}), encoding="utf-8"
-    )
+    legacy = legacy_state(1)
+    legacy["alerts"] = {
+        "stale:2026-08-07T09:27:48+02:00": "2026-08-08T03:00:00+02:00"
+    }
+    p.write_text(json.dumps(legacy), encoding="utf-8")
 
     st = load_state(p)
 

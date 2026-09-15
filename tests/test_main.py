@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from watcher import __main__ as cli
 from watcher import notify, pathe
 from watcher.detect import TZ_PARIS, Snapshot
-from watcher.state import DEFAULT_STATE
+from watcher.state import CURRENT_STATE_VERSION, DEFAULT_STATE
 
 NOW = datetime(2026, 7, 18, 14, 53, tzinfo=TZ_PARIS)
 
@@ -226,6 +226,80 @@ heartbeat_days = 0
 failure_streak_threshold = 3
 stale_check_hours = 0
 """
+
+
+def _write_cli_config(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text(CONFIG_TOML, encoding="utf-8")
+    return config
+
+
+def test_invalid_state_stops_before_network_or_telegram_and_is_not_overwritten(
+    tmp_path, monkeypatch
+):
+    config = _write_cli_config(tmp_path)
+    state = tmp_path / "state.json"
+    evidence = b"{ broken json"
+    state.write_bytes(evidence)
+    calls = []
+    monkeypatch.setattr(notify, "send_telegram", lambda *args, **kwargs: calls.append("send"))
+    monkeypatch.setattr(pathe, "make_client", lambda: calls.append("source"))
+
+    result = cli.run(["--config", str(config), "--state", str(state), "--mode", "check"])
+
+    assert result == 2
+    assert calls == []
+    assert state.read_bytes() == evidence
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["config.toml", "state.json"]
+
+
+def test_missing_production_state_stops_without_sending_or_creating_it(
+    tmp_path, monkeypatch
+):
+    config = _write_cli_config(tmp_path)
+    state = tmp_path / "missing-state.json"
+    calls = []
+    monkeypatch.setattr(notify, "send_telegram", lambda *args, **kwargs: calls.append("send"))
+
+    result = cli.run(["--config", str(config), "--state", str(state), "--mode", "remind"])
+
+    assert result == 2
+    assert calls == []
+    assert not state.exists()
+
+
+def test_bootstrap_state_is_an_explicit_first_use_action(tmp_path, monkeypatch):
+    config = _write_cli_config(tmp_path)
+    state = tmp_path / "first-use" / "state.json"
+    calls = []
+    monkeypatch.setattr(notify, "send_telegram", lambda *args, **kwargs: calls.append("send"))
+
+    result = cli.run(
+        ["--config", str(config), "--state", str(state), "--bootstrap-state"]
+    )
+
+    assert result == 0
+    assert calls == []
+    assert json.loads(state.read_text(encoding="utf-8")) == DEFAULT_STATE
+
+
+def test_dry_run_migrates_only_in_memory_and_leaves_state_bytes_unchanged(tmp_path):
+    config = _write_cli_config(tmp_path)
+    state = tmp_path / "state.json"
+    old = json.loads(json.dumps(DEFAULT_STATE))
+    old["version"] = 1
+    old.pop("cinesa")
+    before = (json.dumps(old, indent=4) + "\n").encode()
+    state.write_bytes(before)
+
+    result = cli.run(
+        ["--config", str(config), "--state", str(state), "--mode", "remind", "--dry-run"]
+    )
+
+    assert result == 0
+    assert state.read_bytes() == before
+    assert json.loads(state.read_text())["version"] == 1
+    assert CURRENT_STATE_VERSION == 2
 
 
 class PatheCheckRunner:

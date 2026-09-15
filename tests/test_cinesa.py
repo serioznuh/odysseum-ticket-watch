@@ -520,7 +520,10 @@ def test_horizon_move_is_recorded_and_timestamped():
 def test_state_upgrade_fills_in_new_cinesa_keys(tmp_path):
     """A state file written before this feature must load with defaults."""
     path = tmp_path / "state.json"
-    path.write_text(json.dumps({"version": 1, "alerts": {}}), encoding="utf-8")
+    old = fresh_state()
+    old["version"] = 1
+    old.pop("cinesa")
+    path.write_text(json.dumps(old), encoding="utf-8")
     loaded = state_mod.load_state(path)
     assert loaded["cinesa"]["imax_present"] is None
     assert loaded["cinesa"]["imax_absent_streak"] == 0
@@ -598,10 +601,10 @@ def test_cinesa_error_and_recovery_keys_allow_repeat_incidents():
 
 def test_state_upgrade_preserves_existing_cinesa_values(tmp_path):
     path = tmp_path / "state.json"
-    path.write_text(
-        json.dumps({"version": 1, "cinesa": {"imax_present": True, "horizon": "2026-08-25"}}),
-        encoding="utf-8",
-    )
+    old = fresh_state()
+    old["version"] = 1
+    old["cinesa"] = {"imax_present": True, "horizon": "2026-08-25"}
+    path.write_text(json.dumps(old), encoding="utf-8")
     loaded = state_mod.load_state(path)
     assert loaded["cinesa"]["imax_present"] is True
     assert loaded["cinesa"]["horizon"] == "2026-08-25"
