@@ -383,6 +383,11 @@ def run(argv: list[str] | None = None) -> int:
     parser.add_argument("--mode", choices=["check", "remind"], default="check")
     parser.add_argument("--dry-run", action="store_true", help="print alerts instead of sending; do not save state")
     parser.add_argument(
+        "--bootstrap-state",
+        action="store_true",
+        help="create empty state for a genuinely new installation and exit; never overwrites",
+    )
+    parser.add_argument(
         "--skip-if-checked-within",
         type=float,
         default=0,
@@ -411,6 +416,8 @@ def run(argv: list[str] | None = None) -> int:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--version", action="version", version=__version__)
     args = parser.parse_args(argv)
+    if args.bootstrap_state and args.dry_run:
+        parser.error("--bootstrap-state cannot be combined with --dry-run")
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -423,7 +430,15 @@ def run(argv: list[str] | None = None) -> int:
 
     cfg = load_config(args.config)
     state_path = args.state or cfg.state_file
-    st = state_mod.load_state(state_path)
+    try:
+        if args.bootstrap_state:
+            state_mod.bootstrap_state(state_path)
+            log.info("new state bootstrapped at %s", state_path)
+            return 0
+        st = state_mod.load_state(state_path)
+    except state_mod.StateError as exc:
+        log.error("%s", exc)
+        return 2
     now = datetime.now(TZ_PARIS)
 
     if args.test_telegram:

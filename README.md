@@ -1,10 +1,8 @@
 # odysseum-ticket-watch
 
-A small Telegram watcher that tells you **in advance** when tickets for
-*Dune : Troisième partie* go on sale at **Pathé Odysseum** (Montpellier) —
-France's only IMAX 70 mm / 1.43:1 screen — then counts you down to the
-opening so you're ready the minute seats exist. It never auto-buys tickets,
-and it can watch any film/cinema on pathe.fr by editing [config.toml](config.toml).
+A small Telegram watcher that tells you **in advance** when tickets for *Dune :
+Troisième partie* go on sale at **Pathé Odysseum** (Montpellier), then counts down
+to the opening. It never auto-buys; edit [config.toml](config.toml) for another watch.
 
 ## What it sends you
 
@@ -58,11 +56,8 @@ the cause it can prove (IP block, CI range, origin refusal, or a silent Mac).
 
 ### Cinesa target
 
-The second target watches a film that is **already showing**, so there is no
-"sale opening" to wait for: what matters is the booking calendar being extended.
-Cinesa loads its schedule up to a fixed wall and then releases more dates in
-batches (observed: the far edge stayed on 2026-08-25 while the near edge rolled
-forward a day), so you name the dates you actually want and only those buzz.
+The second target watches a film that is **already showing**, so the signal is
+the booking calendar extending. You name the dates you want and only those buzz.
 
 Cinesa runs Vista's Omnia/Connect platform, split across two hosts:
 
@@ -71,12 +66,9 @@ Cinesa runs Vista's Omnia/Connect platform, split across two hosts:
 | `www.cinesa.es` | Cloudflare managed challenge (403 to any plain client) | mints the 12 h API token |
 | `vwc.cinesa.es/WSVistaWebClient` | open — plain `httpx`, clean JSON | every actual check |
 
-Because the data API is not bot-protected, checks are cheap and run on **every**
-5-min firing — no need to guess when Cinesa publishes. Only the token needs a
-browser: [watcher/cdp.py](watcher/cdp.py) drives a **real, headed** Chrome (offscreen,
-throwaway profile, ~3 s) twice a day. Headless is challenged and never settles, so
-headed is required — and no stealth tooling or challenge-solving is used: if Chrome
-stops clearing the challenge itself, the watcher raises ⚠️ rather than working around it.
+The data API runs on **every** 5-min firing. Only its token needs a browser:
+[watcher/cdp.py](watcher/cdp.py) drives real, headed Chrome offscreen about twice a
+day. Headless never clears the challenge; no stealth or challenge-solving is used.
 
 **Requirements:** Chrome installed, Mac logged in and awake — a locked screen is fine (verified); only system sleep or a login window blocks it.
 Chrome self-activates on launch, so focus is handed back explicitly. Refreshes are normally imperceptible, not a 100% guarantee of invisibility; absolute zero laptop impact requires a separate always-on home machine.
@@ -110,6 +102,33 @@ source .env
 .venv/bin/python -m watcher --mode check             # real run: alerts sent, state saved
 ```
 
+### State bootstrap and recovery
+
+State contains permanent alert receipts and reminder rungs, so a missing or
+invalid file stops the watcher before network access or Telegram delivery. The
+watcher never renames, replaces, or silently restores it; dry-runs are read-only.
+
+For a genuinely new installation with no state file, initialize it once:
+
+```bash
+.venv/bin/python -m watcher --bootstrap-state
+```
+
+Bootstrap refuses to overwrite any existing file. A missing production file is
+**not** a new installation. To recover, first stop launchd and disable the Actions
+workflow so neither state writer can send or synchronize. Preserve the damaged
+file, then collect the production clone, remote history, and any backups. Start
+from the newest valid copy and reconcile every known Telegram receipt: take the
+union of `alerts` keys and, per sale timestamp, the union of `reminders_sent`;
+also retain the newest `sales`, `formats_seen`, and `shows_seen` baselines. Never
+resume directly from an older backup—it may omit recent sends and replay them.
+
+Install the reconciled candidate at `general.state_file`, then validate it without
+sending or rewriting it using `python -m watcher --mode remind --dry-run`. Ensure
+that exact repaired state reaches both the production clone and `main` before
+re-enabling Actions and launchd. If delivery history cannot be reconciled, keep
+the watcher stopped rather than risk duplicate historical notifications.
+
 ## Deploy
 
 **Cloud half** (reminders + supervision):
@@ -139,18 +158,11 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.odysseum.ticket-watc
 launchctl kickstart gui/$(id -u)/com.odysseum.ticket-watch            # run once now to test
 ```
 
-The agent fires every 5 minutes and decides whether a check is due
-(**adaptive cadence**, see `[cadence]` config): roughly every 4 h normally,
-every 2 h in the last week before an announced opening, every 30 min in the
-last 48 h, every firing from 4 h before until 6 h after the opening (new
-sessions appear right then), then every 6 h once the selected format is bookable.
-With wanted dates configured, it checks on **every 5-min firing** until each future date has been announced. This still permits about 5 min of detection
-delay while the Mac is awake; sleeping pauses local checks.
-Everything else is a zero-network no-op (~0.5 s of local CPU; the guard
-reads only locally-written state, and git sync happens on runs that actually
-checked). Failed runs retry at the next firing; missed firings coalesce on
-wake. Both halves commit `state/state.json`, so run `git pull --rebase`
-before editing any working copy.
+The agent fires every 5 minutes with adaptive cadence: every 4 h normally, 2 h
+in the last week, 30 min in the last 48 h, every firing around opening, then 6 h
+once bookable. Wanted dates remain at 5 min until announced. Sleep pauses checks;
+failures retry on wake. Both halves commit `state/state.json`, so run
+`git pull --rebase` before editing any working copy.
 
 ## Configuration reference (config.toml)
 
@@ -198,16 +210,6 @@ before editing any working copy.
 
 Secrets are env-only (never in config.toml): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
 
-## Example date alert
-
-```
-🎫 Your dates are open — 19 Dec, 20 Dec, IMAX 70 mm (1.43:1)
-Dune : Troisième partie · Pathé Odysseum, Montpellier
-Bookable with IMAX 70 mm (1.43:1): 2026-12-19
-Bookable with IMAX 70 mm (1.43:1): 2026-12-20
-🔗 https://www.pathe.fr/evenements/dune-troisieme-partie-projection-imax-70mm-55289
-```
-
 ## Notes & limitations
 
 - Pathé's own "Ma liste" wishlist notifications are a reasonable **backup**
@@ -215,6 +217,3 @@ Bookable with IMAX 70 mm (1.43:1): 2026-12-20
   watcher remains the precise/early channel.
 - If Pathé redesigns the API or extends bot protection, you get a ⚠️ alert
   after 3 failed checks instead of silence.
-- Context: the first global IMAX 70 mm ticket wave for Dune 3 (April 2026,
-  not France) sold out within hours — when the Odysseum opening is announced,
-  expect minutes, not days.

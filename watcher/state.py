@@ -6,7 +6,8 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timedelta
+from copy import deepcopy
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,9 +20,10 @@ log = logging.getLogger(__name__)
 # bigger number would mean nothing, but it would keep the state file changing
 # on every firing (see update_from_cinesa).
 IMAX_ABSENT_CONFIRM = 2
+CURRENT_STATE_VERSION = 2
 
 DEFAULT_STATE: dict = {
-    "version": 1,
+    "version": CURRENT_STATE_VERSION,
     "alerts": {},          # dedup key -> ISO timestamp of when the alert was sent
     "sales": {},           # show slug -> salesOpeningDatetime ISO (as last seen)
     "formats_seen": {},    # show slug -> [format classes with sessions already alerted]
@@ -49,30 +51,281 @@ DEFAULT_STATE: dict = {
 }
 
 
+class StateError(RuntimeError):
+    """State cannot be trusted enough to run notification logic."""
+
+
+class StateMissingError(StateError):
+    """State is absent; only an explicit bootstrap may create it."""
+
+
+_CORE_FIELDS = {
+    "alerts",
+    "sales",
+    "formats_seen",
+    "shows_seen",
+    "reminders_sent",
+    "sale_target",
+    "tickets_available",
+    "failure_streak",
+    "error_alerted",
+    "last_check_ok",
+    "last_heartbeat",
+}
+_TOP_LEVEL_FIELDS = _CORE_FIELDS | {"version", "last_error", "cinesa"}
+_CINESA_FIELDS = {
+    "imax_present",
+    "imax_absent_streak",
+    "horizon",
+    "day_count",
+    "last_change",
+    "failure_streak",
+    "error_alerted",
+    "blind_since",
+}
+
+
+def _type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    return type(value).__name__
+
+
+def _fail(field: str, expected: str, value: Any) -> None:
+    raise StateError(f"{field}: expected {expected}, got {_type_name(value)}")
+
+
+def _require_mapping(value: Any, field: str) -> dict:
+    if not isinstance(value, dict):
+        _fail(field, "object", value)
+    return value
+
+
+def _require_string(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        _fail(field, "string", value)
+    return value
+
+
+def _require_bool(value: Any, field: str) -> None:
+    if not isinstance(value, bool):
+        _fail(field, "boolean", value)
+
+
+def _require_nonnegative_int(value: Any, field: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        _fail(field, "non-negative integer", value)
+
+
+def _parse_timestamp(value: Any, field: str) -> None:
+    text = _require_string(value, field)
+    # Python 3.9's fromisoformat does not accept the otherwise standard `Z`.
+    candidate = f"{text[:-1]}+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise StateError(f"{field}: invalid ISO-8601 timestamp {text!r}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise StateError(f"{field}: timestamp must include a UTC offset")
+
+
+def _parse_optional_timestamp(value: Any, field: str) -> None:
+    if value is not None:
+        _parse_timestamp(value, field)
+
+
+def _validate_string_list(value: Any, field: str) -> None:
+    if not isinstance(value, list):
+        _fail(field, "array of strings", value)
+    for index, item in enumerate(value):
+        _require_string(item, f"{field}[{index}]")
+
+
+def _validate_string_timestamp_map(value: Any, field: str) -> None:
+    mapping = _require_mapping(value, field)
+    for key, timestamp in mapping.items():
+        _require_string(key, f"{field} key")
+        _parse_timestamp(timestamp, f"{field}[{key!r}]")
+
+
+def _validate_sales(value: Any) -> None:
+    mapping = _require_mapping(value, "sales")
+    for slug, timestamp in mapping.items():
+        _require_string(slug, "sales key")
+        _parse_timestamp(timestamp, f"sales[{slug!r}]")
+
+
+def _validate_formats_seen(value: Any) -> None:
+    mapping = _require_mapping(value, "formats_seen")
+    for slug, formats in mapping.items():
+        _require_string(slug, "formats_seen key")
+        _validate_string_list(formats, f"formats_seen[{slug!r}]")
+
+
+def _validate_reminders(value: Any) -> None:
+    mapping = _require_mapping(value, "reminders_sent")
+    for target, offsets in mapping.items():
+        _parse_timestamp(target, "reminders_sent key")
+        _validate_string_list(offsets, f"reminders_sent[{target!r}]")
+        for offset in offsets:
+            if offset != "open" and not (offset.isdigit() and int(offset) > 0):
+                raise StateError(
+                    f"reminders_sent[{target!r}]: invalid reminder receipt {offset!r}"
+                )
+
+
+def _validate_cinesa(value: Any, *, require_all: bool) -> None:
+    cin = _require_mapping(value, "cinesa")
+    unknown = set(cin) - _CINESA_FIELDS
+    if unknown:
+        raise StateError(f"cinesa: unknown field(s): {', '.join(sorted(unknown))}")
+    required = _CINESA_FIELDS - {"blind_since"}
+    missing = required - set(cin)
+    if require_all and missing:
+        raise StateError(f"cinesa: missing required field(s): {', '.join(sorted(missing))}")
+
+    if "imax_present" in cin and cin["imax_present"] is not None:
+        _require_bool(cin["imax_present"], "cinesa.imax_present")
+    for field in ("imax_absent_streak", "day_count", "failure_streak"):
+        if field in cin:
+            _require_nonnegative_int(cin[field], f"cinesa.{field}")
+    if "horizon" in cin and cin["horizon"] is not None:
+        horizon = _require_string(cin["horizon"], "cinesa.horizon")
+        try:
+            date.fromisoformat(horizon)
+        except ValueError as exc:
+            raise StateError(f"cinesa.horizon: invalid ISO date {horizon!r}") from exc
+    for field in ("last_change", "blind_since"):
+        if field in cin:
+            _parse_optional_timestamp(cin[field], f"cinesa.{field}")
+    if "error_alerted" in cin:
+        _require_bool(cin["error_alerted"], "cinesa.error_alerted")
+
+
+def _validate_fields(state: dict, *, require_all: bool) -> None:
+    unknown = set(state) - _TOP_LEVEL_FIELDS
+    if unknown:
+        raise StateError(f"state: unknown field(s): {', '.join(sorted(unknown))}")
+    missing = _CORE_FIELDS - set(state)
+    if missing:
+        raise StateError(f"state: missing required field(s): {', '.join(sorted(missing))}")
+    if require_all and "cinesa" not in state:
+        raise StateError("state: missing required field(s): cinesa")
+
+    _validate_string_timestamp_map(state["alerts"], "alerts")
+    _validate_sales(state["sales"])
+    _validate_formats_seen(state["formats_seen"])
+    _validate_string_list(state["shows_seen"], "shows_seen")
+    _validate_reminders(state["reminders_sent"])
+    _parse_optional_timestamp(state["sale_target"], "sale_target")
+    _require_bool(state["tickets_available"], "tickets_available")
+    _require_nonnegative_int(state["failure_streak"], "failure_streak")
+    _require_bool(state["error_alerted"], "error_alerted")
+    _parse_optional_timestamp(state["last_check_ok"], "last_check_ok")
+    _parse_optional_timestamp(state["last_heartbeat"], "last_heartbeat")
+    if "last_error" in state:
+        _require_string(state["last_error"], "last_error")
+    if "cinesa" in state:
+        _validate_cinesa(state["cinesa"], require_all=require_all)
+
+
+def _migrate_v0_to_v1(state: dict) -> dict:
+    migrated = deepcopy(state)
+    migrated["version"] = 1
+    return migrated
+
+
+def _migrate_v1_to_v2(state: dict) -> dict:
+    migrated = deepcopy(state)
+    cinesa = deepcopy(DEFAULT_STATE["cinesa"])
+    cinesa.update(migrated.get("cinesa", {}))
+    migrated["cinesa"] = cinesa
+    migrated["version"] = 2
+    return migrated
+
+
+_MIGRATIONS = {
+    0: _migrate_v0_to_v1,
+    1: _migrate_v1_to_v2,
+}
+
+
+def migrate_state(loaded: Any) -> dict:
+    """Validate and migrate a decoded state object without mutating it."""
+    state = _require_mapping(loaded, "state")
+    raw_version = state.get("version", 0)
+    if isinstance(raw_version, bool) or not isinstance(raw_version, int):
+        _fail("version", "integer", raw_version)
+    if raw_version < 0 or raw_version > CURRENT_STATE_VERSION:
+        raise StateError(
+            f"version: unsupported state schema {raw_version}; "
+            f"this watcher supports versions 0 through {CURRENT_STATE_VERSION}"
+        )
+
+    # Every historical schema had the core delivery/baseline fields. Requiring
+    # them prevents a truncated-but-valid `{}` from becoming empty dedup state.
+    _validate_fields(state, require_all=raw_version == CURRENT_STATE_VERSION)
+    migrated = deepcopy(state)
+    version = raw_version
+    while version < CURRENT_STATE_VERSION:
+        migrated = _MIGRATIONS[version](migrated)
+        version = migrated["version"]
+
+    # Keep the established stale-key compatibility migration. It changes only
+    # the obsolete stale key shape and preserves its delivery timestamp.
+    migrate_stale_keys(migrated)
+    _validate_fields(migrated, require_all=True)
+    return migrated
+
+
+def _state_error(path: Path, detail: str) -> StateError:
+    return StateError(
+        f"state file {path} is invalid: {detail}. The original was preserved unchanged; "
+        "refusing to run with empty notification history. Stop schedulers and follow "
+        "the README 'State recovery' procedure"
+    )
+
+
+def _reject_json_constant(value: str) -> None:
+    raise StateError(f"non-standard JSON constant {value}")
+
+
 def load_state(path: str | Path) -> dict:
+    """Load trusted state, failing closed without changing the filesystem."""
     p = Path(path)
     if not p.exists():
-        return json.loads(json.dumps(DEFAULT_STATE))
+        raise StateMissingError(
+            f"state file {p} is missing; refusing to assume a new installation and lose "
+            "notification history. For first use run with --bootstrap-state; for recovery "
+            "follow the README 'State recovery' procedure"
+        )
     try:
-        loaded = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        log.error("state file unreadable (%s) — starting fresh, old file kept as .bak", e)
-        try:
-            p.replace(p.with_suffix(".json.bak"))
-        except OSError:
-            pass
-        return json.loads(json.dumps(DEFAULT_STATE))
-    merged = json.loads(json.dumps(DEFAULT_STATE))
-    nested_defaults = {k: v for k, v in merged.items() if isinstance(v, dict) and k == "cinesa"}
-    merged.update(loaded)
-    # `update` is shallow: re-apply defaults for sub-keys a state file written
-    # by an older version does not have yet, so new fields arrive initialised.
-    for key, defaults in nested_defaults.items():
-        section = dict(defaults)
-        section.update(merged.get(key) or {})
-        merged[key] = section
-    migrate_stale_keys(merged)
-    return merged
+        text = p.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise _state_error(p, str(exc)) from exc
+    try:
+        loaded = json.loads(text, parse_constant=_reject_json_constant)
+        return migrate_state(loaded)
+    except (json.JSONDecodeError, StateError) as exc:
+        raise _state_error(p, str(exc)) from exc
+
+
+def bootstrap_state(path: str | Path) -> dict:
+    """Create initial empty state exclusively; never replace an existing file."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    initial = deepcopy(DEFAULT_STATE)
+    try:
+        with p.open("x", encoding="utf-8") as state_file:
+            json.dump(initial, state_file, indent=2, sort_keys=True)
+            state_file.write("\n")
+    except FileExistsError as exc:
+        raise StateError(
+            f"state file {p} already exists; bootstrap never replaces notification history"
+        ) from exc
+    except OSError as exc:
+        raise StateError(f"could not bootstrap state file {p}: {exc}") from exc
+    return initial
 
 
 LEGACY_STALE_KEY = re.compile(
@@ -105,10 +358,13 @@ def migrate_stale_keys(state: dict) -> None:
 
 
 def save_state(path: str | Path, state: dict) -> None:
+    # Validate before even creating the parent directory or temporary file: a
+    # programming error must not replace the last trusted delivery history.
+    validated = migrate_state(state)
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps(validated, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, p)
 
 
