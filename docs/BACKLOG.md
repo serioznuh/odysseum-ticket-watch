@@ -35,6 +35,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-20 | Persist a notification outbox and delivery receipts | P1 | L | Infra, tooling & docs | [ ] |
 | OTW-21 | Separate deployment from runtime-state synchronization | P1 | L | Infra, tooling & docs | [ ] |
 | OTW-22 | Move the local owner to an always-on residential host | P2 | L | Infra, tooling & docs | [ ] |
+| OTW-23 | An uncaught save_state failure after delivery can re-send alerts | P2 | S | Bugs | [ ] |
 
 ## Architecture implementation sequence
 
@@ -247,8 +248,8 @@ unless it changes or meets the existing supervision policy.
 ### OTW-14 · An aborted state rebase can wedge the push until a human intervenes
 
 **Problem:** `local-check.sh` now aborts a failed rebase rather than leaving
-conflict markers in `state.json` (which would make `load_state` start fresh and
-re-send every alert). Correct, but the local state commit survives unpushed, so
+conflict markers in `state.json` (which now make `load_state` exit non-zero with
+an actionable diagnostic). Correct, but the local state commit survives unpushed, so
 the following `git push` is rejected non-fast-forward and `set -e` exits the
 script 1. The same conflict then recurs on every firing and local state stops
 reaching origin until someone resolves it by hand.
@@ -673,3 +674,25 @@ checks continue at the configured cadence, and restart recovery is verified.
 Cloud supervision observes the new owner, reverse supervision remains active,
 rollback is documented, and Cinesa's GUI step is verified if enabled. Ruff,
 pytest, source dry-runs and the approved operational checks pass.
+
+### OTW-23 · An uncaught save_state failure after delivery can re-send alerts
+**Priority:** P2 · **Effort:** S
+**Problem:** OTW-18 made `load_state`/`migrate_state` fail closed with a clean
+diagnostic exit, but `__main__.run`'s call to `save_state` after delivery is
+not wrapped: a `StateError` there (for example from a malformed upstream
+timestamp reaching `_parse_timestamp`, which since OTW-18 requires a UTC
+offset) exits with a traceback and never persists the run's updated dedup
+memory. Alerts already sent in that run would then be re-sent on the next
+firing, because the delivery baseline never reached disk. No evidence today
+that Pathé emits such a timestamp (production has always been offset-aware),
+so this is hardening rather than an active bug.
+**Fix sketch:** catch `StateError` around the post-delivery `save_state` call
+in `watcher/__main__.py`, log it, and exit with an actionable diagnostic
+instead of an uncaught traceback. Consider also validating/dropping a
+malformed `salesOpeningDatetime` at ingestion in `watcher/state.py` so a bad
+upstream value cannot become fatal only after delivery.
+**Files:** `watcher/__main__.py`, `watcher/state.py`, `tests/test_main.py`.
+**Done when:** a test simulating a `StateError` from the post-delivery
+`save_state` call exits with a clear diagnostic (no traceback) and the run's
+already-sent alerts are not silently lost from the next diagnostic; ruff and
+pytest pass.

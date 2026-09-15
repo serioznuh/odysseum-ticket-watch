@@ -286,6 +286,10 @@ def _state_error(path: Path, detail: str) -> StateError:
     )
 
 
+def _reject_json_constant(value: str) -> None:
+    raise StateError(f"non-standard JSON constant {value}")
+
+
 def load_state(path: str | Path) -> dict:
     """Load trusted state, failing closed without changing the filesystem."""
     p = Path(path)
@@ -300,14 +304,9 @@ def load_state(path: str | Path) -> dict:
     except OSError as exc:
         raise _state_error(p, str(exc)) from exc
     try:
-        loaded = json.loads(
-            text,
-            parse_constant=lambda value: (_ for _ in ()).throw(
-                ValueError(f"non-standard JSON constant {value}")
-            ),
-        )
+        loaded = json.loads(text, parse_constant=_reject_json_constant)
         return migrate_state(loaded)
-    except (json.JSONDecodeError, ValueError, StateError) as exc:
+    except (json.JSONDecodeError, StateError) as exc:
         raise _state_error(p, str(exc)) from exc
 
 

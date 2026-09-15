@@ -64,6 +64,10 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Shared state** — `state/state.json`, committed to `main` by both halves
   (`[skip ci]`); serves as dedup memory and reminder bookkeeping. The Cinesa
   half writes only on real change, so the 5-min cadence causes no commit churn.
+  State is schema-validated before detection or delivery: invalid, unreadable,
+  or unsupported-version state makes `--mode check` exit non-zero with an
+  actionable diagnostic and leaves the file unchanged. A genuinely new
+  installation creates empty state explicitly with `--bootstrap-state`.
   Failure streaks stop changing at their alert threshold, and every Pathé alert
   baseline — listings, formats and `sales` — advances only after the alert it
   gates was delivered, so one failed send cannot retire an announcement.
