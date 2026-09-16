@@ -151,8 +151,8 @@ A single-user Telegram watcher covering **two independent targets**:
   without reopening Chrome, and a good response clears the cooldown. A token
   that is actually dead (or 401-rejected) still forces renewal and fails loudly
   rather than going quiet. A mint that cannot confirm Chrome exited is the one
-  failure no fallback absorbs: `cinesa.leak_since` is re-tested against the
-  profile each firing and alerts on its own.
+  failure no fallback absorbs: `cinesa.leak_since` is re-tested after every
+  Cinesa outcome, clears only on proof the profile is free, and alerts on its own.
 - Verified IDs: film `HO00003228`, site `032` (Diagonal Mar), IMAX showtime
   attribute `0000000086`.
 - **The booking wall is fixed, not rolling** — observed 2026-07-29→08-25

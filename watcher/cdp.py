@@ -41,6 +41,8 @@ HARD_BLOCK_TITLE = "Attention Required!"
 CLEANUP_WAIT_SECONDS = 3.0
 CLEANUP_POLL_SECONDS = 0.1
 _MISSING = object()
+_LOCK_ABSENT = object()
+_LOCK_UNKNOWN = object()
 
 # Every blocking step's own ceiling — what it waits when there is no budget,
 # i.e. exactly what it has always waited. With a budget, each one is clamped to
@@ -389,23 +391,32 @@ def _discover_profile_pids(
     return None
 
 
-def _locked_profile_pid(profile_dir: str) -> int | None:
-    """The PID Chrome itself recorded as the owner of our profile.
+def _locked_profile_pid(profile_dir: str) -> int | object:
+    """The PID Chrome recorded, or an explicit absent/unknown sentinel.
 
     Read straight off `SingletonLock`, with no subprocess involved, so it still
     works when the `ps` listing that normally finds Chrome has timed out — and
-    it names the very process holding the profile lock we must not leak.
+    it names the very process holding the profile lock we must not leak. Only a
+    missing path is demonstrably unlocked. A present but unreadable or malformed
+    lock is unknown, never free.
     """
+    path = os.path.join(profile_dir, CHROME_PROFILE_LOCK)
     try:
-        target = os.readlink(os.path.join(profile_dir, CHROME_PROFILE_LOCK))
-    except OSError:
-        return None  # no lock: Chrome exited cleanly, or never got that far
+        target = os.readlink(path)
+    except FileNotFoundError:
+        return _LOCK_ABSENT
+    except OSError as e:
+        log.warning("could not read Chrome profile lock %s: %s", path, e)
+        return _LOCK_UNKNOWN
     try:
         pid = int(target.rpartition("-")[2])
     except ValueError:
         log.warning("unrecognised Chrome profile lock target %r", target)
-        return None
-    return pid if pid > 0 else None
+        return _LOCK_UNKNOWN
+    if pid <= 0:
+        log.warning("unrecognised Chrome profile lock target %r", target)
+        return _LOCK_UNKNOWN
+    return pid
 
 
 def _is_our_chrome(pid: int, profile_dir: str, budget: Budget | None) -> bool | None:
@@ -448,8 +459,9 @@ def _pids_from_profile_lock(
     `None` still means unknown — an unverifiable candidate is not signalled.
     """
     pid = _locked_profile_pid(profile_dir)
-    if pid is None:
+    if pid is _LOCK_ABSENT or pid is _LOCK_UNKNOWN:
         return None
+    assert isinstance(pid, int)
     if _is_our_chrome(pid, profile_dir, budget) is not True:
         log.warning(
             "Chrome profile lock for %s names PID %d, which could not be"
@@ -480,11 +492,10 @@ def _terminate_by_profile(profile_dir: str, budget: Budget | None = None) -> boo
     own. SIGTERM is never skipped for want of time once a process is known;
     only the *confirmation* is cut short.
 
-    Returns whether Chrome on our profile was signalled or was already gone.
-    False means nothing could be discovered — by `ps` or by the profile lock —
-    so nothing was signalled and a leftover instance may still hold the lock.
-    The caller must not report a clean mint on that, or the leak repeats every
-    run in silence (round-4 review).
+    Returns True only when a successful lookup confirms no matching process.
+    False covers unavailable discovery, failed confirmation, or processes that
+    survived the deadline. The caller must surface all three as a possible leak
+    rather than report a clean mint.
     """
     pids = _discover_profile_pids(profile_dir, budget)
     if pids is None:
@@ -512,14 +523,14 @@ def _terminate_by_profile(profile_dir: str, budget: Budget | None = None) -> boo
             break
         current = _discover_profile_pids(profile_dir, budget)
         if current is None:
-            # SIGTERM went out; only the confirmation is missing. Say so rather
-            # than returning as though Chrome had exited.
-            log.warning(
+            # SIGTERM going out is not evidence that Chrome obeyed it. Cleanup
+            # is clean only after a successful lookup sees no matching process.
+            log.error(
                 "signalled Chrome on watcher profile %s but could not confirm"
                 " it exited: process lookup unavailable",
                 profile_dir,
             )
-            return True
+            return False
         if not current:
             return True
         pids = current
@@ -531,13 +542,14 @@ def _terminate_by_profile(profile_dir: str, budget: Budget | None = None) -> boo
         time.sleep(min(CLEANUP_POLL_SECONDS, remaining))
 
     if pids:
-        log.warning(
+        log.error(
             "Chrome processes for watcher profile %s did not exit within %.1fs: %s",
             profile_dir,
             CLEANUP_WAIT_SECONDS,
             ", ".join(str(pid) for pid in sorted(pids)),
         )
-    return True  # signalled; a slow shutdown is not a leak
+        return False
+    return True
 
 
 def _profile_leak(profile: str, original: BaseException | None) -> ChromeLeakError:
@@ -560,8 +572,11 @@ def profile_lock_status(profile_dir: str, budget: Budget | None = None) -> bool 
     firing: one `readlink`, and a single-PID `ps` only when a lock exists.
     """
     pid = _locked_profile_pid(profile_dir)
-    if pid is None:
+    if pid is _LOCK_ABSENT:
         return False  # no lock at all: nothing holds the profile
+    if pid is _LOCK_UNKNOWN:
+        return None
+    assert isinstance(pid, int)
     ours = _is_our_chrome(pid, profile_dir, budget)
     if ours is None:
         return None
@@ -573,8 +588,8 @@ def profile_lock_status(profile_dir: str, budget: Budget | None = None) -> bool 
 def _cleanup_chrome(profile: str, previous_app: str | None) -> bool:
     """Tear our Chrome down on its own allowance, and hand focus back.
 
-    Returns whether Chrome was signalled (or was already gone). Never raises:
-    the caller may be unwinding a failure whose cause must survive.
+    Returns whether Chrome was confirmed gone. Never raises: the caller may be
+    unwinding a failure whose cause must survive.
     """
     cleanup = Budget(CLEANUP_BUDGET_SECONDS, label="Chrome cleanup")
     try:

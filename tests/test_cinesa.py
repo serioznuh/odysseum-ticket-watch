@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from watcher import __main__ as main
-from watcher import cdp, cinesa, detect, notify
+from watcher import cdp, cinesa, detect, jobs, notify
 from watcher import state as state_mod
 from watcher.budget import Budget
 from watcher.detect import CinesaSnapshot
@@ -824,6 +824,7 @@ def test_a_leaked_chrome_makes_the_run_exit_non_zero(tmp_path, monkeypatch):
         raise cdp.ChromeLeakError("could not be confirmed terminated")
 
     monkeypatch.setattr(cinesa, "fetch_snapshot", leaking_fetch)
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: True)
     monkeypatch.setattr(notify, "send_telegram", lambda *a, **kw: True)
 
     assert main.run(
@@ -840,6 +841,7 @@ def test_a_leaked_chrome_makes_the_run_exit_non_zero(tmp_path, monkeypatch):
         raise RuntimeError("HTTP 500 from vwc.cinesa.es")
 
     monkeypatch.setattr(cinesa, "fetch_snapshot", plain_outage)
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: False)
     assert main.run(
         ["--config", str(runner.config), "--state", str(runner.state),
          "--mode", "check", "--skip-if-checked-within", "6"]
@@ -924,3 +926,76 @@ def test_a_freed_profile_clears_the_leak_and_the_run_is_healthy_again(
     monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: False)
     assert main.run(argv) == 0
     assert "leak_since" not in json.loads(runner.state.read_text())["cinesa"]
+
+
+def test_an_existing_leak_is_reconciled_after_an_unrelated_failure(
+    tmp_path, monkeypatch
+):
+    """Leak truth is independent of the exception raised by this firing.
+
+    An ordinary Cinesa failure must keep a live prior leak visible and make the
+    run non-zero. The same ordinary failure must clear the episode once the
+    profile is demonstrably free, even if required token mints keep failing.
+    """
+    runner = CheckRunner(tmp_path, monkeypatch, {"imax_present": True})
+    st = json.loads(runner.state.read_text())
+    st["cinesa"]["leak_since"] = (
+        datetime.now(PARIS) - timedelta(hours=2)
+    ).isoformat()
+    runner.state.write_text(json.dumps(st), encoding="utf-8")
+    monkeypatch.setattr(
+        cinesa,
+        "fetch_snapshot",
+        lambda cfg, **_kw: (_ for _ in ()).throw(RuntimeError("token mint failed")),
+    )
+    monkeypatch.setattr(notify, "send_telegram", lambda *a, **kw: False)
+    argv = [
+        "--config",
+        str(runner.config),
+        "--state",
+        str(runner.state),
+        "--mode",
+        "check",
+        "--skip-if-checked-within",
+        "6",
+    ]
+
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: True)
+    assert main.run(argv) == 1
+    assert json.loads(runner.state.read_text())["cinesa"]["leak_since"]
+
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: False)
+    assert main.run(argv) == 0
+    assert "leak_since" not in json.loads(runner.state.read_text())["cinesa"]
+
+
+def test_first_leak_alert_is_loud_even_when_episode_crossed_midnight(monkeypatch):
+    """Loudness follows a receipt for this episode, not calendar age."""
+
+    class LeakCfg(Cfg):
+        failure_streak_threshold = 3
+        cinesa_chrome_profile = "/tmp/watcher-profile"
+
+    since = datetime(2026, 9, 15, 23, 50, tzinfo=PARIS)
+    first_now = datetime(2026, 9, 16, 0, 10, tzinfo=PARIS)
+    state = fresh_state()
+    state["cinesa"]["leak_since"] = since.isoformat()
+    ctx = jobs.RunContext(cfg=LeakCfg, state=state, clock=lambda: first_now)
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: True)
+
+    first = jobs.CinesaOutcome()
+    jobs.track_profile_leak(ctx, first, first_now, False, None)
+
+    assert len(first.findings) == 1
+    assert first.findings[0].kind == "WATCHER_ERROR"
+    assert first.findings[0].title == "Cinesa token step needs you"
+
+    # Only a recorded successful delivery turns a later daily reminder silent.
+    state_mod.mark_sent(state, first.findings[0].key, first_now)
+    repeat_now = first_now + timedelta(days=1)
+    repeat = jobs.CinesaOutcome()
+    jobs.track_profile_leak(ctx, repeat, repeat_now, False, None)
+
+    assert len(repeat.findings) == 1
+    assert repeat.findings[0].kind == "WATCHER_STILL_BLIND"
+    assert "day 3" in repeat.findings[0].title

@@ -266,8 +266,9 @@ def test_profile_cleanup_warns_when_exit_cannot_be_confirmed(
     monkeypatch.setattr(cdp.os, "kill", lambda _pid, _signal: None)
 
     with caplog.at_level(logging.WARNING, logger=cdp.log.name):
-        cdp._terminate_by_profile(str(tmp_path / "watcher-profile"))
+        clean = cdp._terminate_by_profile(str(tmp_path / "watcher-profile"))
 
+    assert clean is False
     assert "did not exit" in caplog.text
 
 
@@ -415,8 +416,9 @@ def test_a_lookup_that_fails_only_after_the_kill_still_reports_uncertainty(
     monkeypatch.setattr(cdp.os, "kill", lambda pid, _sig: killed.append(pid))
 
     with caplog.at_level(logging.WARNING, logger=cdp.log.name):
-        cdp._terminate_by_profile(str(profile))
+        clean = cdp._terminate_by_profile(str(profile))
 
+    assert clean is False
     assert killed == [101]
     assert "could not confirm" in caplog.text
 
@@ -445,7 +447,8 @@ def test_the_profile_lock_still_finds_chrome_when_ps_cannot(
 
     monkeypatch.setattr(cdp.subprocess, "run", ps)
     monkeypatch.setattr(cdp.os, "kill", lambda pid, _sig: killed.append(pid))
-    monkeypatch.setattr(cdp, "_discover_profile_pids", lambda *_a: None)
+    discoveries = iter([None, set()])
+    monkeypatch.setattr(cdp, "_discover_profile_pids", lambda *_a: next(discoveries))
 
     with caplog.at_level(logging.WARNING, logger=cdp.log.name):
         assert cdp._terminate_by_profile(str(profile)) is True
@@ -610,3 +613,27 @@ def test_an_unanswerable_ps_is_unknown_not_a_free_profile(monkeypatch, tmp_path)
     # And no lock file at all is the ordinary healthy answer.
     os.unlink(profile / cdp.CHROME_PROFILE_LOCK)
     assert cdp.profile_lock_status(str(profile)) is False
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["not-a-chrome-lock", "somehost-0"],
+)
+def test_a_malformed_profile_lock_is_unknown_not_free(tmp_path, target):
+    profile = tmp_path / "watcher-profile"
+    profile.mkdir()
+    os.symlink(target, profile / cdp.CHROME_PROFILE_LOCK)
+
+    assert cdp.profile_lock_status(str(profile)) is None
+
+
+def test_an_unreadable_profile_lock_is_unknown_not_free(monkeypatch, tmp_path):
+    profile = tmp_path / "watcher-profile"
+    profile.mkdir()
+
+    def denied(_path):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(cdp.os, "readlink", denied)
+
+    assert cdp.profile_lock_status(str(profile)) is None
