@@ -51,7 +51,7 @@ bookability is read off the cinema programme. Unexpected detail/showtimes failur
 degrade health without discarding the rest of the snapshot.
 
 Safety nets: 🔴 after 3 consecutive Pathé failures (including partial listing failures once full coverage has been absent for 6 h),
-🔴 if nothing has succeeded for 18 h — **then every 24 h until it recovers**, so
+🔴 if the local catalogue liveness pulse stops for 18 h — **then every 24 h**, so
 a long outage cannot fall out of mind — and 💤 a weekly heartbeat. Each names
 the cause it can prove (IP block, CI range, origin refusal, or a silent Mac).
 

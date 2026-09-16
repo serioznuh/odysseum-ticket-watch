@@ -73,14 +73,20 @@ A single-user Telegram watcher covering **two independent targets**:
   baseline — listings, formats and `sales` — advances only after the alert it
   gates was delivered, so one failed send cannot retire an announcement.
   `last_error` records the failure cause for the cloud pass and is rewritten
-  only when the text changes, so a steady outage still writes state once.
+  only when the text changes. `last_check_ok` means fully healthy;
+  `last_catalogue_ok` is a separate, hourly-throttled local-liveness pulse that
+  also advances on partial snapshots. Thus a steady degradation does not write
+  every 5 min, and the cloud can still tell a live degraded Mac from a dark one.
 - **Pathé failure model** — catalogue failures still blind the check, while
   every best-effort detail/showtimes result explicitly distinguishes data,
   authoritative emptiness, expected refusal and unexpected failure. One bad
   listing cannot discard the rest of the snapshot, but an unexpected failure
   no longer refreshes `last_check_ok`: it enters the existing capped failure
   streak, appears by name in the heartbeat, and raises one degraded-watch alert
-  after the supervision threshold (with silent daily repeats if it persists).
+  after the supervision threshold. An unchanged condition stays quiet, while a
+  later catalogue-wide failure re-arms supervision and raises its own loud
+  blind alert. If the local liveness pulse subsequently goes stale, cloud
+  supervision reports the whole local half dark, never merely degraded.
   It also cannot turn a programme-wide `isBookable` bit into guessed format
   evidence, so degradation cannot invent a ticket alert or baseline.
   The showtimes endpoint serves only `isMovie: true` listings and refuses every
@@ -95,7 +101,7 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Code** — Python package `watcher/` (`pathe.py` and `cinesa.py` API clients,
   `cdp.py` browser token step, `news.py`, `detect.py`, `state.py`, `notify.py`
   Telegram, `config.py`, `__main__.py` CLI); config in `config.toml`; tests in
-  `tests/` (224 passing).
+  `tests/` (230 passing).
 
 ## Cinesa specifics
 

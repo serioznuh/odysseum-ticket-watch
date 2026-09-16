@@ -299,7 +299,7 @@ def test_dry_run_migrates_only_in_memory_and_leaves_state_bytes_unchanged(tmp_pa
     assert result == 0
     assert state.read_bytes() == before
     assert json.loads(state.read_text())["version"] == 1
-    assert CURRENT_STATE_VERSION == 2
+    assert CURRENT_STATE_VERSION == 3
 
 
 class PatheCheckRunner:
@@ -401,6 +401,99 @@ def test_persistent_listing_failure_uses_supervision_and_never_reports_recovery(
     assert st["failure_streak"] == 0
     assert st["error_alerted"] is False
     assert st["last_check_ok"] is not None
+
+
+def test_degraded_watch_escalating_to_catalogue_blindness_alerts_again(
+    tmp_path, monkeypatch
+):
+    """Acknowledging partial degradation must never suppress a later, strictly
+    worse catalogue outage. Unchanged blindness still settles after that alert."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    slug = "dune-troisieme-partie"
+    degraded = Snapshot(
+        matched_shows=[{"slug": slug, "title": "Dune : Troisième partie"}],
+        listing_results={
+            slug: {"showtimes": detect.FetchResult.failed("HTTP 500 from showtimes")}
+        },
+    )
+    for _ in range(3):
+        st = runner.run(degraded, delivered=True)
+    assert st["error_alerted"] is True
+    assert "Pathé watch is DEGRADED" in runner.sent[0]
+
+    blind = RuntimeError("HTTP 403 from Pathé catalogue")
+    st = runner.run(blind, delivered=True)
+
+    assert len(runner.sent) == 1
+    assert "Pathé watch is BLIND" in runner.sent[0]
+    assert st["error_alerted"] is True
+    assert st["last_error"] == "HTTP 403"
+
+    settled = runner.state.read_bytes()
+    runner.run(blind, delivered=True)
+    assert runner.sent == []
+    assert runner.state.read_bytes() == settled
+
+
+def test_cloud_reports_a_degraded_then_dark_mac_as_stopped_not_merely_degraded():
+    st = {
+        "last_check_ok": "2026-07-17T07:11:00+02:00",
+        "last_catalogue_ok": "2026-07-18T07:11:00+02:00",
+        "last_error": f"{cli.PARTIAL_PATHE_FAILURE} showtimes: dune",
+        "error_alerted": True,
+    }
+    blind = NOW - datetime.fromisoformat(st["last_catalogue_ok"])
+
+    finding = cli.build_stale_finding(Cfg, st, blind, "stale:x:0", 1)
+    text = "\n".join([finding.title, *finding.lines])
+
+    assert finding.title == "Local checks have stopped — 7 h 42 m"
+    assert "Last catalogue check: Sat 18 Jul, 07:11." in text
+    assert "stopped checking after reporting degraded listing data" in text
+    assert "are dark — cloud reminders still run" in text
+    assert "Catalogue checks still work" not in text
+    assert "listing checks degraded" not in text
+
+
+def test_cloud_supervision_uses_catalogue_liveness_for_degraded_local_half(
+    tmp_path, monkeypatch
+):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        CONFIG_TOML.replace("stale_check_hours = 0", "stale_check_hours = 18"),
+        encoding="utf-8",
+    )
+    now = datetime.now(TZ_PARIS)
+    st = json.loads(json.dumps(DEFAULT_STATE))
+    st.update(
+        last_check_ok=(now - timedelta(days=2)).isoformat(),
+        last_catalogue_ok=(now - timedelta(hours=1)).isoformat(),
+        last_error=f"{cli.PARTIAL_PATHE_FAILURE} showtimes: dune",
+        error_alerted=True,
+    )
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps(st), encoding="utf-8")
+    sent = []
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat")
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda cfg, text, **kw: sent.append(text) or True
+    )
+
+    assert cli.run(
+        ["--config", str(config), "--state", str(state), "--mode", "remind"]
+    ) == 0
+    assert sent == []  # degraded but demonstrably alive
+
+    st["last_catalogue_ok"] = (now - timedelta(hours=19)).isoformat()
+    state.write_text(json.dumps(st), encoding="utf-8")
+    assert cli.run(
+        ["--config", str(config), "--state", str(state), "--mode", "remind"]
+    ) == 0
+
+    assert len(sent) == 1
+    assert "Local checks have stopped" in sent[0]
+    assert "Catalogue checks still work" not in sent[0]
 
 
 def test_failed_pathe_one_shot_alerts_are_retried_on_the_next_run(

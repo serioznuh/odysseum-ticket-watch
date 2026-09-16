@@ -44,6 +44,7 @@ def legacy_state(version: int | None) -> dict:
     """Complete pre-Cinesa schema as written before schema version 2."""
     state = fresh_state()
     state.pop("cinesa")
+    state.pop("last_catalogue_ok")
     if version is None:
         state.pop("version")
     else:
@@ -152,6 +153,18 @@ def test_supported_older_schemas_migrate_without_losing_receipts(tmp_path, versi
     assert migrated["formats_seen"] == state["formats_seen"]
     assert migrated["cinesa"] == DEFAULT_STATE["cinesa"]
     assert migrate_state(migrated) == migrated
+
+
+def test_v2_migration_seeds_catalogue_liveness_from_last_full_check():
+    state = fresh_state()
+    state["version"] = 2
+    state.pop("last_catalogue_ok")
+    state["last_check_ok"] = "2026-09-03T21:46:42+02:00"
+
+    migrated = migrate_state(state)
+
+    assert migrated["version"] == CURRENT_STATE_VERSION
+    assert migrated["last_catalogue_ok"] == state["last_check_ok"]
 
 
 def test_current_schema_missing_delivery_fields_is_not_treated_as_empty_state(tmp_path):
@@ -579,6 +592,30 @@ def test_is_check_stale():
     st["last_check_ok"] = iso_in(timedelta(hours=-80))
     assert state_mod.is_check_stale(st, 72, NOW) is True
     assert state_mod.is_check_stale(st, 0, NOW) is False  # disabled
+
+
+def test_catalogue_staleness_uses_liveness_not_full_health():
+    st = fresh_state()
+    st["last_check_ok"] = iso_in(timedelta(hours=-80))
+    st["last_catalogue_ok"] = iso_in(timedelta(hours=-10))
+
+    assert state_mod.is_catalogue_check_stale(st, 72, NOW) is False
+
+    st["last_catalogue_ok"] = iso_in(timedelta(hours=-80))
+    assert state_mod.is_catalogue_check_stale(st, 72, NOW) is True
+
+
+def test_catalogue_liveness_pulse_is_throttled_during_frequent_degraded_retries():
+    st = fresh_state()
+    first = NOW - timedelta(minutes=30)
+    state_mod.refresh_catalogue_liveness(st, first)
+
+    state_mod.refresh_catalogue_liveness(st, NOW)
+    assert st["last_catalogue_ok"] == first.isoformat()
+
+    later = NOW + timedelta(minutes=31)
+    state_mod.refresh_catalogue_liveness(st, later)
+    assert st["last_catalogue_ok"] == later.isoformat()
 
 
 def test_reminders_stop_when_tickets_available():

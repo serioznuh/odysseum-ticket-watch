@@ -182,13 +182,15 @@ def build_recovered_finding(cfg, st: dict, now: datetime) -> Finding:
 
 def record_pathe_failure(cfg, st: dict, error: str, now: datetime, *, dry_run: bool) -> bool:
     """Advance the shared Pathé supervision streak and alert at its threshold."""
+    previous_partial = str(st.get("last_error", "")).startswith(PARTIAL_PATHE_FAILURE)
+    current_partial = error.startswith(PARTIAL_PATHE_FAILURE)
     st["failure_streak"] = min(
         st.get("failure_streak", 0) + 1, cfg.failure_streak_threshold
     )
     summary, status = summarize_pathe_error(error)
     # Store no endpoint URL for ordinary outages, and only stable endpoint/slug
     # names for partial failures, so an unchanged outage settles in state.
-    if error.startswith(PARTIAL_PATHE_FAILURE):
+    if current_partial:
         recorded = error[:300]
     elif status and "refused by origin" in error:
         recorded = f"HTTP {status} refused by origin"
@@ -198,6 +200,12 @@ def record_pathe_failure(cfg, st: dict, error: str, now: datetime, *, dry_run: b
         recorded = summary[:120]
     if st.get("last_error") != recorded:
         st["last_error"] = recorded
+
+    # One bit is sufficient as long as a strict severity escalation re-arms
+    # it. Unchanged degradation/blindness stays quiet; degraded -> blind gets
+    # its own loud alert even if the lesser condition was acknowledged.
+    if previous_partial and not current_partial and st.get("error_alerted"):
+        st["error_alerted"] = False
 
     # With adaptive cadence, retries come every 5 min — require both a failure
     # streak AND 6h without a fully healthy snapshot before crying wolf.
@@ -231,34 +239,31 @@ def build_stale_finding(cfg, st: dict, blind: timedelta, key: str, day: int) -> 
     """Cloud-side supervision. `day` 1 is the first alert at the threshold;
     every later one is a silent 24 h repeat, so a long outage cannot go quiet.
 
-    The cloud pass never calls Pathé, so it reads the local half's stable cause.
-    A partial-failure marker distinguishes incomplete listing data from a dark
-    local process; `error_alerted` distinguishes other reported failures from a
-    Mac that never got as far as reporting.
+    The cloud pass never calls Pathé. This function is called only after the
+    separate catalogue-liveness pulse is stale, so a partial-failure marker is
+    historical context, never evidence that the Mac is still alive.
     """
     repeat = day > 1
-    when = short_dt(detect.parse_iso(st.get("last_check_ok")))
+    when = short_dt(detect.parse_iso(state_mod.catalogue_check_iso(st)))
     partial = str(st.get("last_error", "")).startswith(PARTIAL_PATHE_FAILURE)
-    if partial or (st.get("error_alerted") and st.get("last_error")):
+    if partial:
+        cause = "Cause: the Mac stopped checking after reporting degraded listing data."
+    elif st.get("error_alerted") and st.get("last_error"):
         cause, _ = pathe_cause(str(st["last_error"]))  # ci=False: recorded by the Mac
-        if repeat and not partial:
+        if repeat:
             cause = cause.replace("Cause: Pathé is", "Cause: Pathé is still")
     else:
         cause = "Cause: the Mac hasn't completed a check — off, asleep, or can't push."
-    # The key is `last_check_ok`, which goes stale when the *local half* stops —
-    # and that half runs the news feeds and Cinesa too, so naming only Pathé
-    # understates the outage (OTW-07).
+    # Catalogue liveness goes stale when the *local half* stops, and that half
+    # runs the news feeds and Cinesa too, so naming only Pathé understates the
+    # outage (OTW-07).
     dark = "Pathé and news checks"
     if getattr(cfg, "cinesa_enabled", False):
         dark = "Pathé, news and Cinesa checks"
     title = (
-        f"Pathé still degraded — day {day}"
-        if partial and repeat
-        else (
-            f"Pathé listing checks degraded — {fmt_duration(blind)}"
-            if partial
-            else (f"Still blind — day {day}" if repeat else f"Local checks have stopped — {fmt_duration(blind)}")
-        )
+        f"Still blind — day {day}"
+        if repeat
+        else f"Local checks have stopped — {fmt_duration(blind)}"
     )
     return Finding(
         kind="WATCHER_STILL_BLIND" if repeat else "WATCHER_ERROR",
@@ -267,13 +272,9 @@ def build_stale_finding(cfg, st: dict, blind: timedelta, key: str, day: int) -> 
         title=title,
         lines=[
             watch_label(cfg),
-            f"Last fully healthy check: {when}." if partial else f"Last successful check: {when}.",
+            f"Last catalogue check: {when}.",
             cause,
-            (
-                "Catalogue checks still work; affected listing details are incomplete."
-                if partial
-                else f"{dark} are dark — cloud reminders still run."
-            ),
+            f"{dark} are dark — cloud reminders still run.",
         ],
         url=cfg.film_page_url,
     )
@@ -579,6 +580,7 @@ def run(argv: list[str] | None = None) -> int:
         if snap is not None:
             degradation = snap.degradation_summary()
             if degradation:
+                state_mod.refresh_catalogue_liveness(st, now)
                 log.warning("%s", degradation)
                 sent_any = record_pathe_failure(
                     cfg, st, degradation, now, dry_run=args.dry_run
@@ -594,6 +596,7 @@ def run(argv: list[str] | None = None) -> int:
                 for spent in [k for k in st.get("alerts", {}) if k.startswith("stale:")]:
                     st["alerts"].pop(spent, None)
                 st["last_check_ok"] = now.isoformat()
+                st["last_catalogue_ok"] = now.isoformat()
             findings.extend(detect.analyze_pathe(snap, st, cfg, now))
 
         if pathe_due and cfg.news_enabled:
@@ -759,15 +762,18 @@ def run(argv: list[str] | None = None) -> int:
 
     # Supervision: alert when the Pathé check (running on another machine
     # than this cloud pass) stopped reporting.
-    if not args.adaptive_cadence and state_mod.is_check_stale(st, cfg.stale_check_hours, now):
-        last_ok = detect.as_aware(detect.parse_iso(st.get("last_check_ok")))
+    if not args.adaptive_cadence and state_mod.is_catalogue_check_stale(
+        st, cfg.stale_check_hours, now
+    ):
+        catalogue_iso = state_mod.catalogue_check_iso(st)
+        last_ok = detect.as_aware(detect.parse_iso(catalogue_iso))
         blind = now - last_ok
         # Alert once at the threshold, then every 24h for as long as it lasts —
         # a blind spell that goes quiet after one message is the failure mode
         # this exists to prevent. Periods are measured from the first alert, so
         # every repeat lands at the same clock time.
         period = stale_period(blind, cfg.stale_check_hours)
-        key = f"stale:{st.get('last_check_ok')}:{period}"
+        key = f"stale:{catalogue_iso}:{period}"
         if not state_mod.already_sent(st, key):
             stale = build_stale_finding(cfg, st, blind, key, period + 1)
             if notify.send_telegram(
