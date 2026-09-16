@@ -20,15 +20,85 @@ cd "$(dirname "$0")/.."
 
 source .env
 
+cleanup_state_merge_tmp() {
+  rm -f "$1/base.json" "$1/upstream.json" "$1/local.json"
+  rmdir "$1"
+}
+
+abort_state_rebase() {
+  echo "ERROR: state rebase recovery failed; aborting rebase (OTW-14)" >&2
+  git rebase --abort || true
+  return 1
+}
+
+recover_state_rebase() {
+  local conflicts tmp action
+  while true; do
+    conflicts="$(git diff --name-only --diff-filter=U)"
+    if [ "$conflicts" != "state/state.json" ]; then
+      echo "ERROR: pull failed with conflicts outside state/state.json; not auto-merging" >&2
+      abort_state_rebase
+      return 1
+    fi
+
+    echo "WARNING: state/state.json rebase conflict; running domain-aware recovery (OTW-14)" >&2
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/otw-state-merge.XXXXXX")"
+    if ! git show ':1:state/state.json' > "$tmp/base.json" \
+      || ! git show ':2:state/state.json' > "$tmp/upstream.json" \
+      || ! git show ':3:state/state.json' > "$tmp/local.json" \
+      || ! .venv/bin/python -m watcher.state_merge \
+        --base "$tmp/base.json" \
+        --upstream "$tmp/upstream.json" \
+        --local "$tmp/local.json" \
+        --output state/state.json; then
+      cleanup_state_merge_tmp "$tmp"
+      abort_state_rebase
+      return 1
+    fi
+    cleanup_state_merge_tmp "$tmp"
+    git add state/state.json
+
+    # The replay can become empty when upstream already contains every local
+    # receipt. Skipping is safe only when the entire commit is empty; local
+    # state commits contain no unrelated files, and the index check enforces it.
+    action=--continue
+    if git diff --cached --quiet; then
+      action=--skip
+    fi
+    if GIT_EDITOR=true git rebase "$action"; then
+      echo "state rebase recovery completed" >&2
+      return 0
+    fi
+    # A replay with more than one local commit may stop on the next state
+    # conflict. Loop only for that exact case; every other failure aborts below.
+    if [ "$(git diff --name-only --diff-filter=U)" != "state/state.json" ]; then
+      abort_state_rebase
+      return 1
+    fi
+  done
+}
+
+pull_with_state_recovery() {
+  if git pull --rebase --quiet origin main; then
+    return 0
+  fi
+  if [ "$(git diff --name-only --diff-filter=U)" = "state/state.json" ]; then
+    recover_state_rebase
+    return
+  fi
+  # Preserve the established retry behavior for dirty trees, network errors,
+  # and non-state failures. Only the known state rebase wedge is auto-merged.
+  git rebase --abort || true
+}
+
 # Pull BEFORE the run as well as after it. The watcher reads state/state.json
 # at startup, so a clone that has not pulled cannot see a reminder the cloud
 # failover sent while this Mac was asleep: it would re-send it, and if the two
-# halves marked *different* offsets the reminders_sent hunks conflict, the
-# rebase below aborts, and the local commit sits unpushed until a human turns
-# up (OTW-14's wedge, which then reads as a stale/blind watcher). Same recovery
-# as the post-run pull: a dirty tree or a conflict leaves this clone untouched
-# and the next firing retries. It also lands a deploy one firing sooner.
-git pull --rebase --quiet origin main || git rebase --abort || true
+# halves marked *different* offsets the reminders_sent hunks can conflict.
+# State-only conflicts are merged by delivery/baseline semantics and the rebase
+# continues in this firing; unrelated pull failures retain the normal retry.
+# It also lands a deploy one firing sooner.
+pull_with_state_recovery
 
 # Decides whether a check is due (≈4 h baseline, tightening to every firing
 # around the announced sale opening) and exits instantly otherwise.
@@ -55,11 +125,9 @@ fi
 # was pushed, so nothing was pulled — and the fix for the outage could never
 # reach this clone. A deploy must not depend on the watcher being healthy
 # enough to write state.
-# A swallowed rebase conflict would leave conflict markers in state.json.
-# load_state now fails closed with a non-zero diagnostic before any check or
-# send, so bad state is a loud failure rather than an empty-history reset.
-# Abort back to a clean tree instead and let the next firing retry.
-git pull --rebase --quiet origin main || git rebase --abort || true
+# A state-only conflict is recovered here without dropping either half's
+# delivery receipts or the observation baselines those receipts acknowledge.
+pull_with_state_recovery
 if [ -n "$(git log --oneline '@{u}..HEAD' 2>/dev/null)" ]; then
   git push --quiet origin main
 fi

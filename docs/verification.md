@@ -11,7 +11,7 @@ Use for docs, tests, or local logic changes:
 .venv/bin/python -m pytest -q
 ```
 
-Expected current result: Ruff reports no errors and pytest reports **269 passed**.
+Expected current result: Ruff reports no errors and all collected tests pass.
 
 ## Watcher behavior check
 
