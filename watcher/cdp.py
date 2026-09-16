@@ -63,8 +63,15 @@ STARTUP_POLL_SECONDS = 0.3
 MIN_SOCKET_READ_SECONDS = 0.25
 
 # `ps` is how Chrome is discovered for termination, so a failed or timed-out
-# listing is *unknown*, never "nothing to kill" — it gets another try.
+# listing is *unknown*, never "nothing to kill" — it gets another try, then the
+# profile's own lock file as a fallback.
 PROFILE_LOOKUP_ATTEMPTS = 2
+PROCESS_QUERY_TIMEOUT_SECONDS = 5.0
+
+# Chrome records the process holding a user-data-dir as a symlink to
+# `<host>-<pid>`. Reading it needs no subprocess, so it survives the `ps`
+# timeout that would otherwise leave us with no PID to signal.
+CHROME_PROFILE_LOCK = "SingletonLock"
 
 # Teardown gets its own allowance rather than a slice of the caller's: the
 # throwaway profile must be torn down even when the mint ran out of time, and
@@ -368,7 +375,78 @@ def _discover_profile_pids(
     return None
 
 
-def _terminate_by_profile(profile_dir: str, budget: Budget | None = None) -> None:
+def _locked_profile_pid(profile_dir: str) -> int | None:
+    """The PID Chrome itself recorded as the owner of our profile.
+
+    Read straight off `SingletonLock`, with no subprocess involved, so it still
+    works when the `ps` listing that normally finds Chrome has timed out — and
+    it names the very process holding the profile lock we must not leak.
+    """
+    try:
+        target = os.readlink(os.path.join(profile_dir, CHROME_PROFILE_LOCK))
+    except OSError:
+        return None  # no lock: Chrome exited cleanly, or never got that far
+    try:
+        pid = int(target.rpartition("-")[2])
+    except ValueError:
+        log.warning("unrecognised Chrome profile lock target %r", target)
+        return None
+    return pid if pid > 0 else None
+
+
+def _is_our_chrome(pid: int, profile_dir: str, budget: Budget | None) -> bool:
+    """Whether `pid` really is a Chrome running on our profile.
+
+    A stale lock file can name a PID the OS has since recycled, and signalling
+    that would hit an unrelated process, so an unverifiable candidate is never
+    signalled. This asks about one PID rather than the whole process table, so
+    it can still answer when the full listing could not.
+    """
+    marker = f"--user-data-dir={os.path.abspath(profile_dir)}"
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=_step_timeout(budget, PROCESS_QUERY_TIMEOUT_SECONDS),
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    try:
+        return marker in shlex.split(out)
+    except ValueError:
+        return False
+
+
+def _pids_from_profile_lock(
+    profile_dir: str, budget: Budget | None
+) -> set[int] | None:
+    """Last-resort discovery: the profile's own lock, verified before use.
+
+    `None` still means unknown — an unverifiable candidate is not signalled.
+    """
+    pid = _locked_profile_pid(profile_dir)
+    if pid is None:
+        return None
+    if not _is_our_chrome(pid, profile_dir, budget):
+        log.warning(
+            "Chrome profile lock for %s names PID %d, which could not be"
+            " confirmed as ours — not signalling it",
+            profile_dir,
+            pid,
+        )
+        return None
+    log.warning(
+        "process listing unavailable; falling back to the profile lock to"
+        " terminate Chrome PID %d on %s",
+        pid,
+        profile_dir,
+    )
+    return {pid}
+
+
+def _terminate_by_profile(profile_dir: str, budget: Budget | None = None) -> bool:
     """Terminate only our Chrome profile and confirm it goes away.
 
     `open` detaches, so there is no child PID to wait on. The profile path is
@@ -379,10 +457,17 @@ def _terminate_by_profile(profile_dir: str, budget: Budget | None = None) -> Non
     `budget` bounds the `ps` calls too, not only the confirmation wait — two
     15 s process listings already outlast the whole cleanup reserve on their
     own. SIGTERM is never skipped for want of time once a process is known;
-    only the *confirmation* is cut short, and a lookup that never succeeds is
-    reported rather than passed off as a clean exit.
+    only the *confirmation* is cut short.
+
+    Returns whether Chrome on our profile was signalled or was already gone.
+    False means nothing could be discovered — by `ps` or by the profile lock —
+    so nothing was signalled and a leftover instance may still hold the lock.
+    The caller must not report a clean mint on that, or the leak repeats every
+    run in silence (round-4 review).
     """
     pids = _discover_profile_pids(profile_dir, budget)
+    if pids is None:
+        pids = _pids_from_profile_lock(profile_dir, budget)
     if pids is None:
         log.error(
             "could not determine whether Chrome is still running on watcher"
@@ -390,9 +475,9 @@ def _terminate_by_profile(profile_dir: str, budget: Budget | None = None) -> Non
             " may hold the profile lock for the next mint",
             profile_dir,
         )
-        return
+        return False
     if not pids:
-        return
+        return True
 
     deadline = time.monotonic() + CLEANUP_WAIT_SECONDS
     while pids:
@@ -413,9 +498,9 @@ def _terminate_by_profile(profile_dir: str, budget: Budget | None = None) -> Non
                 " it exited: process lookup unavailable",
                 profile_dir,
             )
-            return
+            return True
         if not current:
-            return
+            return True
         pids = current
         remaining = deadline - time.monotonic()
         if budget is not None:
@@ -431,6 +516,23 @@ def _terminate_by_profile(profile_dir: str, budget: Budget | None = None) -> Non
             CLEANUP_WAIT_SECONDS,
             ", ".join(str(pid) for pid in sorted(pids)),
         )
+    return True  # signalled; a slow shutdown is not a leak
+
+
+def _cleanup_chrome(profile: str, previous_app: str | None) -> bool:
+    """Tear our Chrome down on its own allowance, and hand focus back.
+
+    Returns whether Chrome was signalled (or was already gone). Never raises:
+    the caller may be unwinding a failure whose cause must survive.
+    """
+    cleanup = Budget(CLEANUP_BUDGET_SECONDS, label="Chrome cleanup")
+    try:
+        return _terminate_by_profile(profile, cleanup)
+    except Exception:
+        log.exception("unexpected error while cleaning up watcher Chrome")
+        return False
+    finally:
+        _restore_focus(previous_app, cleanup)
 
 
 def _page_title(ws: _WebSocket, timeout: float = CDP_CALL_TIMEOUT_SECONDS) -> str:
@@ -484,7 +586,11 @@ def evaluate_on_page(
     fixed timeout and can outlast the phase containing it.
 
     Teardown is deliberately outside that bound, on its own small allowance, so
-    the throwaway profile is still killed when the mint runs out of time.
+    the throwaway profile is still killed when the mint runs out of time. If it
+    cannot establish that our Chrome was signalled, the mint fails even though
+    the page produced a token: a leftover Chrome holding the profile lock breaks
+    the *next* mint, and a run that reported success would hide it until someone
+    noticed the watch had gone quiet.
 
     None of this touches how the challenge is cleared. It is the same real,
     headed browser on its own merits — it simply gets less patience.
@@ -496,6 +602,7 @@ def evaluate_on_page(
     profile = os.path.abspath(profile_dir)
     port = _free_port()
     previous_app = _frontmost_app(budget)
+    result: Any = _MISSING
     try:
         _require_time(budget, "launching Chrome")
         _launch_background(
@@ -554,29 +661,35 @@ def evaluate_on_page(
                 )
                 value = reply.get("result", {}).get("result", {}).get("value")
                 if value:
-                    return value
+                    result = value
+                    break
                 title = _page_title(ws, _step_timeout(budget, CDP_CALL_TIMEOUT_SECONDS))
                 if title.strip().startswith(HARD_BLOCK_TITLE):
                     raise CDPError(
                         f"Cloudflare hard block: page title is {title.strip()!r}"
                     )
                 _nap(budget, poll_seconds)
-            if not title and not (budget and budget.expired()):
-                title = _page_title(ws, _step_timeout(budget, CDP_CALL_TIMEOUT_SECONDS))
-            raise CDPError(
-                f"page never produced the value within {wait_seconds:.0f}s"
-                f" (last page title: {title!r})"
-                + ("" if budget is None else f"; {budget.exhausted_message()}")
-            )
+            if result is _MISSING:
+                if not title and not (budget and budget.expired()):
+                    title = _page_title(
+                        ws, _step_timeout(budget, CDP_CALL_TIMEOUT_SECONDS)
+                    )
+                raise CDPError(
+                    f"page never produced the value within {wait_seconds:.0f}s"
+                    f" (last page title: {title!r})"
+                    + ("" if budget is None else f"; {budget.exhausted_message()}")
+                )
         finally:
             ws.close()
     finally:
-        # Its own allowance, minted here: teardown must happen even when the
-        # mint above ran out of time, and must not then run unbounded.
-        cleanup = Budget(CLEANUP_BUDGET_SECONDS, label="Chrome cleanup")
-        try:
-            _terminate_by_profile(profile, cleanup)
-        except Exception:
-            log.exception("unexpected error while cleaning up watcher Chrome")
-        finally:
-            _restore_focus(previous_app, cleanup)
+        signalled = _cleanup_chrome(profile, previous_app)
+
+    # Only reached when the page produced a value: any failure above propagates
+    # through the `finally` instead, keeping its own cause.
+    if not signalled:
+        raise CDPError(
+            f"read the value, but Chrome on watcher profile {profile} could not be"
+            " confirmed terminated — refusing to report a clean mint while a"
+            " leftover instance may hold the profile lock"
+        )
+    return result

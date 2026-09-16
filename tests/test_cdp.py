@@ -68,7 +68,7 @@ class _SuccessfulWebSocket:
         self.closed = True
 
 
-def _patch_evaluation(monkeypatch, tmp_path, websocket=None):
+def _patch_evaluation(monkeypatch, tmp_path, websocket=None, signalled=True):
     chrome = tmp_path / "Chrome"
     chrome.write_text("", encoding="utf-8")
     profile = tmp_path / "watcher-profile"
@@ -87,7 +87,7 @@ def _patch_evaluation(monkeypatch, tmp_path, websocket=None):
     monkeypatch.setattr(
         cdp,
         "_terminate_by_profile",
-        lambda path, budget=None: events.append(("cleanup", path)),
+        lambda path, budget=None: events.append(("cleanup", path)) or signalled,
     )
     monkeypatch.setattr(
         cdp,
@@ -419,3 +419,89 @@ def test_a_lookup_that_fails_only_after_the_kill_still_reports_uncertainty(
 
     assert killed == [101]
     assert "could not confirm" in caplog.text
+
+
+def test_the_profile_lock_still_finds_chrome_when_ps_cannot(
+    monkeypatch, caplog, tmp_path
+):
+    """`ps` is not the only way to find our Chrome: Chrome itself records the
+    owning PID in the profile's SingletonLock, and reading a symlink cannot
+    time out the way a process listing can. "Unknown" must not mean "give up"
+    (round-4 review)."""
+    profile = tmp_path / "watcher-profile"
+    profile.mkdir()
+    os.symlink("somehost-4242", profile / cdp.CHROME_PROFILE_LOCK)
+    killed = []
+    queried = []
+
+    def ps(command, **kwargs):
+        if command[:2] == ["ps", "-p"]:  # the narrow verification query
+            queried.append(command)
+            return SimpleNamespace(
+                stdout=f"/Chrome --user-data-dir={os.path.abspath(profile)}\n"
+            )
+        raise subprocess.TimeoutExpired(cmd="ps", timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(cdp.subprocess, "run", ps)
+    monkeypatch.setattr(cdp.os, "kill", lambda pid, _sig: killed.append(pid))
+    monkeypatch.setattr(cdp, "_discover_profile_pids", lambda *_a: None)
+
+    with caplog.at_level(logging.WARNING, logger=cdp.log.name):
+        assert cdp._terminate_by_profile(str(profile)) is True
+
+    assert killed == [4242]  # signalled, not merely logged about
+    assert queried, "the candidate PID must be verified before signalling"
+    assert "falling back to the profile lock" in caplog.text
+
+
+def test_a_recycled_lock_pid_is_never_signalled(monkeypatch, caplog, tmp_path):
+    """A stale lock can name a PID the OS has since handed to something else.
+    Killing that would be far worse than leaking a Chrome, so an unverifiable
+    candidate is reported instead of signalled."""
+    profile = tmp_path / "watcher-profile"
+    profile.mkdir()
+    os.symlink("somehost-4242", profile / cdp.CHROME_PROFILE_LOCK)
+
+    monkeypatch.setattr(
+        cdp.subprocess,
+        "run",
+        lambda command, **_kw: SimpleNamespace(stdout="/usr/bin/some-other-app\n"),
+    )
+    monkeypatch.setattr(cdp.os, "kill", lambda *_a: pytest.fail("signalled a stranger"))
+    monkeypatch.setattr(cdp, "_discover_profile_pids", lambda *_a: None)
+
+    with caplog.at_level(logging.WARNING, logger=cdp.log.name):
+        assert cdp._terminate_by_profile(str(profile)) is False
+
+    assert "could not be confirmed as ours" in caplog.text
+
+
+def test_a_mint_that_cannot_confirm_teardown_is_not_reported_as_clean(
+    monkeypatch, tmp_path
+):
+    """The gap this closes: a token was read, cleanup could signal nothing, and
+    the run still returned successfully — so a Chrome holding the profile lock
+    broke the *next* mint with nothing in this run to explain it."""
+    chrome, profile, _previous, events, _launches = _patch_evaluation(
+        monkeypatch, tmp_path, signalled=False
+    )
+    monkeypatch.setattr(
+        cdp,
+        "_devtools",
+        lambda url, method="GET", timeout=5.0: (
+            {"Browser": "Chrome"}
+            if url.endswith("/json/version")
+            else {"webSocketDebuggerUrl": "ws://127.0.0.1:4321/devtools/page/1"}
+        ),
+    )
+
+    with pytest.raises(cdp.CDPError, match="could not be confirmed terminated"):
+        cdp.evaluate_on_page(
+            "https://www.cinesa.es/",
+            "token",
+            chrome_path=str(chrome),
+            profile_dir=str(profile),
+        )
+
+    # Cleanup and the focus handoff still ran; only the verdict changed.
+    assert ("cleanup", str(profile.resolve())) in events
