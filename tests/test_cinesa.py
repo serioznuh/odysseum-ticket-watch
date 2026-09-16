@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import ClassVar
 
 import httpx
 import pytest
 
 from watcher import __main__ as main
-from watcher import cdp, cinesa, detect, notify
+from watcher import cdp, cinesa, detect, jobs, notify
 from watcher import state as state_mod
+from watcher.budget import Budget
 from watcher.detect import CinesaSnapshot
 from watcher.state import DEFAULT_STATE
 
@@ -197,7 +199,7 @@ def test_fresh_token_is_reused_without_launching_chrome(tmp_path, monkeypatch):
     token = make_jwt(time.time() + 10 * 3600)
     cinesa.save_token(cfg.cinesa_token_cache, token)
     monkeypatch.setattr(
-        cinesa, "mint_token", lambda c: pytest.fail("must not launch Chrome")
+        cinesa, "mint_token", lambda c, budget=None: pytest.fail("must not launch Chrome")
     )
     assert cinesa.get_token(cfg) == token
 
@@ -208,7 +210,7 @@ def test_refresh_starts_before_expiry_not_at_it(tmp_path, monkeypatch):
     old = make_jwt(time.time() + 2 * 3600)          # inside the 3 h window
     cinesa.save_token(cfg.cinesa_token_cache, old, last_attempt=0)
     new = make_jwt(time.time() + 12 * 3600)
-    monkeypatch.setattr(cinesa, "mint_token", lambda c: new)
+    monkeypatch.setattr(cinesa, "mint_token", lambda c, budget=None: new)
 
     assert cinesa.get_token(cfg) == new
     assert cinesa.load_cached_token(cfg.cinesa_token_cache, time.time()) == new
@@ -221,7 +223,7 @@ def test_failed_refresh_falls_back_to_the_valid_cached_token(tmp_path, monkeypat
     good = make_jwt(time.time() + 2 * 3600)
     cinesa.save_token(cfg.cinesa_token_cache, good, last_attempt=0)
 
-    def boom(c):
+    def boom(c, budget=None):
         raise cdp.CDPError("Chrome DevTools endpoint never came up")
 
     monkeypatch.setattr(cinesa, "mint_token", boom)
@@ -236,9 +238,32 @@ def test_backoff_prevents_a_chrome_launch_every_firing(tmp_path, monkeypatch):
     good = make_jwt(time.time() + 2 * 3600)
     cinesa.save_token(cfg.cinesa_token_cache, good, last_attempt=time.time() - 60)
     monkeypatch.setattr(
-        cinesa, "mint_token", lambda c: pytest.fail("should have backed off")
+        cinesa, "mint_token", lambda c, budget=None: pytest.fail("should have backed off")
     )
     assert cinesa.get_token(cfg) == good
+
+
+def test_a_proactive_refresh_defers_when_the_budget_cannot_afford_chrome(
+    tmp_path, monkeypatch
+):
+    """OTW-19: the token step is the one part that needs a GUI, so it is the
+    one part that can hang. A refresh that no longer fits in the run's budget
+    waits for a later firing rather than holding the ladder open — the token in
+    hand is still valid, which is exactly what the early window is for."""
+    cfg = TokenCfg(tmp_path / "t.json")
+    good = make_jwt(time.time() + 2 * 3600)  # inside the 3 h refresh window
+    cinesa.save_token(cfg.cinesa_token_cache, good, last_attempt=0)
+    monkeypatch.setattr(
+        cinesa, "mint_token", lambda c, budget=None: pytest.fail("must not launch Chrome")
+    )
+    spent = Budget(5.0, label="Cinesa check")
+
+    assert cinesa.get_token(cfg, budget=spent) == good
+
+    # With room for Chrome the refresh happens as it always did.
+    new = make_jwt(time.time() + 12 * 3600)
+    monkeypatch.setattr(cinesa, "mint_token", lambda c, budget=None: new)
+    assert cinesa.get_token(cfg, budget=Budget(600.0, label="Cinesa check")) == new
 
 
 def test_dead_token_still_fails_loudly(tmp_path, monkeypatch):
@@ -247,7 +272,7 @@ def test_dead_token_still_fails_loudly(tmp_path, monkeypatch):
     cfg = TokenCfg(tmp_path / "t.json")
     cinesa.save_token(cfg.cinesa_token_cache, make_jwt(time.time() - 3600))
 
-    def boom(c):
+    def boom(c, budget=None):
         raise cdp.CDPError("Chrome not found")
 
     monkeypatch.setattr(cinesa, "mint_token", boom)
@@ -261,7 +286,7 @@ def test_rejected_token_never_falls_back_to_itself(tmp_path, monkeypatch):
     cfg = TokenCfg(tmp_path / "t.json")
     cinesa.save_token(cfg.cinesa_token_cache, make_jwt(time.time() + 6 * 3600))
 
-    def boom(c):
+    def boom(c, budget=None):
         raise cdp.CDPError("no")
 
     monkeypatch.setattr(cinesa, "mint_token", boom)
@@ -281,7 +306,7 @@ def test_403_mint_failure_cools_down_chrome_and_cached_token_recovers(
 
     launches = []
 
-    def blocked_mint(_cfg):
+    def blocked_mint(_cfg, budget=None):
         launches.append(clock[0])
         raise cdp.CDPError("Cloudflare challenge did not clear")
 
@@ -331,7 +356,7 @@ def test_403_gets_one_new_mint_after_cooldown_window(tmp_path, monkeypatch):
     )
     launches = []
 
-    def blocked_mint(_cfg):
+    def blocked_mint(_cfg, budget=None):
         launches.append(clock[0])
         raise cdp.CDPError("blocked")
 
@@ -356,7 +381,7 @@ def test_401_forces_token_renewal(tmp_path, monkeypatch):
     old = make_jwt(time.time() + 6 * 3600)
     new = make_jwt(time.time() + 12 * 3600)
     cinesa.save_token(cfg.cinesa_token_cache, old)
-    monkeypatch.setattr(cinesa, "mint_token", lambda _cfg: new)
+    monkeypatch.setattr(cinesa, "mint_token", lambda _cfg, budget=None: new)
 
     requests = mock_cinesa_api(
         monkeypatch,
@@ -655,7 +680,7 @@ class CheckRunner:
 
     def run(self, result, *, delivered: bool) -> dict:
         """One firing. `result` is a snapshot to return or an exception to raise."""
-        def fake_fetch(cfg):
+        def fake_fetch(cfg, **_budget):
             if isinstance(result, Exception):
                 raise result
             return result
@@ -702,3 +727,371 @@ def test_cinesa_outage_stops_rewriting_state_once_capped(tmp_path, monkeypatch):
     runner.run(boom, delivered=False)
     runner.run(boom, delivered=False)
     assert runner.state.read_bytes() == settled
+
+
+# ------------------------- cleanup integrity must not be absorbed (OTW-19 r5)
+
+def _leak(_cfg, _budget=None):
+    raise cdp.ChromeLeakError(
+        "read the value, but Chrome on watcher profile /p could not be confirmed"
+        " terminated"
+    )
+
+
+def test_a_leaked_chrome_is_not_absorbed_by_the_cached_token_fallback(
+    tmp_path, monkeypatch, caplog
+):
+    """The proactive-refresh fallback is right for a mint that simply failed —
+    nothing was left behind, so the token in hand is still the best move. A
+    cleanup-integrity failure is the opposite: continuing on the cached token
+    passes the API check, clears the health state and exits 0 while the next
+    mint is already doomed by the profile lock."""
+    cfg = TokenCfg(tmp_path / "t.json")
+    good = make_jwt(time.time() + 2 * 3600)  # inside the 3 h refresh window
+    cinesa.save_token(cfg.cinesa_token_cache, good, last_attempt=0)
+    monkeypatch.setattr(cinesa, "mint_token", _leak)
+
+    with caplog.at_level(logging.ERROR, logger=cinesa.log.name), pytest.raises(
+        cdp.ChromeLeakError
+    ):
+        cinesa.get_token(cfg)
+
+    assert "could not confirm Chrome was terminated" in caplog.text
+    # The attempt is still recorded, so a leak that takes a while to fix does
+    # not mean a Chrome launch on every 5-min firing meanwhile.
+    assert cinesa.read_cache(cfg.cinesa_token_cache)["last_refresh_attempt"] > 0
+
+    # An ordinary mint failure still falls back exactly as before.
+    def boom(_cfg, _budget=None):
+        raise cdp.CDPError("Cloudflare challenge did not clear")
+
+    monkeypatch.setattr(cinesa, "mint_token", boom)
+    cinesa.save_token(cfg.cinesa_token_cache, good, last_attempt=0)
+    assert cinesa.get_token(cfg) == good
+
+
+def test_a_leaked_chrome_is_not_absorbed_by_the_403_fallback(tmp_path, monkeypatch):
+    """The other broad catch, on the 403 path: it keeps the old token for a
+    network rejection and must not swallow a leak either. No mint cooldown
+    either — that mechanism arranges quiet retries, which is the opposite of
+    what a leak needs."""
+    cfg = FetchCfg(tmp_path / "t.json")
+    cinesa.save_token(cfg.cinesa_token_cache, make_jwt(time.time() + 6 * 3600))
+    monkeypatch.setattr(cinesa, "mint_token", _leak)
+    mock_cinesa_api(monkeypatch, lambda _request: 403)
+
+    with pytest.raises(cdp.ChromeLeakError):
+        cinesa.fetch_snapshot(cfg)
+
+    assert "mint_cooldown_until" not in cinesa.read_cache(cfg.cinesa_token_cache)
+
+
+def test_a_forced_renewal_after_a_401_also_surfaces_a_leak(tmp_path, monkeypatch):
+    """force=True skips the proactive fallback, so this reaches the caller via
+    fetch_snapshot's 401 branch. Checked because it is a third route into the
+    same mint."""
+    cfg = FetchCfg(tmp_path / "t.json")
+    cinesa.save_token(cfg.cinesa_token_cache, make_jwt(time.time() + 6 * 3600))
+    monkeypatch.setattr(cinesa, "mint_token", _leak)
+    mock_cinesa_api(monkeypatch, lambda _request: 401)
+
+    with pytest.raises(cdp.ChromeLeakError):
+        cinesa.fetch_snapshot(cfg)
+
+
+def test_the_leak_alert_says_what_to_do_about_it():
+    """"check Chrome is installed and the Mac is awake" would send the owner
+    after the wrong thing entirely."""
+    leak = main.build_cinesa_error_finding(
+        Cfg, cdp.ChromeLeakError("could not be confirmed terminated"), "k"
+    )
+
+    assert "Cause: a leftover Chrome may still hold the watcher profile." in leak.lines
+    assert "Needs you: quit Chrome" in leak.lines[-1]
+    assert "check Chrome is installed" not in "\n".join(leak.lines)
+    # Still the ordinary loud Cinesa error, keyed and shaped like the others.
+    assert leak.kind == "WATCHER_ERROR"
+    assert leak.kind not in notify.DEFAULT_SILENT_KINDS
+
+
+def test_a_leaked_chrome_makes_the_run_exit_non_zero(tmp_path, monkeypatch):
+    """It still feeds the capped streak and its alert like any Cinesa failure,
+    but it must not pass for a healthy run in launchd's log or in Actions — a
+    locked profile needs the owner, and nothing else will clear it."""
+    runner = CheckRunner(tmp_path, monkeypatch, {"imax_present": True})
+
+    def leaking_fetch(cfg, **_budget):
+        raise cdp.ChromeLeakError("could not be confirmed terminated")
+
+    monkeypatch.setattr(cinesa, "fetch_snapshot", leaking_fetch)
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: True)
+    monkeypatch.setattr(notify, "send_telegram", lambda *a, **kw: True)
+
+    assert main.run(
+        ["--config", str(runner.config), "--state", str(runner.state),
+         "--mode", "check", "--skip-if-checked-within", "6"]
+    ) == 1
+
+    # The streak still advanced, so the existing threshold alert still arrives.
+    assert json.loads(runner.state.read_text())["cinesa"]["failure_streak"] == 1
+
+    # An ordinary Cinesa outage stays exit 0: it is a source being down, not a
+    # local integrity problem, and the streak alert is the right channel.
+    def plain_outage(cfg, **_budget):
+        raise RuntimeError("HTTP 500 from vwc.cinesa.es")
+
+    monkeypatch.setattr(cinesa, "fetch_snapshot", plain_outage)
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: False)
+    assert main.run(
+        ["--config", str(runner.config), "--state", str(runner.state),
+         "--mode", "check", "--skip-if-checked-within", "6"]
+    ) == 0
+
+
+def test_a_recurring_leak_is_not_starved_by_cached_token_runs(tmp_path, monkeypatch):
+    """The starvation hole: after a leak, the mint backs off for 30 min, the
+    cached token keeps working, and `update_from_cinesa` resets `failure_streak`
+    to zero on every one of those successful runs. The ordinary streak therefore
+    never reaches its threshold, so the alert never fired and most runs exited 0
+    while Chrome still held the profile (round-6 review).
+
+    `leak_since` is re-tested against the profile instead of counted, so it
+    survives those successes and alerts on schedule.
+    """
+    runner = CheckRunner(tmp_path, monkeypatch, {"imax_present": True})
+    sent: list[str] = []
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda cfg, text, **kw: sent.append(text) or True
+    )
+    # Chrome is still holding the profile on every firing from here on.
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: True)
+
+    def leak(cfg, **_budget):
+        raise cdp.ChromeLeakError("could not be confirmed terminated")
+
+    def cached_ok(cfg, **_budget):
+        return CinesaSnapshot(days=days(("2026-08-01", True), ("2026-08-02", True)))
+
+    argv = ["--config", str(runner.config), "--state", str(runner.state),
+            "--mode", "check", "--skip-if-checked-within", "6"]
+
+    monkeypatch.setattr(cinesa, "fetch_snapshot", leak)
+    assert main.run(argv) == 1
+    st = json.loads(runner.state.read_text())
+    assert st["cinesa"]["leak_since"], "the leak must be remembered"
+
+    # Now the runs that used to bury it: the cached token works, the poll
+    # succeeds, and the ordinary streak goes back to zero.
+    monkeypatch.setattr(cinesa, "fetch_snapshot", cached_ok)
+    assert main.run(argv) == 1  # still not a healthy run
+    st = json.loads(runner.state.read_text())
+    assert st["cinesa"]["failure_streak"] == 0  # reset, exactly as before
+    assert st["cinesa"]["leak_since"]           # but the leak is still known
+
+    # Once it has outlasted what the failure threshold means in wall-clock time,
+    # it alerts on its own rather than waiting for a streak that never comes.
+    stamped = datetime.fromisoformat(st["cinesa"]["leak_since"])
+    st["cinesa"]["leak_since"] = (stamped - timedelta(minutes=20)).isoformat()
+    runner.state.write_text(json.dumps(st), encoding="utf-8")
+    sent.clear()
+    assert main.run(argv) == 1
+
+    assert len(sent) == 1
+    assert "Cinesa token step needs you" in sent[0]
+    assert "quit Chrome" in sent[0]
+
+
+def test_a_freed_profile_clears_the_leak_and_the_run_is_healthy_again(
+    tmp_path, monkeypatch
+):
+    """Only evidence clears it: the profile being demonstrably free."""
+    runner = CheckRunner(tmp_path, monkeypatch, {"imax_present": True})
+    st = json.loads(runner.state.read_text())
+    st["cinesa"]["leak_since"] = (datetime.now(PARIS) - timedelta(hours=2)).isoformat()
+    runner.state.write_text(json.dumps(st), encoding="utf-8")
+    monkeypatch.setattr(notify, "send_telegram", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        cinesa,
+        "fetch_snapshot",
+        lambda cfg, **_kw: CinesaSnapshot(days=days(("2026-08-01", True))),
+    )
+    argv = ["--config", str(runner.config), "--state", str(runner.state),
+            "--mode", "check", "--skip-if-checked-within", "6"]
+
+    # An unknown answer is not resolution: the leak stays, the run stays unhealthy.
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: None)
+    assert main.run(argv) == 1
+    assert json.loads(runner.state.read_text())["cinesa"]["leak_since"]
+
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: False)
+    assert main.run(argv) == 0
+    assert "leak_since" not in json.loads(runner.state.read_text())["cinesa"]
+
+
+def test_an_existing_leak_is_reconciled_after_an_unrelated_failure(
+    tmp_path, monkeypatch
+):
+    """Leak truth is independent of the exception raised by this firing.
+
+    An ordinary Cinesa failure must keep a live prior leak visible and make the
+    run non-zero. The same ordinary failure must clear the episode once the
+    profile is demonstrably free, even if required token mints keep failing.
+    """
+    runner = CheckRunner(tmp_path, monkeypatch, {"imax_present": True})
+    st = json.loads(runner.state.read_text())
+    st["cinesa"]["leak_since"] = (
+        datetime.now(PARIS) - timedelta(hours=2)
+    ).isoformat()
+    runner.state.write_text(json.dumps(st), encoding="utf-8")
+    monkeypatch.setattr(
+        cinesa,
+        "fetch_snapshot",
+        lambda cfg, **_kw: (_ for _ in ()).throw(RuntimeError("token mint failed")),
+    )
+    monkeypatch.setattr(notify, "send_telegram", lambda *a, **kw: False)
+    argv = [
+        "--config",
+        str(runner.config),
+        "--state",
+        str(runner.state),
+        "--mode",
+        "check",
+        "--skip-if-checked-within",
+        "6",
+    ]
+
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: True)
+    assert main.run(argv) == 1
+    assert json.loads(runner.state.read_text())["cinesa"]["leak_since"]
+
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: False)
+    assert main.run(argv) == 0
+    assert "leak_since" not in json.loads(runner.state.read_text())["cinesa"]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        CinesaSnapshot(days=days(("2026-08-01", True))),
+        RuntimeError("ordinary token failure"),
+    ],
+    ids=["successful-cached-token-poll", "ordinary-failure"],
+)
+def test_a_new_profile_lock_is_discovered_after_every_cinesa_outcome(
+    tmp_path, monkeypatch, result
+):
+    """Discovery does not require ChromeLeakError or a pre-existing stamp."""
+    runner = CheckRunner(tmp_path, monkeypatch, {"imax_present": True})
+
+    def fake_fetch(cfg, **_budget):
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(cinesa, "fetch_snapshot", fake_fetch)
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: True)
+    monkeypatch.setattr(notify, "send_telegram", lambda *a, **kw: False)
+    argv = [
+        "--config",
+        str(runner.config),
+        "--state",
+        str(runner.state),
+        "--mode",
+        "check",
+        "--skip-if-checked-within",
+        "6",
+    ]
+
+    assert main.run(argv) == 1
+    assert json.loads(runner.state.read_text())["cinesa"]["leak_since"]
+
+
+def test_first_leak_alert_is_loud_even_when_episode_crossed_midnight(monkeypatch):
+    """Loudness follows a receipt for this episode, not calendar age."""
+
+    class LeakCfg(Cfg):
+        failure_streak_threshold = 3
+        cinesa_chrome_profile = "/tmp/watcher-profile"
+
+    since = datetime(2026, 9, 15, 23, 50, tzinfo=PARIS)
+    first_now = datetime(2026, 9, 16, 0, 10, tzinfo=PARIS)
+    state = fresh_state()
+    state["cinesa"]["leak_since"] = since.isoformat()
+    ctx = jobs.RunContext(cfg=LeakCfg, state=state, clock=lambda: first_now)
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: True)
+
+    first = jobs.CinesaOutcome()
+    jobs.track_profile_leak(ctx, first, first_now, None)
+
+    assert len(first.findings) == 1
+    assert first.findings[0].kind == "WATCHER_ERROR"
+    assert first.findings[0].title == "Cinesa token step needs you"
+
+
+def test_leak_repeats_use_episode_periods_not_calendar_dates(monkeypatch):
+    """Midnight cannot create a second key five minutes after delivery."""
+
+    class LeakCfg(Cfg):
+        failure_streak_threshold = 3
+        cinesa_chrome_profile = "/tmp/watcher-profile"
+
+    since = datetime(2026, 9, 15, 23, 40, tzinfo=PARIS)
+    first_now = since + timedelta(minutes=15)
+    state = fresh_state()
+    state["cinesa"]["leak_since"] = since.isoformat()
+    ctx = jobs.RunContext(cfg=LeakCfg, state=state, clock=lambda: first_now)
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: True)
+
+    first = jobs.CinesaOutcome()
+    jobs.track_profile_leak(ctx, first, first_now, None)
+    state_mod.mark_sent(state, first.findings[0].key, first_now)
+
+    after_midnight = jobs.CinesaOutcome()
+    jobs.track_profile_leak(
+        ctx, after_midnight, first_now + timedelta(minutes=5), None
+    )
+    assert after_midnight.findings[0].key == first.findings[0].key
+
+    next_period = jobs.CinesaOutcome()
+    jobs.track_profile_leak(ctx, next_period, first_now + timedelta(days=1), None)
+    assert next_period.findings[0].key != first.findings[0].key
+    assert next_period.findings[0].kind == "WATCHER_STILL_BLIND"
+    assert "day 2" in next_period.findings[0].title
+
+
+def test_two_leak_episodes_on_the_same_day_have_distinct_loud_keys(monkeypatch):
+    """A resolved episode's receipt cannot suppress a later incident."""
+
+    class LeakCfg(Cfg):
+        failure_streak_threshold = 3
+        cinesa_chrome_profile = "/tmp/watcher-profile"
+
+    state = fresh_state()
+    status = [True]
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: status[0])
+    ctx = jobs.RunContext(cfg=LeakCfg, state=state, clock=lambda: NOW)
+
+    first_since = datetime(2026, 9, 16, 8, 0, tzinfo=PARIS)
+    first = jobs.CinesaOutcome()
+    jobs.track_profile_leak(ctx, first, first_since, None)  # stamps the episode
+    jobs.track_profile_leak(ctx, first, first_since + timedelta(minutes=15), None)
+    first_key = first.findings[0].key
+    state_mod.mark_sent(state, first_key, first_since + timedelta(minutes=15))
+
+    status[0] = False
+    jobs.track_profile_leak(
+        ctx, jobs.CinesaOutcome(), first_since + timedelta(minutes=20), None
+    )
+    assert "leak_since" not in state["cinesa"]
+
+    status[0] = True
+    second_since = first_since + timedelta(hours=2)
+    second = jobs.CinesaOutcome()
+    jobs.track_profile_leak(ctx, second, second_since, None)
+    jobs.track_profile_leak(
+        ctx, second, second_since + timedelta(minutes=15), None
+    )
+
+    assert len(second.findings) == 1
+    assert second.findings[0].key != first_key
+    assert second.findings[0].kind == "WATCHER_ERROR"

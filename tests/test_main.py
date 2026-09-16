@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timedelta
 
 from watcher import __main__ as cli
-from watcher import detect, notify, pathe
+from watcher import cinesa, detect, news, notify, pathe
 from watcher.detect import TZ_PARIS, Snapshot
 from watcher.state import CURRENT_STATE_VERSION, DEFAULT_STATE
 
@@ -318,7 +318,7 @@ class PatheCheckRunner:
     def run(self, result, *, delivered: bool) -> dict:
         """One firing. `result` is a snapshot to return or an exception to raise."""
 
-        def fake_fetch(client, cfg):
+        def fake_fetch(client, cfg, **_budget):
             if isinstance(result, Exception):
                 raise result
             return result
@@ -619,7 +619,7 @@ enabled = false
 """
 
 
-def _reminder_fixture(tmp_path, monkeypatch, sent: list):
+def _reminder_fixture(tmp_path, monkeypatch, sent: list, minutes: int = 10):
     """State on the eve of the sale: 24h and 2h reminders already delivered, the
     15-min one still owed, and a Pathé check fresh enough for the cadence guard
     to skip. Cinesa is off, the default."""
@@ -634,7 +634,7 @@ def _reminder_fixture(tmp_path, monkeypatch, sent: list):
     now = datetime.now(TZ_PARIS)
     # The extra 30 s keeps the floored countdown on "10 minutes" for the whole
     # test rather than tipping to 9 on the clock ticking between here and run().
-    target = (now + timedelta(minutes=10, seconds=30)).isoformat()
+    target = (now + timedelta(minutes=minutes, seconds=30)).isoformat()
     st = json.loads(json.dumps(DEFAULT_STATE))
     st["last_check_ok"] = now.isoformat()
     st["sale_target"] = target
@@ -685,9 +685,9 @@ def _scripted_clock(*readings: datetime):
     """A stand-in for `datetime` whose `now()` returns `readings` in order, the
     last one repeating. Subclassing keeps every other use of the name working.
 
-    `run()` reads the clock twice — once at the top, once at the reminder
-    ladder — and what these tests pin down is that the ladder uses the *second*
-    reading, taken after the network block rather than before it.
+    A run reads the clock twice — once at the top, which is also what the
+    pre-polling reminder pass sees, and once after the sources have been
+    polled, for the second pass over the ladder.
     """
     queue = list(readings)
 
@@ -699,16 +699,18 @@ def _scripted_clock(*readings: datetime):
     return ScriptedClock
 
 
-def test_the_ladder_reads_the_clock_after_the_check_rather_than_before_it(
+def test_a_run_that_overruns_the_opening_still_gets_both_rungs_out(
     tmp_path, monkeypatch
 ):
-    """`now` is taken before the Pathé/news/Cinesa block, which can burn minutes
-    on a bad connection (Pathé retries every request three times against a 20 s
-    timeout, over several requests). Wording the ladder from that stale reading
-    lets a run which started at T-14 send the 15-min warning when the sale is
-    already open — the one alert that must never be wrong. Here the run starts
-    14 min before the opening and reaches the ladder a minute after it, so the
-    GO ping is the only correct send."""
+    """A run that starts at T-14 and only finishes at T+1 owes the user two
+    different things, and used to deliver neither correctly.
+
+    The ladder used to sit behind all polling and retries: it woke at T+1, so
+    the 15-min warning was gone for good, and wording it from the run-start
+    clock would have announced a warning for a sale that was already open. It
+    is now checked before any request — the warning goes out at T-14, on time —
+    and again afterwards, where the later clock correctly picks the GO ping
+    (OTW-19)."""
     sent: list[str] = []
     config, state, target = _reminder_fixture(tmp_path, monkeypatch, sent)
     opening = datetime.fromisoformat(target)
@@ -723,25 +725,27 @@ def test_the_ladder_reads_the_clock_after_the_check_rather_than_before_it(
          "--mode", "check", "--adaptive-cadence"]
     ) == 0
 
-    assert len(sent) == 1
-    assert "Scheduled sale time reached" in sent[0]
-    assert "Sale opens in" not in sent[0]  # what the run-start clock would have sent
+    assert len(sent) == 2
+    assert "Sale opens in 14 minutes" in sent[0]      # recovered, not swallowed
+    assert "Scheduled sale time reached" in sent[1]   # worded from the later clock
+    assert "Sale opens in" not in sent[1]
     saved = json.loads(state.read_text(encoding="utf-8"))
-    assert "open" in saved["reminders_sent"][target]
+    assert saved["reminders_sent"][target] == ["120", "1440", "15", "open"]
 
 
 def test_a_slow_run_counts_down_from_where_it_finished(tmp_path, monkeypatch):
-    """The same seam, one rung earlier: run-start and ladder clocks that pick the
-    same reminder must still word it from the later one. A run that started at
-    T-14 and reaches the ladder at T-2 has two minutes to announce, not
-    fourteen — the countdown is what the user acts on."""
+    """A rung whose window opens *during* the run belongs to the second ladder
+    pass, and must be worded from the clock that pass reads. Here the 15-min
+    window is still shut at run-start (T-20) and open by the time the sources
+    are done (T-2): two minutes to announce, not twenty — the countdown is what
+    the user acts on."""
     sent: list[str] = []
-    config, state, target = _reminder_fixture(tmp_path, monkeypatch, sent)
+    config, state, target = _reminder_fixture(tmp_path, monkeypatch, sent, minutes=20)
     opening = datetime.fromisoformat(target)
     monkeypatch.setattr(
         cli,
         "datetime",
-        _scripted_clock(opening - timedelta(minutes=14), opening - timedelta(minutes=2)),
+        _scripted_clock(opening - timedelta(minutes=20), opening - timedelta(minutes=2)),
     )
 
     assert cli.run(
@@ -751,7 +755,7 @@ def test_a_slow_run_counts_down_from_where_it_finished(tmp_path, monkeypatch):
 
     assert len(sent) == 1
     assert "Sale opens in 2 minutes" in sent[0]
-    assert "14 minutes" not in sent[0]  # the run-start clock's countdown
+    assert "20 minutes" not in sent[0]  # the run-start clock's countdown
     saved = json.loads(state.read_text(encoding="utf-8"))
     assert "15" in saved["reminders_sent"][target]
 
@@ -870,3 +874,184 @@ def test_wanted_pathe_dates_retry_together_then_stay_quiet(tmp_path, monkeypatch
     monkeypatch.setattr(cli, "datetime", _scripted_clock(NOW, NOW))
     runner.run(snap, delivered=True)
     assert runner.sent == []
+
+
+# ------------------------------------------- bounded jobs, ordering (OTW-19)
+
+REMIND_ONLY_CONFIG_TOML = REMINDER_CONFIG_TOML.replace(
+    "[cinesa]\nenabled = false",
+    '[cinesa]\nenabled = true\nfilm_id = "HO00003228"\nsite_id = "032"',
+)
+
+
+def test_a_slow_source_cannot_eat_the_warning_window(tmp_path, monkeypatch):
+    """The reminder ladder used to wait behind every fetch and retry. A run
+    that started at T-14 and did not reach the ladder until T+6 lost the 15-min
+    warning outright — re-reading the clock could word the late message
+    correctly, but could not give the window back.
+
+    The ladder is now served before a source is contacted at all, so the
+    warning goes out on time even though this run's Pathé call burns the whole
+    window and then fails."""
+    sent: list[str] = []
+    trace: list[str] = []
+    config, state, target = _reminder_fixture(tmp_path, monkeypatch, sent)
+    opening = datetime.fromisoformat(target)
+
+    def traced_send(cfg, text, **kw):
+        trace.append("telegram")
+        sent.append(text)
+        return True
+
+    def slow_then_broken(client, cfg, **_budget):
+        trace.append("pathe")
+        raise RuntimeError("HTTP 500 from www.pathe.fr")
+
+    monkeypatch.setattr(notify, "send_telegram", traced_send)
+    monkeypatch.setattr(pathe, "make_client", object)
+    monkeypatch.setattr(pathe, "fetch_snapshot", slow_then_broken)
+    monkeypatch.setattr(
+        cli,
+        "datetime",
+        _scripted_clock(opening - timedelta(minutes=14), opening + timedelta(minutes=6)),
+    )
+
+    # No cadence flag: this firing really does poll Pathé.
+    assert cli.run(
+        ["--config", str(config), "--state", str(state), "--mode", "check"]
+    ) == 0
+
+    assert trace[0] == "telegram"  # the ladder went first, not last
+    assert "pathe" in trace        # ...and the source was still polled
+    assert "Sale opens in 14 minutes" in sent[0]
+    assert "Scheduled sale time reached" in sent[-1]
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["reminders_sent"][target] == ["120", "1440", "15", "open"]
+
+
+def test_a_crashing_job_cannot_take_the_ladder_down_with_it(tmp_path, monkeypatch):
+    """A bug in one job is reported by the exit code, but must not cost the run
+    its reminders, its supervision or its state save."""
+    sent: list[str] = []
+    config, state, target = _reminder_fixture(tmp_path, monkeypatch, sent)
+
+    def boom(*args, **kwargs):
+        raise TypeError("analysis bug")
+
+    monkeypatch.setattr(pathe, "make_client", object)
+    monkeypatch.setattr(pathe, "fetch_snapshot", lambda client, cfg, **kw: Snapshot())
+    monkeypatch.setattr(detect, "analyze_pathe", boom)
+
+    assert cli.run(
+        ["--config", str(config), "--state", str(state), "--mode", "check"]
+    ) == 1
+
+    assert len(sent) == 1
+    assert "Sale opens in 10 minutes" in sent[0]
+    # The receipt is persisted, so the next firing does not repeat the rung.
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert "15" in saved["reminders_sent"][target]
+
+
+def test_default_remind_mode_makes_no_source_requests(tmp_path, monkeypatch):
+    """What the cloud half runs every 15 min. Pathé 403s datacenter IPs and
+    Cinesa is challenged from them, so this pass must stay reminders and
+    supervision only — even with the Cinesa half enabled in config."""
+    sent: list[str] = []
+    config, state, _target = _reminder_fixture(tmp_path, monkeypatch, sent)
+    config.write_text(REMIND_ONLY_CONFIG_TOML, encoding="utf-8")
+    touched: list[str] = []
+
+    monkeypatch.setattr(pathe, "make_client", lambda: touched.append("pathe client"))
+    monkeypatch.setattr(pathe, "fetch_snapshot", lambda *a, **k: touched.append("pathe"))
+    monkeypatch.setattr(news, "fetch_news_items", lambda *a, **k: touched.append("news"))
+    monkeypatch.setattr(cinesa, "fetch_snapshot", lambda *a, **k: touched.append("cinesa"))
+
+    assert cli.run(
+        ["--config", str(config), "--state", str(state), "--mode", "remind"]
+    ) == 0
+
+    assert touched == []
+    assert len(sent) == 1
+    assert "Sale opens in 10 minutes" in sent[0]
+
+
+def test_a_newly_published_opening_is_alerted_in_the_run_that_polls_it(
+    tmp_path, monkeypatch
+):
+    """Splitting the pass into jobs must not put a run's lag between observing
+    a sale date and announcing it — that single alert is the whole point."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    sale = "2026-11-05T08:00:00+01:00"
+    show = {
+        "slug": "dune-troisieme-partie",
+        "title": "Dune : Troisième partie",
+        "salesOpeningDatetime": sale,
+        "isMovie": True,
+    }
+
+    st = runner.run(Snapshot(matched_shows=[show]), delivered=True)
+
+    assert [t for t in runner.sent if "Sale opens" in t]
+    assert f"sale:{show['slug']}:{sale}" in st["alerts"]
+    assert st["sale_target"] == sale  # and the ladder is armed by the same run
+
+
+def test_a_crash_in_analysis_cannot_bank_a_recovery_it_threw_away(
+    tmp_path, monkeypatch
+):
+    """The healthy branch clears `error_alerted` and refreshes the health
+    timestamps; the recovery alert itself is one of the findings the job
+    returns. If analysis then crashed and the coordinator discarded those
+    findings, a saved `error_alerted=False` would mean the outage ended in
+    silence and "Pathé watch is back" could never fire again (round-1 review).
+    """
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    blind = json.loads(runner.state.read_text())
+    blind.update(
+        error_alerted=True,
+        failure_streak=3,
+        last_error="HTTP 403",
+        last_check_ok="2026-07-18T07:11:00+02:00",
+        last_catalogue_ok="2026-07-18T07:11:00+02:00",
+    )
+    blind["alerts"]["stale:2026-07-18T07:11:00+02:00:0"] = "2026-07-19T07:11:00+02:00"
+    runner.state.write_text(json.dumps(blind), encoding="utf-8")
+    healthy = Snapshot(matched_shows=[{"slug": "dune-troisieme-partie", "title": "Dune"}])
+
+    real_analyze = detect.analyze_pathe
+    sent: list[str] = []
+
+    def boom(*args, **kwargs):
+        raise TypeError("analysis bug")
+
+    monkeypatch.setattr(detect, "analyze_pathe", boom)
+    monkeypatch.setattr(pathe, "make_client", object)
+    monkeypatch.setattr(pathe, "fetch_snapshot", lambda client, cfg, **kw: healthy)
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda cfg, text, **kw: sent.append(text) or True
+    )
+    argv = [
+        "--config", str(runner.config), "--state", str(runner.state), "--mode", "check",
+    ]
+
+    assert cli.run(argv) == 1  # the bug is reported...
+
+    # ...and nothing about the outage was banked, so the evidence the recovery
+    # alert is built from survives it.
+    stranded = json.loads(runner.state.read_text(encoding="utf-8"))
+    assert stranded["error_alerted"] is True
+    assert stranded["last_error"] == "HTTP 403"
+    assert stranded["last_check_ok"] == "2026-07-18T07:11:00+02:00"
+    assert "stale:2026-07-18T07:11:00+02:00:0" in stranded["alerts"]
+    assert sent == []
+
+    # The same state, once the bug is gone: recovery still reaches the phone.
+    monkeypatch.setattr(detect, "analyze_pathe", real_analyze)
+    assert cli.run(argv) == 0
+
+    recovered = json.loads(runner.state.read_text(encoding="utf-8"))
+    assert [t for t in sent if "Pathé watch is back" in t]
+    assert recovered["error_alerted"] is False
+    assert "last_error" not in recovered
+    assert recovered["last_check_ok"] != "2026-07-18T07:11:00+02:00"

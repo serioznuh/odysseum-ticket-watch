@@ -31,11 +31,12 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-16 | One run fans out a burst of near-identical alerts | P1 | S | Bugs | [x] |
 | OTW-17 | A merged sale message mixing new and moved openings reads oddly | P3 | S | UX & design | [ ] |
 | OTW-18 | Validate state and make recovery explicit | P1 | M | Infra, tooling & docs | [x] |
-| OTW-19 | Split orchestration into bounded jobs | P2 | M | Infra, tooling & docs | [ ] |
+| OTW-19 | Split orchestration into bounded jobs | P2 | M | Infra, tooling & docs | [x] |
 | OTW-20 | Persist a notification outbox and delivery receipts | P1 | L | Infra, tooling & docs | [ ] |
 | OTW-21 | Separate deployment from runtime-state synchronization | P1 | L | Infra, tooling & docs | [ ] |
 | OTW-22 | Move the local owner to an always-on residential host | P2 | L | Infra, tooling & docs | [ ] |
 | OTW-23 | An uncaught save_state failure after delivery can re-send alerts | P2 | S | Bugs | [ ] |
+| OTW-24 | Harden Cinesa leak tracking against a builder exception, and always persist state in CI | P3 | S | Bugs | [ ] |
 
 ## Architecture implementation sequence
 
@@ -696,3 +697,28 @@ upstream value cannot become fatal only after delivery.
 `save_state` call exits with a clear diagnostic (no traceback) and the run's
 already-sent alerts are not silently lost from the next diagnostic; ruff and
 pytest pass.
+
+### OTW-24 · Harden Cinesa leak tracking against a builder exception, and always persist state in CI
+**Priority:** P3 · **Effort:** S
+**Problem:** Raised in dual review (Claude + Codex) of OTW-19's Cinesa
+Chrome-cleanup/leak-detection rework. Two narrow, non-blocking gaps:
+1. `jobs.run_cinesa_job` calls `track_profile_leak(ctx, out, now, budget)`
+   after the `try/except/else` that builds `CinesaOutcome`, not in a
+   `finally`. If `detect.analyze_cinesa` or `build_cinesa_error_finding` ever
+   raised, `_guard` would discard the whole outcome and the leak check for
+   that run would never happen — a latent bug needing another bug to trigger,
+   since both are pure builders over already-parsed data today.
+2. `.github/workflows/watch.yml`'s "Persist state" step has no `if: always()`.
+   A run that now legitimately exits 1 (a detected Cinesa leak, or any other
+   guarded job failure) still saves useful state locally but skips the commit
+   step, matching the old pre-OTW-19 behavior (an uncaught exception also
+   skipped it) rather than regressing — but `if: always()` would be strictly
+   better now that a failing run can carry state worth persisting.
+**Fix sketch:** move the `track_profile_leak` call into a `finally` (or an
+equivalent guarantee) around the Cinesa job body so leak reconciliation runs
+even if outcome-building itself raises; add `if: always()` to the "Persist
+state" step in `watch.yml` so a failing run's state still reaches origin.
+**Files:** `watcher/jobs.py`, `.github/workflows/watch.yml`, `tests/test_main.py`.
+**Done when:** a test simulating an exception from Cinesa outcome-building
+still records/clears the leak episode; the workflow persists state on a
+failing run; ruff and pytest pass.
