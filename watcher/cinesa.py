@@ -37,6 +37,7 @@ import httpx
 from . import cdp, detect
 from .budget import (
     TOKEN_MINT_BUDGET_SECONDS,
+    TOKEN_MINT_MINIMUM_SECONDS,
     Budget,
     out_of_time,
     request_timeout,
@@ -198,14 +199,52 @@ def clear_mint_cooldown(path: str | Path) -> None:
     _write_cache(path, cache)
 
 
-def mint_token(cfg: Any) -> str:
+# Chrome's own worst case — DevTools startup, then the page poll, then the
+# profile teardown — is longer than the whole Cinesa job budget, so a mint that
+# ignored the budget could overrun it (and the aggregate polling budget behind
+# it) on its own. Cleanup is *reserved* rather than shared: the throwaway
+# profile must always be torn down, whatever else runs out.
+CHROME_STARTUP_SECONDS = 30.0
+CHROME_PAGE_WAIT_SECONDS = 60.0
+CHROME_CLEANUP_RESERVE_SECONDS = 5.0
+
+
+def _mint_waits(budget: Budget | None) -> tuple[float, float]:
+    """(DevTools startup, page poll) seconds for one mint under `budget`.
+
+    Splits what is left in the same 1:2 proportion as the unbudgeted defaults.
+    Raises rather than launching Chrome at all when too little remains to
+    finish — the browser stays exactly the real headed one it has always been,
+    it just gets less patience, and never a launch it cannot see through.
+    """
+    if budget is None:
+        return CHROME_STARTUP_SECONDS, CHROME_PAGE_WAIT_SECONDS
+    available = budget.remaining() - CHROME_CLEANUP_RESERVE_SECONDS
+    if available < TOKEN_MINT_MINIMUM_SECONDS:
+        raise cdp.CDPError(
+            f"Chrome not launched: a Cinesa token mint needs at least"
+            f" {TOKEN_MINT_MINIMUM_SECONDS:.0f}s and the {budget.label} budget"
+            f" has {max(0.0, available):.0f}s left"
+        )
+    startup = min(CHROME_STARTUP_SECONDS, available / 3)
+    return startup, available - startup
+
+
+def mint_token(cfg: Any, budget: Budget | None = None) -> str:
     """Drive a real headed Chrome once and read the page's token."""
-    log.info("minting a new Cinesa token via headed Chrome")
+    startup_seconds, wait_seconds = _mint_waits(budget)
+    log.info(
+        "minting a new Cinesa token via headed Chrome (startup %.0fs, page %.0fs)",
+        startup_seconds,
+        wait_seconds,
+    )
     token = cdp.evaluate_on_page(
         cfg.cinesa_token_url,
         TOKEN_EXPRESSION,
         chrome_path=cfg.cinesa_chrome_path,
         profile_dir=cfg.cinesa_chrome_profile,
+        wait_seconds=wait_seconds,
+        startup_seconds=startup_seconds,
     )
     if not isinstance(token, str) or not token:
         raise cdp.CDPError("Chrome returned an empty Cinesa token")
@@ -224,8 +263,10 @@ def get_token(cfg: Any, *, force: bool = False, budget: Budget | None = None) ->
     `budget` covers the mint too (OTW-19): a Chrome that will not settle must
     not hold the run open past the ladder. A *proactive* refresh that no longer
     fits in the budget is simply deferred to a later firing, which is what the
-    existing early-refresh window is for; a run with no usable token at all
-    still fails loudly rather than going quiet.
+    existing early-refresh window is for. A *required* mint — no usable token,
+    or a forced renewal — still runs, with Chrome's waits shortened to what is
+    left (`_mint_waits`), and fails loudly rather than going quiet if even that
+    does not fit.
     """
     now = time.time()
     cache = read_cache(cfg.cinesa_token_cache)
@@ -263,7 +304,7 @@ def get_token(cfg: Any, *, force: bool = False, budget: Budget | None = None) ->
         log.info("refreshing Cinesa token early (%.1fh left)", remaining_h)
 
     try:
-        token = mint_token(cfg)
+        token = mint_token(cfg, budget)
     except Exception as e:
         if cached and not force:
             # Still holding a usable token: stay up and try again later. Only a

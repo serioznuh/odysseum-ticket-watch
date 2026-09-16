@@ -29,6 +29,13 @@ MIN_REQUEST_TIMEOUT_SECONDS = 1.0
 # firings to succeed, and a half-finished mint helps nobody.
 TOKEN_MINT_BUDGET_SECONDS = 30.0
 
+# A *required* mint (no usable token at all, or a forced renewal after a 401)
+# has no cached token to fall back on, so it gets a far lower bar than the
+# proactive refresh — but not none. Below this, launching Chrome could not
+# finish anyway and would only spend the rest of the run's allowance, so the
+# mint fails loudly instead and enters the existing capped failure streak.
+TOKEN_MINT_MINIMUM_SECONDS = 10.0
+
 
 class Budget:
     """An aggregate wall-clock allowance for one bounded job.

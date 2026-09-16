@@ -8,17 +8,40 @@ could spend a whole 15-minute warning window before the ladder was consulted.
 
 from __future__ import annotations
 
+import base64
+import json
+import time
 from typing import ClassVar
 
 import httpx
 import pytest
 
-from watcher import detect, jobs, news, pathe
+from watcher import cdp, cinesa, detect, jobs, news, pathe
 from watcher import state as state_mod
 from watcher.budget import MIN_REQUEST_TIMEOUT_SECONDS, Budget
 
 PRIMARY = "dune-troisieme-partie-50828"
 CINEMA = "cinema-pathe-odysseum"
+
+
+def make_jwt(exp: float) -> str:
+    """A token whose only interesting claim is `exp` (never verified)."""
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"exp": int(exp)}).encode()
+    ).decode().rstrip("=")
+    return f"header.{payload}.signature"
+
+
+class TokenCfg:
+    """Only the fields get_token touches."""
+
+    cinesa_token_url = "https://www.cinesa.es/"
+    cinesa_chrome_path = "/nonexistent/Chrome"
+    cinesa_chrome_profile = "/tmp/profile"
+    cinesa_token_refresh_before_hours = 3.0
+
+    def __init__(self, cache):
+        self.cinesa_token_cache = str(cache)
 
 
 class FakeClock:
@@ -236,3 +259,65 @@ def test_news_stops_fetching_once_the_budget_is_gone():
 
     assert fetched == ["https://feed/1"]  # the second feed and the page are dropped
     assert [i["title"] for i in items] == ["Dune"]
+
+
+# ---------------------------------------------- the Cinesa token step (round 1)
+
+def test_mint_waits_shrink_to_what_the_budget_leaves():
+    """Chrome's own worst case (30 s startup + 60 s page poll + cleanup) is
+    longer than the whole Cinesa job budget, so an unbudgeted mint could
+    overrun both it and the aggregate polling budget on its own."""
+    assert cinesa._mint_waits(None) == (
+        cinesa.CHROME_STARTUP_SECONDS,
+        cinesa.CHROME_PAGE_WAIT_SECONDS,
+    )
+
+    clock = FakeClock()
+    startup, page = cinesa._mint_waits(budget_for(clock, 60.0, "Cinesa check"))
+    spent = startup + page + cinesa.CHROME_CLEANUP_RESERVE_SECONDS
+
+    assert spent <= 60.0                     # cleanup is reserved, never shared
+    assert startup < cinesa.CHROME_STARTUP_SECONDS
+    assert page < cinesa.CHROME_PAGE_WAIT_SECONDS
+    assert startup < page                    # same 1:2 shape as the defaults
+
+
+def test_a_required_mint_refuses_to_launch_chrome_it_cannot_see_through(
+    tmp_path, monkeypatch
+):
+    """Cache miss and forced renewal both skip the proactive-refresh gate, so
+    they need their own: a launch that could not finish would only spend the
+    rest of the run's allowance. It fails loudly instead — which is the
+    documented response to Chrome not clearing the challenge, and keeps the
+    real headed browser exactly as it is."""
+    cfg = TokenCfg(tmp_path / "t.json")
+    monkeypatch.setattr(
+        cdp, "evaluate_on_page", lambda *a, **kw: pytest.fail("Chrome was launched")
+    )
+    clock = FakeClock()
+    spent = budget_for(clock, 8.0, "Cinesa check")
+
+    with pytest.raises(cdp.CDPError, match="Chrome not launched"):
+        cinesa.get_token(cfg, budget=spent)  # no cached token at all
+
+    cinesa.save_token(cfg.cinesa_token_cache, make_jwt(time.time() + 6 * 3600))
+    with pytest.raises(cdp.CDPError, match="Chrome not launched"):
+        cinesa.get_token(cfg, force=True, budget=spent)
+
+
+def test_a_budgeted_mint_hands_chrome_the_shortened_waits(tmp_path, monkeypatch):
+    seen = {}
+    cfg = TokenCfg(tmp_path / "t.json")
+
+    def fake_page(url, expression, **kwargs):
+        seen.update(kwargs)
+        return "token-value"
+
+    monkeypatch.setattr(cdp, "evaluate_on_page", fake_page)
+    clock = FakeClock()
+
+    assert cinesa.get_token(cfg, budget=budget_for(clock, 60.0, "Cinesa check")) == (
+        "token-value"
+    )
+    assert seen["startup_seconds"] < cinesa.CHROME_STARTUP_SECONDS
+    assert seen["wait_seconds"] < cinesa.CHROME_PAGE_WAIT_SECONDS

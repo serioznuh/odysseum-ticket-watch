@@ -323,12 +323,18 @@ def evaluate_on_page(
     profile_dir: str = ".cache/chrome-profile",
     wait_seconds: float = 60.0,
     poll_seconds: float = 1.5,
+    startup_seconds: float = 30.0,
 ) -> Any:
     """Load `url` in a real headed Chrome and poll `expression` until truthy.
 
     The window is placed far offscreen so a scheduled run does not steal focus
     or flash on screen. Chrome runs on a throwaway profile directory, never the
     user's own, and is always terminated before returning.
+
+    `startup_seconds` (DevTools coming up) and `wait_seconds` (the page
+    producing the value) are separate knobs so a caller working to a time
+    budget can shorten both. Shortening them only makes this less patient — it
+    is the same real, headed browser clearing the challenge on its own merits.
     """
     if not os.path.exists(chrome_path):
         raise CDPError(f"Chrome not found at {chrome_path} — set [cinesa] chrome_path")
@@ -352,7 +358,7 @@ def evaluate_on_page(
             ],
             previous_app=previous_app,
         )
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + startup_seconds
         while time.monotonic() < deadline:
             try:
                 _devtools(f"http://127.0.0.1:{port}/json/version")
@@ -360,7 +366,9 @@ def evaluate_on_page(
             except (urllib.error.URLError, OSError):
                 time.sleep(0.3)
         else:
-            raise CDPError("Chrome DevTools endpoint never came up")
+            raise CDPError(
+                f"Chrome DevTools endpoint never came up within {startup_seconds:.0f}s"
+            )
 
         tab = _devtools(
             f"http://127.0.0.1:{port}/json/new?{urllib.parse.quote(url, safe=':/?=&%')}",

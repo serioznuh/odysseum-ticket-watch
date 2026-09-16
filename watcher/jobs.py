@@ -130,6 +130,16 @@ def run_pathe_job(
         return out
 
     out.snapshot = snap
+    # Analyse BEFORE the health bookkeeping below, deliberately. `analyze_pathe`
+    # reads only the observation baselines (`shows_seen`, `sales`,
+    # `formats_seen`, and `tickets_available` via `reminders_cover`), never the
+    # health fields, so the order does not change a single finding — but if
+    # analysis raises, the coordinator discards this outcome, and clearing
+    # `error_alerted` first would bank a recovery whose alert was thrown away.
+    # `build_recovered_finding` would then never fire again: the outage would
+    # end silently, for good.
+    analyzed = detect.analyze_pathe(snap, ctx.state, ctx.cfg, now)
+
     degradation = snap.degradation_summary()
     if degradation:
         state_mod.refresh_catalogue_liveness(ctx.state, now)
@@ -138,6 +148,7 @@ def run_pathe_job(
             ctx.cfg, ctx.state, degradation, now, dry_run=ctx.dry_run
         )
     else:
+        # Reads `st` before the clear below, so the blind span is recoverable.
         if ctx.state.get("error_alerted"):
             out.findings.append(alerts.build_recovered_finding(ctx.cfg, ctx.state, now))
         ctx.state["failure_streak"] = 0
@@ -149,7 +160,7 @@ def run_pathe_job(
             ctx.state["alerts"].pop(spent, None)
         ctx.state["last_check_ok"] = now.isoformat()
         ctx.state["last_catalogue_ok"] = now.isoformat()
-    out.findings.extend(detect.analyze_pathe(snap, ctx.state, ctx.cfg, now))
+    out.findings.extend(analyzed)
     return out
 
 

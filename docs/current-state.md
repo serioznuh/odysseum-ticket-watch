@@ -26,16 +26,16 @@ A single-user Telegram watcher covering **two independent targets**:
 - **One pass = an ordered sequence of bounded jobs** (`watcher/runner.py` over
   `watcher/jobs.py`). Due reminders are checked **before** any request and
   again after fresh observations land; `reminders_sent` is the dedup record, so
-  a rung cannot go out twice, and a run that overruns its warning window now
-  delivers that warning on time *and* the opening ping from the later clock.
-  Each polling job has an aggregate time budget covering its retries, feed
-  loops and token refresh (Pathé 120 s, news 45 s, Cinesa 60 s; 240 s for all
-  polling, inside one launchd firing interval), so a slow source cannot consume
-  the run. Exhausting it reports through the existing failure paths:
-  per-listing degradation, catalogue-wide an outage. A job that is disabled,
-  skipped or crashes is logged and makes the run exit non-zero, but never costs
-  the pass its reminders, supervision or single state save. Cadence, source
-  selection and local-owner/cloud-failover ordering are unchanged.
+  no rung goes out twice and a run that overruns its warning window delivers
+  that warning on time *and* the opening ping from the later clock. Each
+  polling job has an aggregate time budget covering retries, feed loops and the
+  token refresh (Pathé 120 s, news 45 s, Cinesa 60 s; 240 s for all polling,
+  inside one launchd firing interval) — Chrome's own waits shrink to fit, and a
+  mint too big for what is left fails loudly instead of launching. Exhausting a
+  budget reports as per-listing degradation or a catalogue-wide outage. A
+  crashing job is logged and exits non-zero, but never costs the pass its
+  reminders, supervision or single state save, and banks nothing: Pathé
+  analysis runs before the health bookkeeping it would otherwise strand.
 - **Local half** — launchd agent `com.odysseum.ticket-watch` in the
   `~/.ticket-watch` clone fires `scripts/local-check.sh` every 5 min. An
   adaptive-cadence guard decides if a full Pathé + news check is due (≈4 h
@@ -114,7 +114,7 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Code** — Python package `watcher/`: `pathe.py`/`cinesa.py` API clients,
   `cdp.py` token step, `news.py`, `detect.py`, `state.py`, `notify.py`,
   `coalesce.py`, `alerts.py`, `budget.py`/`jobs.py`/`runner.py` orchestration,
-  `config.py`, thin `__main__.py` CLI; `config.toml`; `tests/` (244 passing).
+  `config.py`, thin `__main__.py` CLI; `config.toml`; `tests/` (248 passing).
 
 ## Cinesa specifics
 

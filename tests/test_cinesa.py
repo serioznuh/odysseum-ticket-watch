@@ -198,7 +198,7 @@ def test_fresh_token_is_reused_without_launching_chrome(tmp_path, monkeypatch):
     token = make_jwt(time.time() + 10 * 3600)
     cinesa.save_token(cfg.cinesa_token_cache, token)
     monkeypatch.setattr(
-        cinesa, "mint_token", lambda c: pytest.fail("must not launch Chrome")
+        cinesa, "mint_token", lambda c, budget=None: pytest.fail("must not launch Chrome")
     )
     assert cinesa.get_token(cfg) == token
 
@@ -209,7 +209,7 @@ def test_refresh_starts_before_expiry_not_at_it(tmp_path, monkeypatch):
     old = make_jwt(time.time() + 2 * 3600)          # inside the 3 h window
     cinesa.save_token(cfg.cinesa_token_cache, old, last_attempt=0)
     new = make_jwt(time.time() + 12 * 3600)
-    monkeypatch.setattr(cinesa, "mint_token", lambda c: new)
+    monkeypatch.setattr(cinesa, "mint_token", lambda c, budget=None: new)
 
     assert cinesa.get_token(cfg) == new
     assert cinesa.load_cached_token(cfg.cinesa_token_cache, time.time()) == new
@@ -222,7 +222,7 @@ def test_failed_refresh_falls_back_to_the_valid_cached_token(tmp_path, monkeypat
     good = make_jwt(time.time() + 2 * 3600)
     cinesa.save_token(cfg.cinesa_token_cache, good, last_attempt=0)
 
-    def boom(c):
+    def boom(c, budget=None):
         raise cdp.CDPError("Chrome DevTools endpoint never came up")
 
     monkeypatch.setattr(cinesa, "mint_token", boom)
@@ -237,7 +237,7 @@ def test_backoff_prevents_a_chrome_launch_every_firing(tmp_path, monkeypatch):
     good = make_jwt(time.time() + 2 * 3600)
     cinesa.save_token(cfg.cinesa_token_cache, good, last_attempt=time.time() - 60)
     monkeypatch.setattr(
-        cinesa, "mint_token", lambda c: pytest.fail("should have backed off")
+        cinesa, "mint_token", lambda c, budget=None: pytest.fail("should have backed off")
     )
     assert cinesa.get_token(cfg) == good
 
@@ -253,7 +253,7 @@ def test_a_proactive_refresh_defers_when_the_budget_cannot_afford_chrome(
     good = make_jwt(time.time() + 2 * 3600)  # inside the 3 h refresh window
     cinesa.save_token(cfg.cinesa_token_cache, good, last_attempt=0)
     monkeypatch.setattr(
-        cinesa, "mint_token", lambda c: pytest.fail("must not launch Chrome")
+        cinesa, "mint_token", lambda c, budget=None: pytest.fail("must not launch Chrome")
     )
     spent = Budget(5.0, label="Cinesa check")
 
@@ -261,7 +261,7 @@ def test_a_proactive_refresh_defers_when_the_budget_cannot_afford_chrome(
 
     # With room for Chrome the refresh happens as it always did.
     new = make_jwt(time.time() + 12 * 3600)
-    monkeypatch.setattr(cinesa, "mint_token", lambda c: new)
+    monkeypatch.setattr(cinesa, "mint_token", lambda c, budget=None: new)
     assert cinesa.get_token(cfg, budget=Budget(600.0, label="Cinesa check")) == new
 
 
@@ -271,7 +271,7 @@ def test_dead_token_still_fails_loudly(tmp_path, monkeypatch):
     cfg = TokenCfg(tmp_path / "t.json")
     cinesa.save_token(cfg.cinesa_token_cache, make_jwt(time.time() - 3600))
 
-    def boom(c):
+    def boom(c, budget=None):
         raise cdp.CDPError("Chrome not found")
 
     monkeypatch.setattr(cinesa, "mint_token", boom)
@@ -285,7 +285,7 @@ def test_rejected_token_never_falls_back_to_itself(tmp_path, monkeypatch):
     cfg = TokenCfg(tmp_path / "t.json")
     cinesa.save_token(cfg.cinesa_token_cache, make_jwt(time.time() + 6 * 3600))
 
-    def boom(c):
+    def boom(c, budget=None):
         raise cdp.CDPError("no")
 
     monkeypatch.setattr(cinesa, "mint_token", boom)
@@ -305,7 +305,7 @@ def test_403_mint_failure_cools_down_chrome_and_cached_token_recovers(
 
     launches = []
 
-    def blocked_mint(_cfg):
+    def blocked_mint(_cfg, budget=None):
         launches.append(clock[0])
         raise cdp.CDPError("Cloudflare challenge did not clear")
 
@@ -355,7 +355,7 @@ def test_403_gets_one_new_mint_after_cooldown_window(tmp_path, monkeypatch):
     )
     launches = []
 
-    def blocked_mint(_cfg):
+    def blocked_mint(_cfg, budget=None):
         launches.append(clock[0])
         raise cdp.CDPError("blocked")
 
@@ -380,7 +380,7 @@ def test_401_forces_token_renewal(tmp_path, monkeypatch):
     old = make_jwt(time.time() + 6 * 3600)
     new = make_jwt(time.time() + 12 * 3600)
     cinesa.save_token(cfg.cinesa_token_cache, old)
-    monkeypatch.setattr(cinesa, "mint_token", lambda _cfg: new)
+    monkeypatch.setattr(cinesa, "mint_token", lambda _cfg, budget=None: new)
 
     requests = mock_cinesa_api(
         monkeypatch,

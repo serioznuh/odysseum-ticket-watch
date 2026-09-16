@@ -995,3 +995,63 @@ def test_a_newly_published_opening_is_alerted_in_the_run_that_polls_it(
     assert [t for t in runner.sent if "Sale opens" in t]
     assert f"sale:{show['slug']}:{sale}" in st["alerts"]
     assert st["sale_target"] == sale  # and the ladder is armed by the same run
+
+
+def test_a_crash_in_analysis_cannot_bank_a_recovery_it_threw_away(
+    tmp_path, monkeypatch
+):
+    """The healthy branch clears `error_alerted` and refreshes the health
+    timestamps; the recovery alert itself is one of the findings the job
+    returns. If analysis then crashed and the coordinator discarded those
+    findings, a saved `error_alerted=False` would mean the outage ended in
+    silence and "Pathé watch is back" could never fire again (round-1 review).
+    """
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    blind = json.loads(runner.state.read_text())
+    blind.update(
+        error_alerted=True,
+        failure_streak=3,
+        last_error="HTTP 403",
+        last_check_ok="2026-07-18T07:11:00+02:00",
+        last_catalogue_ok="2026-07-18T07:11:00+02:00",
+    )
+    blind["alerts"]["stale:2026-07-18T07:11:00+02:00:0"] = "2026-07-19T07:11:00+02:00"
+    runner.state.write_text(json.dumps(blind), encoding="utf-8")
+    healthy = Snapshot(matched_shows=[{"slug": "dune-troisieme-partie", "title": "Dune"}])
+
+    real_analyze = detect.analyze_pathe
+    sent: list[str] = []
+
+    def boom(*args, **kwargs):
+        raise TypeError("analysis bug")
+
+    monkeypatch.setattr(detect, "analyze_pathe", boom)
+    monkeypatch.setattr(pathe, "make_client", object)
+    monkeypatch.setattr(pathe, "fetch_snapshot", lambda client, cfg, **kw: healthy)
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda cfg, text, **kw: sent.append(text) or True
+    )
+    argv = [
+        "--config", str(runner.config), "--state", str(runner.state), "--mode", "check",
+    ]
+
+    assert cli.run(argv) == 1  # the bug is reported...
+
+    # ...and nothing about the outage was banked, so the evidence the recovery
+    # alert is built from survives it.
+    stranded = json.loads(runner.state.read_text(encoding="utf-8"))
+    assert stranded["error_alerted"] is True
+    assert stranded["last_error"] == "HTTP 403"
+    assert stranded["last_check_ok"] == "2026-07-18T07:11:00+02:00"
+    assert "stale:2026-07-18T07:11:00+02:00:0" in stranded["alerts"]
+    assert sent == []
+
+    # The same state, once the bug is gone: recovery still reaches the phone.
+    monkeypatch.setattr(detect, "analyze_pathe", real_analyze)
+    assert cli.run(argv) == 0
+
+    recovered = json.loads(runner.state.read_text(encoding="utf-8"))
+    assert [t for t in sent if "Pathé watch is back" in t]
+    assert recovered["error_alerted"] is False
+    assert "last_error" not in recovered
+    assert recovered["last_check_ok"] != "2026-07-18T07:11:00+02:00"
