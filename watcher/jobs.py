@@ -112,7 +112,7 @@ def pathe_due(ctx: RunContext, now: datetime) -> bool:
     return True
 
 
-# ------------------------------------------------------------- source jobs
+# -------------------------------------------------------- supervision jobs
 
 
 def run_state_sync_failure_job(ctx: RunContext, now: datetime) -> bool:

@@ -7,11 +7,11 @@ The order *is* the contract (OTW-19):
    polling and retries. Re-reading the clock afterwards fixed the *wording* of a
    late reminder but could not give back a warning window a slow source had
    already eaten.
-2. **Local-sync supervision**, then the adaptive-cadence guard, still in front
-   of everything the Pathé + news half fetches, then the Pathé, news and Cinesa
-   polling jobs. Each runs under an aggregate time budget, and each is guarded,
-   so a job that is skipped, disabled or outright broken cannot take the rest
-   of the pass with it.
+2. **Local-sync supervision** (no network, no budget), then the adaptive-cadence
+   guard, still in front of everything the Pathé + news half fetches, then the
+   Pathé, news and Cinesa polling jobs. Each polling job runs under an
+   aggregate time budget, and each job here is guarded, so a job that is
+   skipped, disabled or outright broken cannot take the rest of the pass with it.
 3. **Delivery** of this pass's findings (dedup, coalescing, sending), then the
    baselines those alerts gate.
 4. **Due reminders again**, recomputed against a fresh clock and the
