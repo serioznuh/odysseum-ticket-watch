@@ -202,24 +202,34 @@ def clear_mint_cooldown(path: str | Path) -> None:
 # Chrome's own worst case — DevTools startup, then the page poll, then the
 # profile teardown — is longer than the whole Cinesa job budget, so a mint that
 # ignored the budget could overrun it (and the aggregate polling budget behind
-# it) on its own. Cleanup is *reserved* rather than shared: the throwaway
-# profile must always be torn down, whatever else runs out.
+# it) on its own. Two things are reserved out of the job's remainder rather
+# than shared with the mint: `cdp`'s teardown, which runs on its own allowance
+# so the throwaway profile dies even when the mint does not finish, and the one
+# small API call the token exists for.
 CHROME_STARTUP_SECONDS = 30.0
 CHROME_PAGE_WAIT_SECONDS = 60.0
-CHROME_CLEANUP_RESERVE_SECONDS = 5.0
+CHROME_CLEANUP_RESERVE_SECONDS = cdp.CLEANUP_BUDGET_SECONDS
+API_CALL_RESERVE_SECONDS = 5.0
 
 
-def _mint_waits(budget: Budget | None) -> tuple[float, float]:
-    """(DevTools startup, page poll) seconds for one mint under `budget`.
+def _mint_plan(budget: Budget | None) -> tuple[float, float, Budget | None]:
+    """(DevTools startup ceiling, page-poll ceiling, hard budget) for one mint.
 
-    Splits what is left in the same 1:2 proportion as the unbudgeted defaults.
-    Raises rather than launching Chrome at all when too little remains to
-    finish — the browser stays exactly the real headed one it has always been,
-    it just gets less patience, and never a launch it cannot see through.
+    The two ceilings split what is left in the same 1:2 proportion as the
+    unbudgeted defaults, so startup cannot eat the page poll's share. The
+    budget is the hard bound `cdp` clamps every blocking call to — the launch,
+    each DevTools poll, the websocket connect and each CDP round trip — because
+    ceilings on the phases alone leave those free to outlast them.
+
+    Raises rather than launching Chrome at all when too little remains to see a
+    mint through: the browser stays exactly the real headed one it has always
+    been, it just gets less patience, and never a launch it cannot finish.
     """
     if budget is None:
-        return CHROME_STARTUP_SECONDS, CHROME_PAGE_WAIT_SECONDS
-    available = budget.remaining() - CHROME_CLEANUP_RESERVE_SECONDS
+        return CHROME_STARTUP_SECONDS, CHROME_PAGE_WAIT_SECONDS, None
+    available = (
+        budget.remaining() - CHROME_CLEANUP_RESERVE_SECONDS - API_CALL_RESERVE_SECONDS
+    )
     if available < TOKEN_MINT_MINIMUM_SECONDS:
         raise cdp.CDPError(
             f"Chrome not launched: a Cinesa token mint needs at least"
@@ -227,12 +237,12 @@ def _mint_waits(budget: Budget | None) -> tuple[float, float]:
             f" has {max(0.0, available):.0f}s left"
         )
     startup = min(CHROME_STARTUP_SECONDS, available / 3)
-    return startup, available - startup
+    return startup, available - startup, budget.child(available, "Cinesa token mint")
 
 
 def mint_token(cfg: Any, budget: Budget | None = None) -> str:
     """Drive a real headed Chrome once and read the page's token."""
-    startup_seconds, wait_seconds = _mint_waits(budget)
+    startup_seconds, wait_seconds, mint_budget = _mint_plan(budget)
     log.info(
         "minting a new Cinesa token via headed Chrome (startup %.0fs, page %.0fs)",
         startup_seconds,
@@ -245,6 +255,7 @@ def mint_token(cfg: Any, budget: Budget | None = None) -> str:
         profile_dir=cfg.cinesa_chrome_profile,
         wait_seconds=wait_seconds,
         startup_seconds=startup_seconds,
+        budget=mint_budget,
     )
     if not isinstance(token, str) or not token:
         raise cdp.CDPError("Chrome returned an empty Cinesa token")

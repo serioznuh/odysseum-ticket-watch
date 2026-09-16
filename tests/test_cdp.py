@@ -16,7 +16,7 @@ def test_launch_background_uses_hidden_offscreen_args(monkeypatch):
     calls = []
     previous = "/Applications/Notes.app"
 
-    monkeypatch.setattr(cdp, "_frontmost_app", lambda: previous)
+    monkeypatch.setattr(cdp, "_frontmost_app", lambda budget=None: previous)
 
     def fake_run(args, **kwargs):
         calls.append((args, kwargs))
@@ -54,10 +54,10 @@ def test_launch_background_uses_hidden_offscreen_args(monkeypatch):
 
 
 class _SuccessfulWebSocket:
-    def __init__(self, _url):
+    def __init__(self, _url, timeout=30.0, budget=None):
         self.closed = False
 
-    def call(self, _method, params):
+    def call(self, _method, params, timeout=30.0):
         if params["expression"] == "token":
             return {"result": {"result": {"value": "fresh-token"}}}
         raise AssertionError("the page title is not needed after a token is ready")
@@ -74,7 +74,7 @@ def _patch_evaluation(monkeypatch, tmp_path, websocket=None):
     events = []
     launches = []
 
-    monkeypatch.setattr(cdp, "_frontmost_app", lambda: previous)
+    monkeypatch.setattr(cdp, "_frontmost_app", lambda budget=None: previous)
     monkeypatch.setattr(cdp, "_free_port", lambda: 4321)
 
     def fake_launch(path, args, **kwargs):
@@ -85,12 +85,12 @@ def _patch_evaluation(monkeypatch, tmp_path, websocket=None):
     monkeypatch.setattr(
         cdp,
         "_terminate_by_profile",
-        lambda path: events.append(("cleanup", path)),
+        lambda path, budget=None: events.append(("cleanup", path)),
     )
     monkeypatch.setattr(
         cdp,
         "_restore_focus",
-        lambda app: events.append(("focus", app)),
+        lambda app, budget=None: events.append(("focus", app)),
     )
     monkeypatch.setattr(cdp, "_WebSocket", websocket or _SuccessfulWebSocket)
 
@@ -131,10 +131,10 @@ def test_failures_after_launch_restore_focus_after_profile_cleanup(
     monkeypatch, tmp_path, failure
 ):
     class FailingWebSocket:
-        def __init__(self, _url):
+        def __init__(self, _url, timeout=30.0, budget=None):
             pass
 
-        def call(self, _method, _params):
+        def call(self, _method, _params, timeout=30.0):
             raise cdp.CDPError("late CDP failure")
 
         def close(self):
@@ -178,10 +178,10 @@ def test_hard_block_title_fails_without_waiting_for_normal_timeout(
     monkeypatch, tmp_path
 ):
     class HardBlockedWebSocket:
-        def __init__(self, _url):
+        def __init__(self, _url, timeout=30.0, budget=None):
             pass
 
-        def call(self, _method, params):
+        def call(self, _method, params, timeout=30.0):
             if params["expression"] == "token":
                 return {"result": {"result": {"value": ""}}}
             assert params["expression"] == "document.title"
@@ -259,7 +259,7 @@ def test_profile_cleanup_targets_only_exact_watcher_profile(monkeypatch, tmp_pat
 def test_profile_cleanup_warns_when_exit_cannot_be_confirmed(
     monkeypatch, caplog, tmp_path
 ):
-    monkeypatch.setattr(cdp, "_profile_pids", lambda _profile: {101})
+    monkeypatch.setattr(cdp, "_profile_pids", lambda _profile, budget=None: {101})
     monkeypatch.setattr(cdp, "CLEANUP_WAIT_SECONDS", 0.0)
     monkeypatch.setattr(cdp.os, "kill", lambda _pid, _signal: None)
 

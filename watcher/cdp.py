@@ -31,6 +31,8 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from .budget import Budget
+
 log = logging.getLogger(__name__)
 
 DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -40,20 +42,65 @@ CLEANUP_WAIT_SECONDS = 3.0
 CLEANUP_POLL_SECONDS = 0.1
 _MISSING = object()
 
+# Every blocking step's own ceiling — what it waits when there is no budget,
+# i.e. exactly what it has always waited. With a budget, each one is clamped to
+# whatever is left of it as well (`_step_timeout`), because shortening the two
+# *phase* deadlines is not enough on its own: a single `open`, DevTools poll,
+# socket read or `ps` can outlast the phase that contains it (OTW-19 round 2).
+FOCUS_TIMEOUT_SECONDS = 5.0
+LAUNCH_TIMEOUT_SECONDS = 30.0
+RESTORE_FOCUS_TIMEOUT_SECONDS = 10.0
+DEVTOOLS_TIMEOUT_SECONDS = 5.0
+WEBSOCKET_TIMEOUT_SECONDS = 30.0
+CDP_CALL_TIMEOUT_SECONDS = 30.0
+PROCESS_LIST_TIMEOUT_SECONDS = 15.0
+STARTUP_POLL_SECONDS = 0.3
+
+# Teardown gets its own allowance rather than a slice of the caller's: the
+# throwaway profile must be torn down even when the mint ran out of time, and
+# it must not then run unbounded. `evaluate_on_page` mints this in its
+# `finally`, so it is a ceiling on cleanup no matter what happened before.
+CLEANUP_BUDGET_SECONDS = 5.0
+
 
 class CDPError(RuntimeError):
     """Chrome could not be driven, or the page never yielded the value."""
 
 
+def _step_timeout(budget: Budget | None, ceiling: float) -> float:
+    """One blocking step's timeout: its own ceiling, never past the budget."""
+    return ceiling if budget is None else budget.timeout(ceiling)
+
+
+def _require_time(budget: Budget | None, what: str) -> None:
+    """Refuse to *start* a step there is no time left for.
+
+    Paired with `_step_timeout`, this is what bounds the whole operation: no
+    step begins after the deadline, and a step that begins just before it is
+    clamped to the remainder.
+    """
+    if budget is not None and budget.expired():
+        raise CDPError(f"Chrome step abandoned before {what}: {budget.exhausted_message()}")
+
+
+def _nap(budget: Budget | None, seconds: float) -> None:
+    if budget is None:
+        time.sleep(seconds)
+    else:
+        budget.sleep(seconds)
+
+
 class _WebSocket:
     """Minimal RFC 6455 client: text frames, no extensions, no TLS (localhost)."""
 
-    def __init__(self, url: str, timeout: float = 30.0):
+    def __init__(self, url: str, timeout: float = 30.0, budget: Budget | None = None):
+        self._budget = budget
         _, _, rest = url.partition("://")
         hostport, _, path = rest.partition("/")
         host, _, port = hostport.partition(":")
-        self.sock = socket.create_connection((host, int(port or 80)), timeout=timeout)
-        self.sock.settimeout(timeout)
+        connect = _step_timeout(budget, timeout)
+        self.sock = socket.create_connection((host, int(port or 80)), timeout=connect)
+        self.sock.settimeout(connect)
 
         key = base64.b64encode(os.urandom(16)).decode()
         self.sock.sendall(
@@ -69,6 +116,9 @@ class _WebSocket:
 
         buf = b""
         while b"\r\n\r\n" not in buf:
+            # Each recv is bounded by the socket timeout above; the budget check
+            # bounds the *loop*, so a peer dribbling bytes cannot extend it.
+            _require_time(budget, "the websocket handshake completing")
             chunk = self.sock.recv(4096)
             if not chunk:
                 raise CDPError("websocket handshake closed early")
@@ -81,6 +131,7 @@ class _WebSocket:
 
     def _read(self, n: int) -> bytes:
         while len(self._buf) < n:
+            _require_time(self._budget, "the rest of a websocket frame")
             chunk = self.sock.recv(65536)
             if not chunk:
                 raise CDPError("websocket closed mid-frame")
@@ -138,12 +189,13 @@ class _WebSocket:
         self._send(
             0x1, json.dumps({"id": mid, "method": method, "params": params or {}}).encode()
         )
+        timeout = _step_timeout(self._budget, timeout)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             msg = json.loads(self._recv())
             if msg.get("id") == mid:  # otherwise an unsolicited CDP event
                 return msg
-        raise CDPError(f"no CDP reply for {method} within {timeout}s")
+        raise CDPError(f"no CDP reply for {method} within {timeout:.1f}s")
 
     def close(self) -> None:
         with contextlib.suppress(Exception):
@@ -158,11 +210,15 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _frontmost_app() -> str | None:
+def _frontmost_app(budget: Budget | None = None) -> str | None:
     """Bundle path of the app that currently has focus, if it can be read."""
     try:
         asn = subprocess.run(
-            ["lsappinfo", "front"], capture_output=True, text=True, timeout=5, check=True
+            ["lsappinfo", "front"],
+            capture_output=True,
+            text=True,
+            timeout=_step_timeout(budget, FOCUS_TIMEOUT_SECONDS),
+            check=True,
         ).stdout.strip()
         if not asn:
             return None
@@ -170,7 +226,7 @@ def _frontmost_app() -> str | None:
             ["lsappinfo", "info", "-only", "bundlepath", asn],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=_step_timeout(budget, FOCUS_TIMEOUT_SECONDS),
             check=True,
         ).stdout
         path = out.partition("=")[2].strip().strip('"')
@@ -179,7 +235,7 @@ def _frontmost_app() -> str | None:
         return None
 
 
-def _restore_focus(bundle_path: str | None) -> None:
+def _restore_focus(bundle_path: str | None, budget: Budget | None = None) -> None:
     if not bundle_path:
         return
     with contextlib.suppress(OSError, subprocess.SubprocessError):
@@ -187,7 +243,7 @@ def _restore_focus(bundle_path: str | None) -> None:
             ["open", "-a", bundle_path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=10,
+            timeout=_step_timeout(budget, RESTORE_FOCUS_TIMEOUT_SECONDS),
             check=True,
         )
 
@@ -197,6 +253,7 @@ def _launch_background(
     args: list[str],
     *,
     previous_app: str | None | object = _MISSING,
+    budget: Budget | None = None,
 ) -> str | None:
     """Start Chrome hidden/backgrounded; returns the app that had focus.
 
@@ -208,19 +265,21 @@ def _launch_background(
     The window is still a real one, which is what clears the challenge;
     nothing here touches the challenge itself.
     """
-    previous = _frontmost_app() if previous_app is _MISSING else previous_app
+    previous = (
+        _frontmost_app(budget) if previous_app is _MISSING else previous_app
+    )
     bundle = chrome_path.split("/Contents/MacOS/")[0]
     subprocess.run(
         ["open", "-g", "-j", "-n", "-a", bundle, "--args", *args],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        timeout=30,
+        timeout=_step_timeout(budget, LAUNCH_TIMEOUT_SECONDS),
     )
     return previous
 
 
-def _profile_pids(profile_dir: str) -> set[int] | None:
+def _profile_pids(profile_dir: str, budget: Budget | None = None) -> set[int] | None:
     """Return running Chrome PIDs whose exact profile argument is ours."""
     marker = f"--user-data-dir={os.path.abspath(profile_dir)}"
     try:
@@ -228,7 +287,7 @@ def _profile_pids(profile_dir: str) -> set[int] | None:
             ["ps", "-Ao", "pid=,command="],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=_step_timeout(budget, PROCESS_LIST_TIMEOUT_SECONDS),
             check=True,
         ).stdout
     except (OSError, subprocess.SubprocessError):
@@ -254,15 +313,20 @@ def _profile_pids(profile_dir: str) -> set[int] | None:
     return pids
 
 
-def _terminate_by_profile(profile_dir: str) -> None:
+def _terminate_by_profile(profile_dir: str, budget: Budget | None = None) -> None:
     """Terminate only our Chrome profile and confirm it goes away.
 
     `open` detaches, so there is no child PID to wait on. The profile path is
     unique to this watcher, so the user's own Chrome can never match. A short
     bounded wait catches a Chrome that ignored SIGTERM without holding the
     watcher open indefinitely.
+
+    `budget` bounds the `ps` calls too, not only the confirmation wait — two
+    15 s process listings already outlast the whole cleanup reserve on their
+    own. SIGTERM is always sent: killing our own Chrome is never skipped for
+    want of time, only the *confirmation* is cut short.
     """
-    pids = _profile_pids(profile_dir)
+    pids = _profile_pids(profile_dir, budget)
     if not pids:
         return
 
@@ -274,11 +338,15 @@ def _terminate_by_profile(profile_dir: str) -> None:
             except (ProcessLookupError, PermissionError):
                 continue
 
-        current = _profile_pids(profile_dir)
+        if budget is not None and budget.expired():
+            break
+        current = _profile_pids(profile_dir, budget)
         if current is None or not current:
             return
         pids = current
         remaining = deadline - time.monotonic()
+        if budget is not None:
+            remaining = min(remaining, budget.remaining())
         if remaining <= 0:
             break
         time.sleep(min(CLEANUP_POLL_SECONDS, remaining))
@@ -292,13 +360,14 @@ def _terminate_by_profile(profile_dir: str) -> None:
         )
 
 
-def _page_title(ws: _WebSocket) -> str:
+def _page_title(ws: _WebSocket, timeout: float = CDP_CALL_TIMEOUT_SECONDS) -> str:
     """Read the title without turning a transient CDP error into a failure."""
     try:
         value = (
             ws.call(
                 "Runtime.evaluate",
                 {"expression": "document.title", "returnByValue": True},
+                timeout=timeout,
             )
             .get("result", {})
             .get("result", {})
@@ -309,7 +378,7 @@ def _page_title(ws: _WebSocket) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _devtools(url: str, method: str = "GET", timeout: float = 5.0) -> Any:
+def _devtools(url: str, method: str = "GET", timeout: float = DEVTOOLS_TIMEOUT_SECONDS) -> Any:
     req = urllib.request.Request(url, method=method)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
@@ -324,6 +393,7 @@ def evaluate_on_page(
     wait_seconds: float = 60.0,
     poll_seconds: float = 1.5,
     startup_seconds: float = 30.0,
+    budget: Budget | None = None,
 ) -> Any:
     """Load `url` in a real headed Chrome and poll `expression` until truthy.
 
@@ -332,9 +402,19 @@ def evaluate_on_page(
     user's own, and is always terminated before returning.
 
     `startup_seconds` (DevTools coming up) and `wait_seconds` (the page
-    producing the value) are separate knobs so a caller working to a time
-    budget can shorten both. Shortening them only makes this less patient — it
-    is the same real, headed browser clearing the challenge on its own merits.
+    producing the value) are the two phases' own ceilings. `budget` is the hard
+    bound on the whole operation: no step *starts* after it is exhausted, and
+    every blocking call — the `open` that launches Chrome, each DevTools HTTP
+    poll, the websocket connect and handshake, every CDP round trip, and the
+    `ps` calls during teardown — is clamped to what is left of it. Shortening
+    the phases alone was not enough: any one of those calls carries its own
+    fixed timeout and can outlast the phase containing it.
+
+    Teardown is deliberately outside that bound, on its own small allowance, so
+    the throwaway profile is still killed when the mint runs out of time.
+
+    None of this touches how the challenge is cleared. It is the same real,
+    headed browser on its own merits — it simply gets less patience.
     """
     if not os.path.exists(chrome_path):
         raise CDPError(f"Chrome not found at {chrome_path} — set [cinesa] chrome_path")
@@ -342,8 +422,9 @@ def evaluate_on_page(
     os.makedirs(profile_dir, exist_ok=True)
     profile = os.path.abspath(profile_dir)
     port = _free_port()
-    previous_app = _frontmost_app()
+    previous_app = _frontmost_app(budget)
     try:
+        _require_time(budget, "launching Chrome")
         _launch_background(
             chrome_path,
             [
@@ -357,55 +438,72 @@ def evaluate_on_page(
                 "about:blank",
             ],
             previous_app=previous_app,
+            budget=budget,
         )
         deadline = time.monotonic() + startup_seconds
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and not (budget and budget.expired()):
             try:
-                _devtools(f"http://127.0.0.1:{port}/json/version")
+                _devtools(
+                    f"http://127.0.0.1:{port}/json/version",
+                    timeout=_step_timeout(budget, DEVTOOLS_TIMEOUT_SECONDS),
+                )
                 break
             except (urllib.error.URLError, OSError):
-                time.sleep(0.3)
+                _nap(budget, STARTUP_POLL_SECONDS)
         else:
             raise CDPError(
                 f"Chrome DevTools endpoint never came up within {startup_seconds:.0f}s"
+                + ("" if budget is None else f" ({budget.exhausted_message()})")
             )
 
+        _require_time(budget, "opening the token tab")
         tab = _devtools(
             f"http://127.0.0.1:{port}/json/new?{urllib.parse.quote(url, safe=':/?=&%')}",
             method="PUT",
+            timeout=_step_timeout(budget, DEVTOOLS_TIMEOUT_SECONDS),
         )
         # Opening the tab is Chrome's last activation point, so hand focus back
         # now — doing it earlier just lets Chrome take it again.
-        _restore_focus(previous_app)
-        ws = _WebSocket(tab["webSocketDebuggerUrl"])
+        _restore_focus(previous_app, budget)
+        ws = _WebSocket(
+            tab["webSocketDebuggerUrl"],
+            timeout=_step_timeout(budget, WEBSOCKET_TIMEOUT_SECONDS),
+            budget=budget,
+        )
         try:
             deadline = time.monotonic() + wait_seconds
             title = ""
-            while time.monotonic() < deadline:
+            while time.monotonic() < deadline and not (budget and budget.expired()):
                 reply = ws.call(
-                    "Runtime.evaluate", {"expression": expression, "returnByValue": True}
+                    "Runtime.evaluate",
+                    {"expression": expression, "returnByValue": True},
+                    timeout=_step_timeout(budget, CDP_CALL_TIMEOUT_SECONDS),
                 )
                 value = reply.get("result", {}).get("result", {}).get("value")
                 if value:
                     return value
-                title = _page_title(ws)
+                title = _page_title(ws, _step_timeout(budget, CDP_CALL_TIMEOUT_SECONDS))
                 if title.strip().startswith(HARD_BLOCK_TITLE):
                     raise CDPError(
                         f"Cloudflare hard block: page title is {title.strip()!r}"
                     )
-                time.sleep(poll_seconds)
-            if not title:
-                title = _page_title(ws)
+                _nap(budget, poll_seconds)
+            if not title and not (budget and budget.expired()):
+                title = _page_title(ws, _step_timeout(budget, CDP_CALL_TIMEOUT_SECONDS))
             raise CDPError(
                 f"page never produced the value within {wait_seconds:.0f}s"
                 f" (last page title: {title!r})"
+                + ("" if budget is None else f"; {budget.exhausted_message()}")
             )
         finally:
             ws.close()
     finally:
+        # Its own allowance, minted here: teardown must happen even when the
+        # mint above ran out of time, and must not then run unbounded.
+        cleanup = Budget(CLEANUP_BUDGET_SECONDS, label="Chrome cleanup")
         try:
-            _terminate_by_profile(profile)
+            _terminate_by_profile(profile, cleanup)
         except Exception:
             log.exception("unexpected error while cleaning up watcher Chrome")
         finally:
-            _restore_focus(previous_app)
+            _restore_focus(previous_app, cleanup)

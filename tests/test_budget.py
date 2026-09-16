@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import time
+from types import SimpleNamespace
 from typing import ClassVar
 
 import httpx
@@ -263,23 +265,29 @@ def test_news_stops_fetching_once_the_budget_is_gone():
 
 # ---------------------------------------------- the Cinesa token step (round 1)
 
-def test_mint_waits_shrink_to_what_the_budget_leaves():
-    """Chrome's own worst case (30 s startup + 60 s page poll + cleanup) is
+def test_mint_plan_shrinks_every_phase_to_what_the_budget_leaves():
+    """Chrome's own worst case (30 s startup + 60 s page poll + teardown) is
     longer than the whole Cinesa job budget, so an unbudgeted mint could
     overrun both it and the aggregate polling budget on its own."""
-    assert cinesa._mint_waits(None) == (
+    assert cinesa._mint_plan(None) == (
         cinesa.CHROME_STARTUP_SECONDS,
         cinesa.CHROME_PAGE_WAIT_SECONDS,
+        None,
     )
 
     clock = FakeClock()
-    startup, page = cinesa._mint_waits(budget_for(clock, 60.0, "Cinesa check"))
-    spent = startup + page + cinesa.CHROME_CLEANUP_RESERVE_SECONDS
+    startup, page, mint = cinesa._mint_plan(budget_for(clock, 60.0, "Cinesa check"))
 
-    assert spent <= 60.0                     # cleanup is reserved, never shared
     assert startup < cinesa.CHROME_STARTUP_SECONDS
     assert page < cinesa.CHROME_PAGE_WAIT_SECONDS
-    assert startup < page                    # same 1:2 shape as the defaults
+    assert startup < page  # same 1:2 shape as the unbudgeted defaults
+    # Teardown and the API call the token exists for are reserved, not shared.
+    assert startup + page == pytest.approx(mint.seconds)
+    assert (
+        mint.seconds
+        + cinesa.CHROME_CLEANUP_RESERVE_SECONDS
+        + cinesa.API_CALL_RESERVE_SECONDS
+    ) <= 60.0
 
 
 def test_a_required_mint_refuses_to_launch_chrome_it_cannot_see_through(
@@ -321,3 +329,175 @@ def test_a_budgeted_mint_hands_chrome_the_shortened_waits(tmp_path, monkeypatch)
     )
     assert seen["startup_seconds"] < cinesa.CHROME_STARTUP_SECONDS
     assert seen["wait_seconds"] < cinesa.CHROME_PAGE_WAIT_SECONDS
+
+
+# -------------------------------- every blocking call, not just the phases
+
+class StalledWebSocket:
+    """A Chrome that answers, slowly, and never produces the token.
+
+    Records the timeout it is handed and spends exactly that much, which is how
+    a real stalled CDP round trip behaves.
+    """
+
+    calls: ClassVar[list[float]] = []
+    connects: ClassVar[list[float]] = []
+    clock: ClassVar[list] = []
+    connect_cost: ClassVar[list] = [0.0]
+
+    def __init__(self, _url, timeout=30.0, budget=None):
+        StalledWebSocket.connects.append(timeout)
+        StalledWebSocket.clock[0].t += StalledWebSocket.connect_cost[0]
+
+    def call(self, _method, params, timeout=30.0):
+        StalledWebSocket.calls.append(timeout)
+        StalledWebSocket.clock[0].t += timeout
+        return {"result": {"result": {"value": ""}}}
+
+    def close(self):
+        pass
+
+
+def stall_chrome(monkeypatch, tmp_path, clock, setup_cost=None):
+    """Drive `evaluate_on_page` for real against a Chrome that never answers.
+
+    `setup_cost=None` stalls *every* blocking primitive for its whole timeout;
+    a number makes the launch/DevTools/focus steps that cheap, leaving the page
+    itself as the only stall — the realistic "challenge never settles" case.
+    Nothing above the code under test is stubbed, and `cdp.time` is the fake
+    clock, so the phase deadlines and the budget share one timeline.
+    """
+    timeouts: dict[str, list[float]] = {"subprocess": [], "devtools": []}
+    chrome = tmp_path / "Chrome"
+    chrome.write_text("", encoding="utf-8")
+
+    def cost(timeout):
+        return timeout if setup_cost is None else setup_cost
+
+    def fake_run(_command, **kwargs):
+        timeouts["subprocess"].append(kwargs["timeout"])
+        clock.t += cost(kwargs["timeout"])
+        return SimpleNamespace(stdout="")
+
+    def fake_devtools(url, method="GET", timeout=5.0):
+        timeouts["devtools"].append(timeout)
+        clock.t += cost(timeout)
+        if url.endswith("/json/version"):
+            return {"Browser": "Chrome"}
+        return {"webSocketDebuggerUrl": "ws://127.0.0.1:4321/devtools/page/1"}
+
+    StalledWebSocket.calls = []
+    StalledWebSocket.connects = []
+    StalledWebSocket.clock = [clock]
+    StalledWebSocket.connect_cost = [0.0 if setup_cost is None else setup_cost]
+
+    monkeypatch.setattr(cdp.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(cdp.time, "sleep", clock.sleep)
+    monkeypatch.setattr(cdp.subprocess, "run", fake_run)
+    monkeypatch.setattr(cdp, "_devtools", fake_devtools)
+    monkeypatch.setattr(cdp, "_WebSocket", StalledWebSocket)
+    monkeypatch.setattr(cdp, "_free_port", lambda: 4321)
+    monkeypatch.setattr(cdp.os, "kill", lambda _pid, _signal: None)
+    return chrome, tmp_path / "profile", timeouts
+
+
+def test_every_blocking_call_is_clamped_not_just_the_phases(monkeypatch, tmp_path):
+    """The round-2 gap: shortening the startup/page *phases* left every
+    blocking call inside them with its own fixed timeout — a 30 s socket
+    connect, a 30 s CDP round trip. Either could outlast the phase containing
+    it, so a page that never settles still ran past the Cinesa job budget.
+
+    Here the budget is smaller than a single one of those ceilings, so a clamp
+    is the only thing that can keep them under it.
+    """
+    clock = FakeClock()
+    chrome, profile, _timeouts = stall_chrome(
+        monkeypatch, tmp_path, clock, setup_cost=0.5
+    )
+    budget = budget_for(clock, 20.0, "Cinesa token mint")
+
+    with pytest.raises(cdp.CDPError):
+        cdp.evaluate_on_page(
+            "https://www.cinesa.es/",
+            "token",
+            chrome_path=str(chrome),
+            profile_dir=str(profile),
+            budget=budget,
+        )
+
+    assert StalledWebSocket.connects and StalledWebSocket.calls
+    assert max(StalledWebSocket.connects) < cdp.WEBSOCKET_TIMEOUT_SECONDS
+    assert max(StalledWebSocket.calls) < cdp.CDP_CALL_TIMEOUT_SECONDS
+    # Teardown runs on its own allowance, so that is the only time a mint may
+    # spend past its budget.
+    assert clock.t <= 20.0 + cdp.CLEANUP_BUDGET_SECONDS + cdp.CLEANUP_WAIT_SECONDS
+    assert budget.expired()
+
+
+def test_a_stalled_launch_and_focus_handoff_are_bounded_too(monkeypatch, tmp_path):
+    """The same gap on the subprocess side: `open` carries 30 s, the focus
+    handoff 10 s, `lsappinfo` 5 s each. A Mac where those hang is exactly the
+    case where the reminder ladder must not be waiting behind Chrome."""
+    clock = FakeClock()
+    chrome, profile, timeouts = stall_chrome(monkeypatch, tmp_path, clock)
+    budget = budget_for(clock, 60.0, "Cinesa token mint")
+
+    with pytest.raises(cdp.CDPError):
+        cdp.evaluate_on_page(
+            "https://www.cinesa.es/",
+            "token",
+            chrome_path=str(chrome),
+            profile_dir=str(profile),
+            budget=budget,
+        )
+
+    assert clock.t <= 60.0 + cdp.CLEANUP_BUDGET_SECONDS + cdp.CLEANUP_WAIT_SECONDS
+    assert max(timeouts["subprocess"]) <= 60.0
+    assert max(timeouts["devtools"]) <= 60.0
+
+
+def test_without_a_budget_the_same_stall_runs_far_past_the_job_limit(
+    monkeypatch, tmp_path
+):
+    """The control for the test above: the same stalled Chrome, no budget, and
+    the fixed per-call timeouts add up well beyond a Cinesa job — which is
+    exactly what the budget now prevents."""
+    clock = FakeClock()
+    chrome, profile, _timeouts = stall_chrome(monkeypatch, tmp_path, clock)
+
+    with pytest.raises(cdp.CDPError):
+        cdp.evaluate_on_page(
+            "https://www.cinesa.es/",
+            "token",
+            chrome_path=str(chrome),
+            profile_dir=str(profile),
+        )
+
+    assert clock.t > jobs.CINESA_BUDGET_SECONDS
+
+
+def test_teardown_is_bounded_even_when_the_mint_ran_out_of_time(
+    monkeypatch, tmp_path
+):
+    """Killing our own Chrome is never skipped for want of time — only the
+    confirmation is cut short. An unbounded teardown would put the whole run
+    past the polling ceiling just as surely as an unbounded mint."""
+    clock = FakeClock()
+    killed = []
+
+    def fake_run(_command, **kwargs):
+        clock.t += kwargs["timeout"]  # two 15 s `ps` calls, the old worst case
+        return SimpleNamespace(
+            stdout=f"101 /Chrome --user-data-dir={os.path.abspath(tmp_path / 'p')}\n"
+        )
+
+    monkeypatch.setattr(cdp.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(cdp.time, "sleep", clock.sleep)
+    monkeypatch.setattr(cdp.subprocess, "run", fake_run)
+    monkeypatch.setattr(cdp.os, "kill", lambda pid, _sig: killed.append(pid))
+
+    cleanup = budget_for(clock, cdp.CLEANUP_BUDGET_SECONDS, "Chrome cleanup")
+    cdp._terminate_by_profile(str(tmp_path / "p"), cleanup)
+
+    assert killed == [101]  # SIGTERM still sent
+    assert clock.t <= cdp.CLEANUP_BUDGET_SECONDS + cdp.CLEANUP_WAIT_SECONDS
