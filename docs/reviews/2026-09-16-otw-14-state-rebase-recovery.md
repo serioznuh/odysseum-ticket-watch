@@ -75,4 +75,5 @@ NOTES:
 ## Outcome
 <!-- cross-review-merge-state: APPROVED -->
 Approved after 2 rounds (continuing a prior capped loop's round 1); eligible for merge. Final head eef750a82da9e8150c3defd418638a510f70912f, authoritative test gate: pass (pytest, 2107ms). All review findings resolved; all NOTES triaged (4 fixed, 4 accepted, 1 assigned-id: OTW-25).
-Done-when: met — a state-rebase conflict now resolves itself within one firing via a domain-aware merge (preserving alerts/reminders_sent/their baselines) without a human, and an unresolvable conflict fails loudly through a durable local marker that reaches a deduplicated user-facing WATCHER_ERROR alert naming the state-sync recovery failure, rather than only launchd's log.
+A state-rebase conflict now resolves itself within one firing via a domain-aware merge (preserving alerts/reminders_sent/their baselines) without a human, and an unresolvable conflict fails loudly through a durable local marker that reaches a deduplicated user-facing WATCHER_ERROR alert naming the state-sync recovery failure, rather than only launchd's log.
+Done-when: met
