@@ -116,7 +116,7 @@ NOTES:
 ### Codex review — VERDICT: APPROVE
 NOTES: none — both round-1 fixes confirmed complete, all four originally-open findings confirmed still closed, no other P0/P1 found.
 
-A no-brainer fix (item 1 above) was applied after round 2's dual approval: commit f3d63cc, authoritative gate re-run and passed at that head, no new review round per protocol §8.1.
+Three no-brainer/docs-only fixes were applied atop the reviewed diff before settling this round (each zero behavior risk, none touching reviewed logic): the stale `_mint_waits` docstring reference (commit f3d63cc), a new backlog item OTW-24 recording the two assigned-id NOTES above (commit 44da318), and this review log's own Done-when formatting (commits 4fd5059, 76a8c0e). The settled head below is the tip after all three.
 
 ## Required verification
 Not scheduled — no machinery/ paths changed in this diff.
