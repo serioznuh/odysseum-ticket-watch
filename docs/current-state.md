@@ -105,14 +105,14 @@ A single-user Telegram watcher covering **two independent targets**:
   "not yet" (measured: a bookable event still 403s), so the 70 mm listings use
   cinema-programme `isBookable`, without a `refCmd` deep link. That exact
   refusal is expected healthy state; the observed JSON Akamai block is not.
-- **Deploying needs no state change** — `local-check.sh` pulls on every firing.
-  It used to pull only when it had a state commit to push, which deadlocked:
-  a blind run writes identical state, so nothing was pushed and nothing pulled,
-  and the fix for an outage could not reach the clone that needed it.
+- **Deploying needs no state change** — `local-check.sh` pulls on every firing; every
+  pull also recovers `state.json` conflicts via a validated three-way merge that
+  unions receipts and acknowledged baselines. An unsafe merge aborts rather than
+  guessing, leaves a marker, and produces one loud deduplicated watcher alert.
 - **Code** — Python package `watcher/`: `pathe.py`/`cinesa.py` API clients,
-  `cdp.py` token step, `news.py`, `detect.py`, `state.py`, `notify.py`,
+  `cdp.py` token step, `news.py`, `detect.py`, `state.py`/`state_merge.py`/`state_sync.py`, `notify.py`,
   `coalesce.py`, `alerts.py`, `budget.py`/`jobs.py`/`runner.py` orchestration,
-  `config.py`, thin `__main__.py` CLI; `config.toml`; `tests/` (269 passing).
+  `config.py`, thin `__main__.py` CLI; `config.toml`; pytest suite in `tests/`.
 
 ## Cinesa specifics
 

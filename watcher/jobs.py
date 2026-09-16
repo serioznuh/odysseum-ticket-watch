@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
-from . import alerts, cdp, cinesa, coalesce, detect, news, notify, pathe
+from . import alerts, cdp, cinesa, coalesce, detect, news, notify, pathe, state_sync
 from . import state as state_mod
 from .budget import Budget
 from .detect import Finding
@@ -61,6 +61,7 @@ class RunContext:
     adaptive_cadence: bool = False
     skip_if_checked_within: float = 0.0
     reminder_grace_minutes: float = 0.0
+    state_sync_marker: str = state_sync.DEFAULT_MARKER_PATH
     monotonic: Callable[[], float] = time.monotonic
     sleeper: Callable[[float], None] = time.sleep
 
@@ -109,6 +110,18 @@ def pathe_due(ctx: RunContext, now: datetime) -> bool:
     if ctx.adaptive_cadence:
         log.info("adaptive cadence tier: check when older than %.2fh — running", threshold)
     return True
+
+
+# -------------------------------------------------------- supervision jobs
+
+
+def run_state_sync_failure_job(ctx: RunContext, now: datetime) -> bool:
+    """Deliver one loud alert for the unresolved local sync episode."""
+    marker = state_sync.load_failure(ctx.state_sync_marker)
+    if marker is None:
+        return False
+    finding = alerts.build_state_sync_failure_finding(ctx.cfg, marker)
+    return deliver(ctx, [finding], now)
 
 
 # ------------------------------------------------------------- source jobs

@@ -26,7 +26,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-11 | Make Cinesa Chrome refresh normally imperceptible | P2 | S | UX & design | [x] |
 | OTW-12 | `reminders_cover` can over-promise on two same-pass events | P3 | S | Bugs | [ ] |
 | OTW-13 | A persistent per-listing Pathé failure is reported as healthy | P2 | S | Bugs | [x] |
-| OTW-14 | An aborted state rebase can wedge the push until a human intervenes | P3 | S | Bugs | [ ] |
+| OTW-14 | An aborted state rebase can wedge the push until a human intervenes | P3 | S | Bugs | [x] |
 | OTW-15 | Reminders ride a cloud cron that fires ~11% of its schedule | P0 | M | Bugs | [x] |
 | OTW-16 | One run fans out a burst of near-identical alerts | P1 | S | Bugs | [x] |
 | OTW-17 | A merged sale message mixing new and moved openings reads oddly | P3 | S | UX & design | [ ] |
@@ -37,6 +37,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-22 | Move the local owner to an always-on residential host | P2 | L | Infra, tooling & docs | [ ] |
 | OTW-23 | An uncaught save_state failure after delivery can re-send alerts | P2 | S | Bugs | [ ] |
 | OTW-24 | Harden Cinesa leak tracking against a builder exception, and always persist state in CI | P3 | S | Bugs | [ ] |
+| OTW-25 | Exercise OTW-14's rebase recovery against a real git rebase, not just a fake-Git test double | P3 | S | Infra, tooling & docs | [ ] |
 
 ## Architecture implementation sequence
 
@@ -722,3 +723,23 @@ state" step in `watch.yml` so a failing run's state still reaches origin.
 **Done when:** a test simulating an exception from Cinesa outcome-building
 still records/clears the leak episode; the workflow persists state on a
 failing run; ruff and pytest pass.
+
+### OTW-25 · Exercise OTW-14's rebase recovery against a real git rebase, not just a fake-Git test double
+**Priority:** P3 · **Effort:** S
+**Problem:** Raised in dual review (Claude + Codex) of OTW-14's state-rebase
+recovery. `tests/test_state_merge.py`'s shell-boundary test exercises
+`scripts/local-check.sh`'s conflict-detection and merge-invocation logic
+against a fake `git` shim, not a real conflicting rebase — so the actual
+`git rebase`/`--continue`/`--skip`/`--abort` stage sequence, and cleanup on a
+genuinely failed merge, are unverified by the automated suite (they were
+verified manually, once, during review).
+**Fix sketch:** add an integration test that builds two temporary git
+repositories (or one repo with divergent branches) that produce a real
+`state/state.json`-only rebase conflict, runs `scripts/local-check.sh`'s
+recovery path against it with real `git`, and asserts the conflict resolves,
+`--skip` is taken when appropriate, and an unresolvable conflict aborts
+cleanly with the local commit intact.
+**Files:** `tests/test_state_merge.py` or a new `tests/test_local_check.py`.
+**Done when:** a real (not faked) conflicting rebase — including a resolvable
+case and an unresolvable one — is exercised in the test suite, without
+depending on the developer's own git config; ruff and pytest pass.
