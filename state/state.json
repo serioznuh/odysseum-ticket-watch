@@ -28,7 +28,7 @@
     "last_change": "2026-08-06T15:08:31.710968+02:00"
   },
   "error_alerted": false,
-  "failure_streak": 0,
+  "failure_streak": 1,
   "formats_seen": {
     "dune-troisieme-partie-50828": [
       "other"
@@ -39,6 +39,7 @@
   },
   "last_catalogue_ok": "2026-09-16T13:14:49.660341+02:00",
   "last_check_ok": "2026-09-16T13:14:49.660341+02:00",
+  "last_error": "HTTP 403",
   "last_heartbeat": "2026-09-14T23:32:25.869908+02:00",
   "reminders_sent": {
     "2026-09-09T09:00:00+02:00": [
