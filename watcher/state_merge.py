@@ -177,14 +177,14 @@ def _merge_sale_target(
     merged_sales: dict,
     now: datetime,
 ) -> str | None:
-    """Choose the earliest upcoming target still represented after merging.
+    """Reconcile selected targets that are still represented after merging.
 
     Each side's target already encodes which sales belong to selected listings,
     which the state file does not otherwise retain.  Taking the union of those
-    two candidates and then the earliest future value preserves that selection
-    while preventing a later-delivered, later opening from hiding an earlier
-    ladder.  A concurrent clear versus replacement is not safely distinguishable
-    from a withdrawn listing, so it fails closed.
+    two candidates and then the earliest future value prevents a later-delivered,
+    later opening from hiding an earlier ladder.  One agreed or carried-forward
+    target remains valid after opening so the six-hour "open now" grace survives.
+    Ambiguous clears/replacements or multiple elapsed targets fail closed.
     """
     old = _validate_sale_target(base, "base")
     theirs = _validate_sale_target(upstream, "upstream")
@@ -203,13 +203,23 @@ def _merge_sale_target(
         for target in (theirs, ours)
         if target is not None and target in merged_values
     }
+    if len(candidates) <= 1:
+        # update_from_snapshot deliberately retains an elapsed target while it
+        # is still in sales: due_reminders needs it for the six-hour "open now"
+        # window.  A merge must preserve that same invariant.
+        return next(iter(candidates), None)
+
     aware_now = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
     upcoming = [
         target
         for target in candidates
         if _parse_timestamp(target) > aware_now
     ]
-    return min(upcoming, key=_parse_timestamp, default=None)
+    if upcoming:
+        return min(upcoming, key=_parse_timestamp)
+    raise StateMergeError(
+        "sale_target has multiple elapsed candidates; refusing to guess"
+    )
 
 
 def merge_states(

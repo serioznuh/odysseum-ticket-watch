@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from watcher.state import DEFAULT_STATE, load_state
+from watcher.state import DEFAULT_STATE, due_reminders, load_state
 from watcher.state_merge import StateMergeError, merge_states, run
 from watcher.state_sync import load_failure
 
@@ -158,6 +158,40 @@ def test_concurrent_targets_choose_earliest_merged_upcoming_opening():
         "october-listing": october,
     }
     assert merged["sale_target"] == october
+
+
+def test_agreed_elapsed_target_survives_for_open_now_reminder():
+    target = "2026-09-17T10:00:00+02:00"
+    base = fresh_state()
+    base["sales"] = {"dune": target}
+    base["sale_target"] = target
+    upstream = deepcopy(base)
+    upstream["reminders_sent"] = {target: ["1440"]}
+    local = deepcopy(base)
+    local["reminders_sent"] = {target: ["120", "15"]}
+
+    merged = merge_states(base, upstream, local, now=MERGE_NOW)
+
+    assert merged["sale_target"] == target
+    assert merged["reminders_sent"] == {target: ["120", "1440", "15"]}
+    assert due_reminders(merged, [1440, 120, 15], MERGE_NOW) == [
+        {"offset": "open", "target": target}
+    ]
+
+
+def test_divergent_elapsed_targets_fail_closed():
+    earlier = "2026-09-17T09:00:00+02:00"
+    later = "2026-09-17T10:00:00+02:00"
+    base = fresh_state()
+    upstream = fresh_state()
+    upstream["sales"] = {"earlier": earlier}
+    upstream["sale_target"] = earlier
+    local = fresh_state()
+    local["sales"] = {"later": later}
+    local["sale_target"] = later
+
+    with pytest.raises(StateMergeError, match="multiple elapsed candidates"):
+        merge_states(base, upstream, local, now=MERGE_NOW)
 
 
 def test_same_optional_key_removed_on_both_sides_stays_absent():
