@@ -80,3 +80,47 @@ Not scheduled — no machinery/ paths changed in this diff.
 ## Outcome
 <!-- cross-review-merge-state: CAPPED pr=21 -->
 Capped after one round of this second continuation, deliberately WITHOUT sending a further fix round: the user pre-authorized up to 5 review rounds for the Cinesa-cleanup thread, all 5 were used in the prior continuation (loop_id 7661c956-...), and this fresh round (needed only because the prior round-5 review was blocked by a Codex outage, not because of new authorization) immediately surfaced 4 more real P1s in the same area — a pattern of each fix uncovering another gap one layer deeper (tri-state leak detection now interacts with SIGTERM-deadline handling, job-level streak/backoff coupling, filesystem-level lock parsing, and calendar-vs-delivery-history alert timing). Rather than keep spending rounds unilaterally past the authorized budget, this loop stops here for an owner decision: authorize a bounded number of further rounds to close these out, accept the current unfixed state and merge only the earlier (already-reviewed and fixed) commits, or take a different approach to this cleanup path's design.
+
+# OTW-19: Codex rewrites Cinesa Chrome-cleanup, dual review (Claude+Codex) closes it
+Flow 2 (/codex-build) · builder gpt-5.6-sol/high · reviewers Claude claude-opus-5/xhigh + Codex gpt-5.6-sol/xhigh · 2026-09-16
+<!-- cross-review-loop-id: 88677a59-de90-4a48-bdbf-14b7d70e13b1 -->
+
+## Task
+OTW-19: Codex rewrites Cinesa Chrome-cleanup, dual review (Claude+Codex) closes it
+
+## Round 1 — VERDICT: REVISE · reviewers Claude claude-opus-5/xhigh + Codex gpt-5.6-sol/xhigh
+### Claude review — VERDICT: APPROVE
+NOTES:
+1. [fixed] stale `_mint_waits` docstring reference (function renamed to `_mint_plan`) — fixed in f3d63cc
+2. [accepted] leak-alert day-numbering label has a cosmetic off-by-one near midnight; loudness itself is correct
+3. [accepted] the ChromeLeakError branch's save_token rewrite drops mint_cooldown_until — pre-existing behavior, not introduced by this diff
+4. [accepted] mint patience is now shorter than before by design (documented trade-off)
+5. [accepted] a transient double `ps` failure can report a false-positive leak on an otherwise-successful mint — correctly biased trade-off (leak-suspected over silently-clean)
+6. [accepted] architecture: watcher/cdp.py has grown to ~830 lines with many timeout constants and overlapping Chrome-liveness helpers — justified by real failures hit at 5-min cadence, but at the ceiling for a single-user hobby project; a NOTE, not a block
+
+### Codex review — VERDICT: REVISE
+FINDINGS:
+1. [P1] watcher/jobs.py:304 — leak discovery still depended on `isinstance(error, ChromeLeakError)`; when no `leak_since` existed, `track_profile_leak` returned before inspecting the profile if that flag was false, so a locked profile alongside an ordinary Cinesa failure or a successful cached-token poll went unrecorded — FIXED in e2cfcbe
+2. [P1] watcher/jobs.py:238 — the date-only `cinesa_leak:` key was not scoped to a leak episode, so same-day episodes could suppress each other and a first alert near midnight could get an unwanted daily repeat — FIXED in e2cfcbe
+NOTES: overlaps Claude's round-1 NOTES above (stale docstring, day-numbering wording, pre-existing mint_cooldown_until drop); architecturally the jobs/budget split was appropriate, but leak truth was split across an exception subtype, a caller flag, and profile probing — addressed by round 2's unconditional reconciliation fix.
+
+## Round 2 — VERDICT: APPROVE · reviewers Claude claude-opus-5/high (re-review) + Codex gpt-5.6-sol/high (re-review)
+### Claude review — VERDICT: APPROVE
+NOTES:
+1. [assigned-id: OTW-24] watcher/jobs.py:295 — `track_profile_leak` runs after the try/except/else rather than in a finally; if outcome-building itself raised, the leak check for that run would be skipped (latent, needs another bug to trigger)
+2. [accepted] leak-alert day-numbering cosmetic off-by-one persists (duplicate of round-1 note); loudness is correct
+3. [assigned-id: OTW-24] .github/workflows/watch.yml's "Persist state" step lacks `if: always()`, so a now-legitimate non-zero exit (a detected leak) skips the state commit — matches prior behavior, not a regression, but worth hardening
+4. [accepted] README's alert catalogue correctly left untouched — the leak alert reuses existing WATCHER_ERROR/WATCHER_STILL_BLIND kinds, needs no new silent_kinds entry
+5. [accepted] `pathe.make_client()` in runner._run_source_jobs is still never closed — pre-existing, unchanged by this diff, outside scope
+
+### Codex review — VERDICT: APPROVE
+NOTES: none — both round-1 fixes confirmed complete, all four originally-open findings confirmed still closed, no other P0/P1 found.
+
+A no-brainer fix (item 1 above) was applied after round 2's dual approval: commit f3d63cc, authoritative gate re-run and passed at that head, no new review round per protocol §8.1.
+
+## Required verification
+Not scheduled — no machinery/ paths changed in this diff.
+
+## Outcome
+<!-- cross-review-merge-state: APPROVED pr=21 -->
+Done-when: met — fake-clock tests prove slow/failing polling cannot consume an entire reminder window, a newly discovered opening is evaluated in the same run, skipped/disabled jobs do not block reminders, default remind mode makes no source requests, cadence/grace tests pass, Python 3.9 works, no framework was introduced, and ruff/pytest/dry-run all pass (278 passed at the settled head, 279 including the notes-fix commit). Approved after 2 dual-review rounds (Claude + Codex, both required, both approved round 2) that closed all 4 outstanding Cinesa Chrome-cleanup findings via a Codex-authored refactor of the leak-detection reconciliation (unconditional profile check after every Cinesa outcome; an episode-scoped alert key) on top of the 9 prior rounds' narrower patches. Two minor hardening notes were promoted to a new backlog item, OTW-24, rather than blocking this merge. Eligible for merge pending GitHub confirmation.
