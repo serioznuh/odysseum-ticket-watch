@@ -35,8 +35,16 @@ from typing import Any
 import httpx
 
 from . import cdp, detect
+from .budget import (
+    TOKEN_MINT_BUDGET_SECONDS,
+    Budget,
+    out_of_time,
+    request_timeout,
+)
 
 log = logging.getLogger(__name__)
+
+REQUEST_TIMEOUT = 20.0
 
 # The token is published into the page as window.initialData.api.authToken.
 TOKEN_EXPRESSION = (
@@ -90,7 +98,16 @@ class TokenMintCooldown(RuntimeError):
 
 
 def make_client() -> httpx.Client:
-    return httpx.Client(headers=HEADERS, timeout=20.0, follow_redirects=True)
+    return httpx.Client(headers=HEADERS, timeout=REQUEST_TIMEOUT, follow_redirects=True)
+
+
+def _pause(budget: Budget | None, seconds: float) -> None:
+    """Backoff pause, clipped to the job's remaining budget. Goes through this
+    module's own `time` so the existing test seams keep working."""
+    if budget is None:
+        time.sleep(seconds)
+    else:
+        budget.sleep(seconds)
 
 
 # --------------------------------------------------------------------------- token
@@ -195,7 +212,7 @@ def mint_token(cfg: Any) -> str:
     return token
 
 
-def get_token(cfg: Any, *, force: bool = False) -> str:
+def get_token(cfg: Any, *, force: bool = False, budget: Budget | None = None) -> str:
     """Cached token, refreshed *ahead* of expiry via a real headed Chrome.
 
     The token step is the one part that needs a GUI, so it is the one part a
@@ -203,6 +220,12 @@ def get_token(cfg: Any, *, force: bool = False) -> str:
     blocked attempt took the whole Cinesa half down; refreshing while hours of
     life remain turns that into a long retry window, and a failed refresh falls
     back to the token still in hand instead of failing the run.
+
+    `budget` covers the mint too (OTW-19): a Chrome that will not settle must
+    not hold the run open past the ladder. A *proactive* refresh that no longer
+    fits in the budget is simply deferred to a later firing, which is what the
+    existing early-refresh window is for; a run with no usable token at all
+    still fails loudly rather than going quiet.
     """
     now = time.time()
     cache = read_cache(cfg.cinesa_token_cache)
@@ -228,6 +251,13 @@ def get_token(cfg: Any, *, force: bool = False) -> str:
                 "refresh due (%.1fh left) but last attempt was %.0f min ago — waiting",
                 remaining_h,
                 since_attempt / 60,
+            )
+            return cached
+        if budget is not None and not budget.allows(TOKEN_MINT_BUDGET_SECONDS):
+            log.info(
+                "refresh due (%.1fh left) but only %.0fs of budget remain — deferring",
+                remaining_h,
+                budget.remaining(),
             )
             return cached
         log.info("refreshing Cinesa token early (%.1fh left)", remaining_h)
@@ -260,11 +290,20 @@ def get_token(cfg: Any, *, force: bool = False) -> str:
 
 # --------------------------------------------------------------------------- api
 
-def _get_json(client: httpx.Client, url: str, token: str) -> Any:
+def _get_json(
+    client: httpx.Client, url: str, token: str, budget: Budget | None = None
+) -> Any:
     last_error: Exception | None = None
     for attempt in range(3):
+        # As in pathe: the budget covers the retries, not each attempt.
+        if out_of_time(budget):
+            raise RuntimeError(budget.exhausted_message())
         try:
-            r = client.get(url, headers={"Authorization": f"Bearer {token}"})
+            r = client.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=request_timeout(budget, REQUEST_TIMEOUT),
+            )
             if r.status_code in (401, 403):
                 raise TokenRejected(r.status_code, url)
             r.raise_for_status()
@@ -274,11 +313,11 @@ def _get_json(client: httpx.Client, url: str, token: str) -> Any:
         except (httpx.HTTPError, ValueError) as e:
             last_error = e
             log.warning("GET %s failed (attempt %d/3): %s", url, attempt + 1, e)
-            time.sleep(1.5 * (attempt + 1))
+            _pause(budget, 1.5 * (attempt + 1))
     raise RuntimeError(f"Cinesa API request failed for {url}: {last_error}")
 
 
-def _token_after_403(cfg: Any, token: str) -> str:
+def _token_after_403(cfg: Any, token: str, budget: Budget | None = None) -> str:
     """Try one mint for a 403, or reuse the valid token during its cooldown."""
     now = time.time()
     if mint_cooldown_active(cfg.cinesa_token_cache, now):
@@ -286,7 +325,7 @@ def _token_after_403(cfg: Any, token: str) -> str:
         return token
 
     try:
-        return get_token(cfg, force=True)
+        return get_token(cfg, force=True, budget=budget)
     except Exception as e:
         # The 403 is usually an IP/network rejection. Keep the token that was
         # just used; it may work as soon as the VPN/proxy is removed.
@@ -327,31 +366,38 @@ def parse_screening_dates(payload: Any, cfg: Any) -> list[dict]:
     return sorted(days, key=lambda d: d["date"])
 
 
-def fetch_snapshot(cfg: Any) -> detect.CinesaSnapshot:
-    """One check: at most one browser launch, exactly one small API call."""
+def fetch_snapshot(cfg: Any, budget: Budget | None = None) -> detect.CinesaSnapshot:
+    """One check: at most one browser launch, exactly one small API call.
+
+    `budget` is an aggregate allowance for the token step and the call
+    together; running out of it fails the check like any other Cinesa outage,
+    through the existing capped failure streak.
+    """
     url = (
         f"{cfg.cinesa_api_base}/ocapi/v1/film-screening-dates"
         f"?siteIds={cfg.cinesa_site_id}&filmIds={cfg.cinesa_film_id}"
     )
-    token = get_token(cfg)
+    token = get_token(cfg, budget=budget)
     client = make_client()
     try:
         try:
-            payload = _get_json(client, url, token)
+            payload = _get_json(client, url, token, budget)
         except TokenRejected as e:
             if e.status_code == 401:
                 # A 401 is an authentication failure: force an immediate mint,
                 # even if a network-rejection cooldown is present.
                 log.info("Cinesa token rejected (%s) — forcing one new token", e)
-                payload = _get_json(client, url, get_token(cfg, force=True))
+                payload = _get_json(
+                    client, url, get_token(cfg, force=True, budget=budget), budget
+                )
             elif e.status_code == 403:
                 # A 403 is more likely an IP/network rejection. A failed mint
                 # is contained by a cache-only cooldown, and the still-valid
                 # token gets another API chance on later firings.
                 log.info("Cinesa API rejected the network (%s)", e)
-                retry_token = _token_after_403(cfg, token)
+                retry_token = _token_after_403(cfg, token, budget)
                 try:
-                    payload = _get_json(client, url, retry_token)
+                    payload = _get_json(client, url, retry_token, budget)
                 except TokenRejected as retry_error:
                     if retry_error.status_code == 403:
                         # A freshly minted token that is also rejected points

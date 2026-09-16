@@ -14,6 +14,7 @@ import pytest
 from watcher import __main__ as main
 from watcher import cdp, cinesa, detect, notify
 from watcher import state as state_mod
+from watcher.budget import Budget
 from watcher.detect import CinesaSnapshot
 from watcher.state import DEFAULT_STATE
 
@@ -239,6 +240,29 @@ def test_backoff_prevents_a_chrome_launch_every_firing(tmp_path, monkeypatch):
         cinesa, "mint_token", lambda c: pytest.fail("should have backed off")
     )
     assert cinesa.get_token(cfg) == good
+
+
+def test_a_proactive_refresh_defers_when_the_budget_cannot_afford_chrome(
+    tmp_path, monkeypatch
+):
+    """OTW-19: the token step is the one part that needs a GUI, so it is the
+    one part that can hang. A refresh that no longer fits in the run's budget
+    waits for a later firing rather than holding the ladder open — the token in
+    hand is still valid, which is exactly what the early window is for."""
+    cfg = TokenCfg(tmp_path / "t.json")
+    good = make_jwt(time.time() + 2 * 3600)  # inside the 3 h refresh window
+    cinesa.save_token(cfg.cinesa_token_cache, good, last_attempt=0)
+    monkeypatch.setattr(
+        cinesa, "mint_token", lambda c: pytest.fail("must not launch Chrome")
+    )
+    spent = Budget(5.0, label="Cinesa check")
+
+    assert cinesa.get_token(cfg, budget=spent) == good
+
+    # With room for Chrome the refresh happens as it always did.
+    new = make_jwt(time.time() + 12 * 3600)
+    monkeypatch.setattr(cinesa, "mint_token", lambda c: new)
+    assert cinesa.get_token(cfg, budget=Budget(600.0, label="Cinesa check")) == new
 
 
 def test_dead_token_still_fails_loudly(tmp_path, monkeypatch):
@@ -655,7 +679,7 @@ class CheckRunner:
 
     def run(self, result, *, delivered: bool) -> dict:
         """One firing. `result` is a snapshot to return or an exception to raise."""
-        def fake_fetch(cfg):
+        def fake_fetch(cfg, **_budget):
             if isinstance(result, Exception):
                 raise result
             return result

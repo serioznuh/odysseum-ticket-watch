@@ -11,7 +11,11 @@ from typing import Any
 
 import httpx
 
+from .budget import Budget, out_of_time, request_timeout
+
 log = logging.getLogger(__name__)
+
+REQUEST_TIMEOUT = 20.0
 
 TAG_RE = re.compile(r"<[^>]+>")
 
@@ -47,12 +51,23 @@ def parse_rss(xml_text: str) -> list[dict]:
     return items
 
 
-def fetch_news_items(client: httpx.Client, cfg: Any) -> list[dict]:
-    """Fetch all configured feeds and extra pages. Failures are logged, not fatal."""
+def fetch_news_items(
+    client: httpx.Client, cfg: Any, budget: Budget | None = None
+) -> list[dict]:
+    """Fetch all configured feeds and extra pages. Failures are logged, not fatal.
+
+    The budget covers the whole loop, not each feed: news is the least
+    time-critical signal here, and a feed that hangs must not push the reminder
+    ladder out of its window. Whatever was fetched before the budget ran out is
+    still analysed.
+    """
     items: list[dict] = []
     for feed_url in cfg.google_news_queries:
+        if out_of_time(budget):
+            log.warning("news feeds cut short: %s", budget.exhausted_message())
+            return items
         try:
-            r = client.get(feed_url)
+            r = client.get(feed_url, timeout=request_timeout(budget, REQUEST_TIMEOUT))
             r.raise_for_status()
             fetched = parse_rss(r.text)
             log.info("news feed ok (%d items): %s", len(fetched), feed_url)
@@ -61,8 +76,11 @@ def fetch_news_items(client: httpx.Client, cfg: Any) -> list[dict]:
             log.warning("news feed failed %s: %s", feed_url, e)
 
     for page_url in cfg.extra_pages:
+        if out_of_time(budget):
+            log.warning("watched pages cut short: %s", budget.exhausted_message())
+            return items
         try:
-            r = client.get(page_url)
+            r = client.get(page_url, timeout=request_timeout(budget, REQUEST_TIMEOUT))
             r.raise_for_status()
             text = strip_tags(r.text)
             items.append(

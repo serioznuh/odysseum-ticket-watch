@@ -33,7 +33,15 @@ git pull --rebase --quiet origin main || git rebase --abort || true
 # Decides whether a check is due (≈4 h baseline, tightening to every firing
 # around the announced sale opening) and exits instantly otherwise.
 # To force a full check right now: .venv/bin/python -m watcher --mode check
-.venv/bin/python -m watcher --mode check --adaptive-cadence
+#
+# Capture the status instead of letting `set -e` abort here. A failing run can
+# still have saved state — a delivered reminder's receipt, for one — and under
+# `set -e` that state was left modified but uncommitted, which then made the
+# NEXT firing's pre-run pull fail on a dirty tree. A deploy must not depend on
+# the watcher being healthy (OTW-14's wedge class), so sync first and report
+# the watcher's status to launchd at the end.
+status=0
+.venv/bin/python -m watcher --mode check --adaptive-cadence || status=$?
 
 if [ -n "$(git status --porcelain state/state.json)" ]; then
   git add state/state.json
@@ -55,3 +63,5 @@ git pull --rebase --quiet origin main || git rebase --abort || true
 if [ -n "$(git log --oneline '@{u}..HEAD' 2>/dev/null)" ]; then
   git push --quiet origin main
 fi
+
+exit "$status"

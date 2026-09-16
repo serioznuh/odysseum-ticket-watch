@@ -20,10 +20,13 @@ from typing import Any
 import httpx
 
 from . import detect
+from .budget import Budget, out_of_time, request_timeout
 
 log = logging.getLogger(__name__)
 
 BASE = "https://www.pathe.fr/api"
+
+REQUEST_TIMEOUT = 20.0
 
 HEADERS = {
     "User-Agent": (
@@ -37,7 +40,19 @@ HEADERS = {
 
 
 def make_client() -> httpx.Client:
-    return httpx.Client(headers=HEADERS, timeout=20.0, follow_redirects=True)
+    return httpx.Client(headers=HEADERS, timeout=REQUEST_TIMEOUT, follow_redirects=True)
+
+
+def _pause(budget: Budget | None, seconds: float) -> None:
+    """Backoff/politeness pause, clipped to the job's remaining budget.
+
+    Deliberately goes through this module's own `time` so the existing test
+    seam that silences backoff sleeps keeps working.
+    """
+    if budget is None:
+        time.sleep(seconds)
+    else:
+        budget.sleep(seconds)
 
 
 REFUSAL_MESSAGE = "no movie allowed"
@@ -81,12 +96,19 @@ def _get_json_result(
     *,
     allow_404: bool = False,
     allow_refusal: bool = False,
+    budget: Budget | None = None,
 ) -> detect.FetchResult:
     url = path if path.startswith("http") else BASE + path
     last_error: Exception | None = None
     for attempt in range(3):
+        # The budget covers the retries, not each attempt: three tries against
+        # a 20 s timeout, repeated over several endpoints, is how a slow outage
+        # used to eat a whole reminder window without exceeding any one timeout.
+        if out_of_time(budget):
+            log.warning("GET %s abandoned: %s", url, budget.exhausted_message())
+            return detect.FetchResult.failed(budget.exhausted_message())
         try:
-            r = client.get(url)
+            r = client.get(url, timeout=request_timeout(budget, REQUEST_TIMEOUT))
             if r.status_code == 404 and allow_404:
                 return detect.FetchResult.authoritative(None)
             refusal = origin_refusal(r)
@@ -105,7 +127,7 @@ def _get_json_result(
         except (httpx.HTTPError, ValueError) as e:
             last_error = e
             log.warning("GET %s failed (attempt %d/3): %s", url, attempt + 1, e)
-            time.sleep(1.5 * (attempt + 1))
+            _pause(budget, 1.5 * (attempt + 1))
     return detect.FetchResult.failed(f"Pathé API request failed for {url}: {last_error}")
 
 
@@ -115,17 +137,20 @@ def get_json(
     *,
     allow_404: bool = False,
     allow_refusal: bool = False,
+    budget: Budget | None = None,
 ) -> Any:
     """Compatibility wrapper for authoritative calls that fail by exception."""
     result = _get_json_result(
-        client, path, allow_404=allow_404, allow_refusal=allow_refusal
+        client, path, allow_404=allow_404, allow_refusal=allow_refusal, budget=budget
     )
     if not result.healthy:
         raise RuntimeError(result.diagnostic)
     return result.data
 
 
-def show_detail(client: httpx.Client, slug: str) -> detect.FetchResult:
+def show_detail(
+    client: httpx.Client, slug: str, budget: Budget | None = None
+) -> detect.FetchResult:
     """One listing's detail, best-effort.
 
     Per-show calls must never fail the whole snapshot — that is precisely the
@@ -133,30 +158,38 @@ def show_detail(client: httpx.Client, slug: str) -> detect.FetchResult:
     keeps whatever authoritative catalogue data is still available.
     """
     result = _get_json_result(
-        client, f"/show/{slug}", allow_404=True, allow_refusal=True
+        client, f"/show/{slug}", allow_404=True, allow_refusal=True, budget=budget
     )
     if not result.healthy:
         log.warning("detail for %s unavailable, continuing: %s", slug, result.diagnostic)
     return result
 
 
-def fetch_snapshot(client: httpx.Client, cfg: Any) -> detect.Snapshot:
-    """Fetch every Pathé signal we watch, in ~4-8 small requests."""
+def fetch_snapshot(
+    client: httpx.Client, cfg: Any, budget: Budget | None = None
+) -> detect.Snapshot:
+    """Fetch every Pathé signal we watch, in ~4-8 small requests.
+
+    `budget` is an aggregate allowance for the whole snapshot. Running out of
+    it on a catalogue call fails the check exactly like any other catalogue
+    outage; running out on a per-listing call is per-listing degradation, which
+    is the same health signal a 500 on that listing produces (OTW-13).
+    """
     listing_results: dict[str, dict[str, detect.FetchResult]] = {}
-    payload = get_json(client, "/shows")
+    payload = get_json(client, "/shows", budget=budget)
     all_shows = payload.get("shows", payload) if isinstance(payload, dict) else payload
     matched = [
         s for s in all_shows if detect.show_matches(s, cfg.match_patterns, cfg.primary_slug)
     ]
     if not any(s.get("slug") == cfg.primary_slug for s in matched):
-        detail_result = show_detail(client, cfg.primary_slug)
+        detail_result = show_detail(client, cfg.primary_slug, budget)
         listing_results.setdefault(cfg.primary_slug, {})["detail"] = detail_result
         if detail_result.data:
             matched.append(detail_result.data)
         else:
             log.warning("primary slug %s not found in Pathé catalogue", cfg.primary_slug)
 
-    cinema_payload = get_json(client, f"/cinema/{cfg.cinema_slug}/shows")
+    cinema_payload = get_json(client, f"/cinema/{cfg.cinema_slug}/shows", budget=budget)
     cinema_shows = cinema_payload.get("shows", {}) if isinstance(cinema_payload, dict) else {}
 
     # Catch listings visible only on the cinema programme (defensive).
@@ -165,7 +198,7 @@ def fetch_snapshot(client: httpx.Client, cfg: Any) -> detect.Snapshot:
         if slug not in matched_slugs and detect.show_matches(
             {"slug": slug}, cfg.match_patterns, cfg.primary_slug
         ):
-            detail_result = show_detail(client, slug)
+            detail_result = show_detail(client, slug, budget)
             listing_results.setdefault(slug, {})["detail"] = detail_result
             matched.append(detail_result.data or {"slug": slug, "title": slug})
             matched_slugs.add(slug)
@@ -181,6 +214,7 @@ def fetch_snapshot(client: httpx.Client, cfg: Any) -> detect.Snapshot:
             f"/show/{slug}/showtimes/{cfg.cinema_slug}",
             allow_404=True,
             allow_refusal=True,
+            budget=budget,
         )
         listing_results.setdefault(slug, {})["showtimes"] = showtimes_result
         if not showtimes_result.healthy:
@@ -195,7 +229,7 @@ def fetch_snapshot(client: httpx.Client, cfg: Any) -> detect.Snapshot:
         st = showtimes_result.data
         if isinstance(st, dict) and st:
             showtimes[slug] = st
-        time.sleep(0.3)  # be polite
+        _pause(budget, 0.3)  # be polite
 
     for show in matched:
         if detect.selected_listing(show, cfg):
