@@ -276,7 +276,7 @@ def get_token(cfg: Any, *, force: bool = False, budget: Budget | None = None) ->
     fits in the budget is simply deferred to a later firing, which is what the
     existing early-refresh window is for. A *required* mint — no usable token,
     or a forced renewal — still runs, with Chrome's waits shortened to what is
-    left (`_mint_waits`), and fails loudly rather than going quiet if even that
+    left (`_mint_plan`), and fails loudly rather than going quiet if even that
     does not fit.
     """
     now = time.time()
