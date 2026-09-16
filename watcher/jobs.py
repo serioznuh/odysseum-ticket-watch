@@ -190,7 +190,6 @@ def track_profile_leak(
     ctx: RunContext,
     out: CinesaOutcome,
     now: datetime,
-    detected: bool,
     budget: Budget | None,
 ) -> None:
     """Keep a leak visible until the profile is actually free again.
@@ -213,18 +212,17 @@ def track_profile_leak(
     long leak does not churn `state.json` at the 5-min cadence.
     """
     cin = ctx.state.setdefault("cinesa", {})
-    if detected:
-        cin.setdefault("leak_since", now.isoformat())
-    if not cin.get("leak_since"):
+    status = cdp.profile_lock_status(ctx.cfg.cinesa_chrome_profile, budget)
+    if status is False:
+        if cin.pop("leak_since", None):
+            log.info("cinesa: the watcher profile is free again — leak cleared")
         return
 
-    # Re-test even when this run raised ChromeLeakError. Cleanup uncertainty can
-    # resolve before this check, while a prior leak can survive an unrelated
-    # fetch failure. Only a demonstrably free profile clears the episode.
-    if cdp.profile_lock_status(ctx.cfg.cinesa_chrome_profile, budget) is False:
-        log.info("cinesa: the watcher profile is free again — leak cleared")
-        cin.pop("leak_since", None)
-        return
+    # True is a verified live watcher Chrome; None is a present lock whose
+    # owner cannot be determined. Both must start an episode when there is no
+    # prior stamp: requiring ChromeLeakError here would miss a leftover process
+    # after an unrelated fetch failure or a successful cached-token poll.
+    cin.setdefault("leak_since", now.isoformat())
 
     out.integrity_failure = True
     since = detect.as_aware(detect.parse_iso(cin["leak_since"]) or now)
@@ -235,17 +233,18 @@ def track_profile_leak(
     )
     if now - since < threshold:
         return
-    key = f"cinesa_leak:{now:%Y-%m-%d}"
-    # Calendar age does not say whether the owner has ever been told. In
-    # particular, an episode can cross midnight before reaching the threshold.
-    # Count only a stored delivery receipt at or after this episode began.
+    # Like stale alerts, periods begin at the eligibility threshold and last a
+    # full 24 hours. Midnight is irrelevant. Including the episode stamp means
+    # a resolved leak followed by another one the same day gets a fresh key.
+    period = (now - since - threshold).days
+    episode = cin["leak_since"]
+    episode_prefix = f"cinesa_leak:{episode}:"
+    key = f"{episode_prefix}{period}"
     delivered = any(
-        alert_key.startswith("cinesa_leak:")
-        and (sent_at := detect.parse_iso(sent_iso)) is not None
-        and detect.as_aware(sent_at) >= since
-        for alert_key, sent_iso in ctx.state.get("alerts", {}).items()
+        alert_key.startswith(episode_prefix)
+        for alert_key in ctx.state.get("alerts", {})
     )
-    day = (now.date() - since.date()).days + 1 if delivered else 1
+    day = period + 1 if delivered else 1
     out.findings.append(alerts.build_cinesa_leak_finding(ctx.cfg, since, key, day=day))
 
 
@@ -260,11 +259,9 @@ def run_cinesa_job(
         return out
 
     cin = ctx.state.setdefault("cinesa", {})
-    error: Exception | None = None
     try:
         snap = cinesa.fetch_snapshot(ctx.cfg, budget=budget)
     except Exception as e:
-        error = e
         log.exception("Cinesa check failed")
         # Capped at the alert threshold: nothing reads a larger value,
         # and a counter that kept growing would rewrite state.json on
@@ -301,9 +298,7 @@ def run_cinesa_job(
     # poll does not prove the profile is free, an ordinary outage does not prove
     # a prior leak persists, and a fresh cleanup error can already have resolved
     # by the time this exact profile check runs.
-    track_profile_leak(
-        ctx, out, now, isinstance(error, cdp.ChromeLeakError), budget
-    )
+    track_profile_leak(ctx, out, now, budget)
     return out
 
 
