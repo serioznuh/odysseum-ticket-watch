@@ -60,7 +60,8 @@ A single-user Telegram watcher covering **two independent targets**:
   in the selected format, using the same rules as the date alerts. Other dates
   and formats cannot confirm those bookings. Only future national sale openings
   from live selected listings appear; old or withdrawn dates retained in dedup
-  state do not. The heartbeat links to the selected format's event page.
+  state do not. The heartbeat links to the selected format's event page and
+  explicitly names any detail/showtimes calls that are currently degraded.
 - **Shared state** — `state/state.json`, committed to `main` by both halves
   (`[skip ci]`); serves as dedup memory and reminder bookkeeping. The Cinesa
   half writes only on real change, so the 5-min cadence causes no commit churn.
@@ -73,19 +74,20 @@ A single-user Telegram watcher covering **two independent targets**:
   gates was delivered, so one failed send cannot retire an announcement.
   `last_error` records the failure cause for the cloud pass and is rewritten
   only when the text changes, so a steady outage still writes state once.
-- **Pathé failure model** — only the catalogue calls (`/shows`,
-  `/cinema/…/shows`) are the health signal and can fail the check. Every
-  per-listing call (detail and showtimes) is best-effort, so one listing can
-  never blind the watch — that was the 2026-09-02 outage. The showtimes
-  endpoint serves only `isMovie: true` listings and refuses every *event*
-  listing with `403 "No movie allowed !"`; this is permanent, not a "not yet"
-  (measured: an event listing bookable at Odysseum today still 403s), so the
-  70 mm listings are watched through their cinema-programme `isBookable`
-  entry, and no `refCmd` deep link is available for them. The refusal is
-  matched on that message — the observed Akamai block is *also* JSON
-  (`{"error":"Error from IP …"}`) — and is reported as an origin refusal
-  rather than an IP block. A persistent per-listing failure is still reported
-  as healthy (OTW-13).
+- **Pathé failure model** — catalogue failures still blind the check, while
+  every best-effort detail/showtimes result explicitly distinguishes data,
+  authoritative emptiness, expected refusal and unexpected failure. One bad
+  listing cannot discard the rest of the snapshot, but an unexpected failure
+  no longer refreshes `last_check_ok`: it enters the existing capped failure
+  streak, appears by name in the heartbeat, and raises one degraded-watch alert
+  after the supervision threshold (with silent daily repeats if it persists).
+  It also cannot turn a programme-wide `isBookable` bit into guessed format
+  evidence, so degradation cannot invent a ticket alert or baseline.
+  The showtimes endpoint serves only `isMovie: true` listings and refuses every
+  *event* listing with `403 "No movie allowed !"`; this is permanent, not a
+  "not yet" (measured: a bookable event still 403s), so the 70 mm listings use
+  cinema-programme `isBookable`, without a `refCmd` deep link. That exact
+  refusal is expected healthy state; the observed JSON Akamai block is not.
 - **Deploying needs no state change** — `local-check.sh` pulls on every firing.
   It used to pull only when it had a state commit to push, which deadlocked:
   a blind run writes identical state, so nothing was pushed and nothing pulled,
@@ -93,7 +95,7 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Code** — Python package `watcher/` (`pathe.py` and `cinesa.py` API clients,
   `cdp.py` browser token step, `news.py`, `detect.py`, `state.py`, `notify.py`
   Telegram, `config.py`, `__main__.py` CLI); config in `config.toml`; tests in
-  `tests/` (201 passing).
+  `tests/` (224 passing).
 
 ## Cinesa specifics
 

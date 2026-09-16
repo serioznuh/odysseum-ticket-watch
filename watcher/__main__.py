@@ -25,6 +25,7 @@ from .config import load_config
 from .detect import TZ_PARIS, Finding
 
 log = logging.getLogger("watcher")
+PARTIAL_PATHE_FAILURE = "Per-listing Pathé failure:"
 
 
 def summarize_pathe_error(error: str) -> tuple[str, int | None]:
@@ -95,6 +96,12 @@ def pathe_cause(error: str, *, ci: bool = False) -> tuple[str, str]:
     False — the cloud pass always runs in Actions, and would otherwise report
     every one of the Mac's 403s as the expected datacenter block.
     """
+    if error.startswith(PARTIAL_PATHE_FAILURE):
+        affected = error.removeprefix(PARTIAL_PATHE_FAILURE).strip()
+        return (
+            f"Cause: Pathé listing data is unavailable ({affected}).",
+            "Catalogue signals still work; retrying the missing data every 5 min.",
+        )
     summary, status = summarize_pathe_error(error)
     if status == 403 and "refused by origin" in error:
         # Pathé's own nginx declining a listing, which no amount of waiting or
@@ -128,16 +135,21 @@ def pathe_cause(error: str, *, ci: bool = False) -> tuple[str, str]:
 
 
 def build_error_finding(cfg, st: dict, error: str, now: datetime) -> Finding:
-    """Fired once per outage, as soon as the local half is confidently blind."""
+    """Fired once the local half is confidently blind or persistently degraded."""
     cause, tail = pathe_cause(error, ci=running_in_ci())
     when, blind_for = blind_since(st, now)
-    since = f"No sale detection since {when}"
+    degraded = error.startswith(PARTIAL_PATHE_FAILURE)
+    since = (
+        f"Full listing coverage unavailable since {when}"
+        if degraded
+        else f"No sale detection since {when}"
+    )
     since += f" ({blind_for})." if blind_for else "."
     return Finding(
         kind="WATCHER_ERROR",
         key=f"error:{now:%Y-%m-%d}",
         confidence="high",
-        title="Pathé watch is BLIND",
+        title="Pathé watch is DEGRADED" if degraded else "Pathé watch is BLIND",
         lines=[watch_label(cfg), since, cause, tail],
         url=cfg.film_page_url,
     )
@@ -147,7 +159,17 @@ def build_recovered_finding(cfg, st: dict, now: datetime) -> Finding:
     """Sent on the first successful check after an outage. Reads `st` before the
     caller refreshes `last_check_ok`, so the blind span is still recoverable."""
     _, blind_for = blind_since(st, now)
-    line = f"Blind for {blind_for}. " if blind_for else ""
+    label = (
+        "Degraded"
+        if str(st.get("last_error", "")).startswith(PARTIAL_PATHE_FAILURE)
+        else "Blind"
+    )
+    if blind_for:
+        line = f"{label} for {blind_for}. "
+    elif label == "Degraded":
+        line = "Degraded state cleared. "
+    else:
+        line = ""
     return Finding(
         kind="RECOVERED",
         key=f"recovered:{now:%Y-%m-%dT%H%M}",
@@ -156,6 +178,44 @@ def build_recovered_finding(cfg, st: dict, now: datetime) -> Finding:
         lines=[watch_label(cfg), f"{line}Checks are running normally."],
         url=cfg.film_page_url,
     )
+
+
+def record_pathe_failure(cfg, st: dict, error: str, now: datetime, *, dry_run: bool) -> bool:
+    """Advance the shared Pathé supervision streak and alert at its threshold."""
+    st["failure_streak"] = min(
+        st.get("failure_streak", 0) + 1, cfg.failure_streak_threshold
+    )
+    summary, status = summarize_pathe_error(error)
+    # Store no endpoint URL for ordinary outages, and only stable endpoint/slug
+    # names for partial failures, so an unchanged outage settles in state.
+    if error.startswith(PARTIAL_PATHE_FAILURE):
+        recorded = error[:300]
+    elif status and "refused by origin" in error:
+        recorded = f"HTTP {status} refused by origin"
+    elif status:
+        recorded = f"HTTP {status}"
+    else:
+        recorded = summary[:120]
+    if st.get("last_error") != recorded:
+        st["last_error"] = recorded
+
+    # With adaptive cadence, retries come every 5 min — require both a failure
+    # streak AND 6h without a fully healthy snapshot before crying wolf.
+    if (
+        st["failure_streak"] >= cfg.failure_streak_threshold
+        and not state_mod.is_check_fresh(st, 6.0, now)
+        and not st.get("error_alerted")
+    ):
+        finding = build_error_finding(cfg, st, error, now)
+        if notify.send_telegram(
+            cfg,
+            notify.render_finding(finding),
+            dry_run=dry_run,
+            silent=notify.is_silent(cfg, finding.kind),
+        ):
+            st["error_alerted"] = True
+            return True
+    return False
 
 
 def stale_period(blind: timedelta, stale_hours: int) -> int:
@@ -171,15 +231,17 @@ def build_stale_finding(cfg, st: dict, blind: timedelta, key: str, day: int) -> 
     """Cloud-side supervision. `day` 1 is the first alert at the threshold;
     every later one is a silent 24 h repeat, so a long outage cannot go quiet.
 
-    The cloud pass never calls Pathé, so it cannot see *why* it is blind. It
-    infers that from `error_alerted`: set means the local half ran, failed and
-    alerted; clear means the Mac never got as far as reporting.
+    The cloud pass never calls Pathé, so it reads the local half's stable cause.
+    A partial-failure marker distinguishes incomplete listing data from a dark
+    local process; `error_alerted` distinguishes other reported failures from a
+    Mac that never got as far as reporting.
     """
     repeat = day > 1
     when = short_dt(detect.parse_iso(st.get("last_check_ok")))
-    if st.get("error_alerted") and st.get("last_error"):
+    partial = str(st.get("last_error", "")).startswith(PARTIAL_PATHE_FAILURE)
+    if partial or (st.get("error_alerted") and st.get("last_error")):
         cause, _ = pathe_cause(str(st["last_error"]))  # ci=False: recorded by the Mac
-        if repeat:
+        if repeat and not partial:
             cause = cause.replace("Cause: Pathé is", "Cause: Pathé is still")
     else:
         cause = "Cause: the Mac hasn't completed a check — off, asleep, or can't push."
@@ -189,20 +251,29 @@ def build_stale_finding(cfg, st: dict, blind: timedelta, key: str, day: int) -> 
     dark = "Pathé and news checks"
     if getattr(cfg, "cinesa_enabled", False):
         dark = "Pathé, news and Cinesa checks"
+    title = (
+        f"Pathé still degraded — day {day}"
+        if partial and repeat
+        else (
+            f"Pathé listing checks degraded — {fmt_duration(blind)}"
+            if partial
+            else (f"Still blind — day {day}" if repeat else f"Local checks have stopped — {fmt_duration(blind)}")
+        )
+    )
     return Finding(
         kind="WATCHER_STILL_BLIND" if repeat else "WATCHER_ERROR",
         key=key,
         confidence="high",
-        title=(
-            f"Still blind — day {day}"
-            if repeat
-            else f"Local checks have stopped — {fmt_duration(blind)}"
-        ),
+        title=title,
         lines=[
             watch_label(cfg),
-            f"Last successful check: {when}.",
+            f"Last fully healthy check: {when}." if partial else f"Last successful check: {when}.",
             cause,
-            f"{dark} are dark — cloud reminders still run.",
+            (
+                "Catalogue checks still work; affected listing details are incomplete."
+                if partial
+                else f"{dark} are dark — cloud reminders still run."
+            ),
         ],
         url=cfg.film_page_url,
     )
@@ -328,7 +399,7 @@ def build_heartbeat(cfg, snap: detect.Snapshot, st: dict, now: datetime) -> Find
             entry = snap.cinema_entries.get(slug) or {}
             if detect.selected_listing(show, cfg) and (
                 entry.get("isBookable") is True or entry.get("bookable") is True
-            ):
+            ) and (not wanted or snap.endpoint_healthy(slug, "showtimes")):
                 bookable = True
             for day, sessions in (snap.showtimes.get(slug) or {}).items():
                 if day < now.date().isoformat():
@@ -358,12 +429,21 @@ def build_heartbeat(cfg, snap: detect.Snapshot, st: dict, now: datetime) -> Find
             ),
             "Watching: " + (", ".join(cfg.cinesa_target_dates) or "no target dates"),
         ]
-    lines.append("All checks healthy.")
+    degraded = snap.degraded_results
+    if degraded:
+        lines += [
+            "Pathé check degraded — catalogue signals are available, but listing data is incomplete:",
+            "; ".join(f"{endpoint}: {slug}" for slug, endpoint, _result in degraded) + ".",
+        ]
+        title = "All quiet — Pathé partly degraded"
+    else:
+        lines.append("All checks healthy.")
+        title = "All quiet — nothing new"
     return Finding(
         kind="HEARTBEAT",
         key=f"heartbeat:{now:%Y-%m-%d}",
         confidence="high",
-        title="All quiet — nothing new",
+        title=title,
         lines=lines,
         url=(cfg.pathe_page_url or cfg.film_page_url) if wanted else cfg.film_page_url,
     )
@@ -492,58 +572,28 @@ def run(argv: list[str] | None = None) -> int:
                 snap = pathe.fetch_snapshot(client, cfg)
         except Exception as e:
             log.exception("Pathé check failed")
-            # Capped at the alert threshold: nothing reads a larger value,
-            # and a counter that kept growing would rewrite state.json on
-            # every firing of a long outage, commit and push included.
-            st["failure_streak"] = min(
-                st.get("failure_streak", 0) + 1, cfg.failure_streak_threshold
-            )
-            # The cloud pass never calls Pathé, so it cannot tell "IP blocked"
-            # from "the Mac never checked in" — the two need opposite responses.
-            # Recording the cause here lets it say which. Written only when the
-            # text changes: a steady outage writes state once, not every 5 min.
-            summary, status = summarize_pathe_error(str(e))
-            # Store the status without the failing URL: fetch_snapshot hits
-            # several endpoints, and an outage that flapped between them would
-            # otherwise rewrite state — and commit and push — every 5 min.
-            # The marker survives into state (still URL-free, still one stable
-            # string per outage) so the cloud pass reports the right cause too.
-            if status and "refused by origin" in str(e):
-                recorded = f"HTTP {status} refused by origin"
-            elif status:
-                recorded = f"HTTP {status}"
-            else:
-                recorded = summary[:120]
-            if st.get("last_error") != recorded:
-                st["last_error"] = recorded
-            # With adaptive cadence, retries come every 5 min — require both
-            # a failure streak AND 6h without success before crying wolf.
-            if (
-                st["failure_streak"] >= cfg.failure_streak_threshold
-                and not state_mod.is_check_fresh(st, 6.0, now)
-                and not st.get("error_alerted")
-            ):
-                err = build_error_finding(cfg, st, str(e), now)
-                if notify.send_telegram(
-                    cfg,
-                    notify.render_finding(err),
-                    dry_run=args.dry_run,
-                    silent=notify.is_silent(cfg, err.kind),
-                ):
-                    st["error_alerted"] = True
-                    sent_any = True
+            sent_any = record_pathe_failure(
+                cfg, st, str(e), now, dry_run=args.dry_run
+            ) or sent_any
 
         if snap is not None:
-            if st.get("error_alerted"):
-                findings.append(build_recovered_finding(cfg, st, now))
-            st["failure_streak"] = 0
-            st["error_alerted"] = False
-            # Stale cause + spent stale keys must not survive into the next
-            # outage: they would make the cloud pass report the wrong reason.
-            st.pop("last_error", None)
-            for spent in [k for k in st.get("alerts", {}) if k.startswith("stale:")]:
-                st["alerts"].pop(spent, None)
-            st["last_check_ok"] = now.isoformat()
+            degradation = snap.degradation_summary()
+            if degradation:
+                log.warning("%s", degradation)
+                sent_any = record_pathe_failure(
+                    cfg, st, degradation, now, dry_run=args.dry_run
+                ) or sent_any
+            else:
+                if st.get("error_alerted"):
+                    findings.append(build_recovered_finding(cfg, st, now))
+                st["failure_streak"] = 0
+                st["error_alerted"] = False
+                # Stale cause + spent stale keys must not survive into the next
+                # outage: they would make the cloud pass report the wrong reason.
+                st.pop("last_error", None)
+                for spent in [k for k in st.get("alerts", {}) if k.startswith("stale:")]:
+                    st["alerts"].pop(spent, None)
+                st["last_check_ok"] = now.isoformat()
             findings.extend(detect.analyze_pathe(snap, st, cfg, now))
 
         if pathe_due and cfg.news_enabled:

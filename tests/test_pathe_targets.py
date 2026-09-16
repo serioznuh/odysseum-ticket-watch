@@ -94,6 +94,15 @@ def test_sessions_can_prove_target_format_on_regular_listing():
     assert targets(snap) == []
 
 
+def test_failed_showtimes_cannot_confirm_a_target_date_from_the_listing_title():
+    snap = snapshot({'2026-12-19': {'bookable': True}})
+    snap.listing_results = {
+        EVENT: {'showtimes': detect.FetchResult.failed('HTTP 500 from showtimes')}
+    }
+
+    assert targets(snap) == []
+
+
 def test_pending_dates_keep_cadence_fast_until_delivered_or_past():
     st = deepcopy(state.DEFAULT_STATE)
     st.update(tickets_available=True, sale_target=NOW.isoformat(),

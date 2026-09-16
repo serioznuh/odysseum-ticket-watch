@@ -216,6 +216,22 @@ def test_update_from_snapshot_marks_tickets_available():
     assert st["formats_seen"]["a"] == ["imax70"]
 
 
+def test_update_from_snapshot_does_not_record_a_format_when_showtimes_failed():
+    st = fresh_state()
+    snap = Snapshot(
+        matched_shows=[{"slug": "a", "title": "A : Projection IMAX 70mm"}],
+        cinema_entries={"a": {"isBookable": True}},
+        listing_results={
+            "a": {"showtimes": detect.FetchResult.failed("HTTP 500 from showtimes")}
+        },
+    )
+
+    update_from_snapshot(st, snap, None, NOW)
+
+    assert st["tickets_available"] is False
+    assert st["formats_seen"] == {}
+
+
 def test_undelivered_one_shot_alerts_leave_their_baselines_alone():
     """Failed NEW_LISTING/TICKETS_AVAILABLE sends must retry, while current
     sale and ticket facts still move forward."""

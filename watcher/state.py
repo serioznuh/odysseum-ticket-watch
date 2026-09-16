@@ -421,7 +421,10 @@ def update_from_snapshot(
                 fmts = set(state["formats_seen"].get(slug, [])) | set(summary["counts"])
                 state["formats_seen"][slug] = sorted(fmts)
             state["tickets_available"] = True
-        elif entry.get("isBookable") or entry.get("bookable"):
+        elif (
+            (entry.get("isBookable") or entry.get("bookable"))
+            and snap.endpoint_healthy(slug, "showtimes")
+        ):
             if advance_one_shot:
                 fmt = detect.classify_format(show.get("title"), slug)
                 fmts = set(state["formats_seen"].get(slug, [])) | {fmt}

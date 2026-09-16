@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timedelta
 
 from watcher import __main__ as cli
-from watcher import notify, pathe
+from watcher import detect, notify, pathe
 from watcher.detect import TZ_PARIS, Snapshot
 from watcher.state import CURRENT_STATE_VERSION, DEFAULT_STATE
 
@@ -360,6 +360,47 @@ def test_pathe_outage_stops_rewriting_state_once_capped(tmp_path, monkeypatch):
     runner.run(boom, delivered=False)
     runner.run(boom, delivered=False)
     assert runner.state.read_bytes() == settled
+
+
+def test_persistent_listing_failure_uses_supervision_and_never_reports_recovery(
+    tmp_path, monkeypatch
+):
+    """Healthy catalogues plus one permanently failing listing are degraded,
+    not a successful check. The existing streak policy alerts once and settles."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    slug = "dune-troisieme-partie"
+    snap = Snapshot(
+        matched_shows=[{"slug": slug, "title": "Dune : Troisième partie"}],
+        listing_results={
+            slug: {"showtimes": detect.FetchResult.failed("HTTP 500 from showtimes")}
+        },
+    )
+
+    for _ in range(2):
+        st = runner.run(snap, delivered=True)
+        assert runner.sent == []
+    st = runner.run(snap, delivered=True)
+
+    assert len(runner.sent) == 1
+    assert "Pathé watch is DEGRADED" in runner.sent[0]
+    assert "Checks are running normally" not in runner.sent[0]
+    assert st["last_check_ok"] is None
+    assert st["failure_streak"] == 3
+    assert st["error_alerted"] is True
+
+    settled = runner.state.read_bytes()
+    runner.run(snap, delivered=True)
+    assert runner.sent == []
+    assert runner.state.read_bytes() == settled
+
+    healthy = Snapshot(matched_shows=[{"slug": slug, "title": "Dune"}])
+    st = runner.run(healthy, delivered=True)
+    assert len(runner.sent) == 1
+    assert "Pathé watch is back" in runner.sent[0]
+    assert "Degraded state cleared" in runner.sent[0]
+    assert st["failure_streak"] == 0
+    assert st["error_alerted"] is False
+    assert st["last_check_ok"] is not None
 
 
 def test_failed_pathe_one_shot_alerts_are_retried_on_the_next_run(
