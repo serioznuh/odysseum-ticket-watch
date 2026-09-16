@@ -439,7 +439,7 @@ def test_cloud_reports_a_degraded_then_dark_mac_as_stopped_not_merely_degraded()
     st = {
         "last_check_ok": "2026-07-17T07:11:00+02:00",
         "last_catalogue_ok": "2026-07-18T07:11:00+02:00",
-        "last_error": f"{cli.PARTIAL_PATHE_FAILURE} showtimes: dune",
+        "last_error": f"{detect.PARTIAL_PATHE_FAILURE} showtimes: dune",
         "error_alerted": True,
     }
     blind = NOW - datetime.fromisoformat(st["last_catalogue_ok"])
@@ -468,7 +468,7 @@ def test_cloud_supervision_uses_catalogue_liveness_for_degraded_local_half(
     st.update(
         last_check_ok=(now - timedelta(days=2)).isoformat(),
         last_catalogue_ok=(now - timedelta(hours=1)).isoformat(),
-        last_error=f"{cli.PARTIAL_PATHE_FAILURE} showtimes: dune",
+        last_error=f"{detect.PARTIAL_PATHE_FAILURE} showtimes: dune",
         error_alerted=True,
     )
     state = tmp_path / "state.json"

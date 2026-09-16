@@ -25,7 +25,6 @@ from .config import load_config
 from .detect import TZ_PARIS, Finding
 
 log = logging.getLogger("watcher")
-PARTIAL_PATHE_FAILURE = "Per-listing Pathé failure:"
 
 
 def summarize_pathe_error(error: str) -> tuple[str, int | None]:
@@ -96,8 +95,8 @@ def pathe_cause(error: str, *, ci: bool = False) -> tuple[str, str]:
     False — the cloud pass always runs in Actions, and would otherwise report
     every one of the Mac's 403s as the expected datacenter block.
     """
-    if error.startswith(PARTIAL_PATHE_FAILURE):
-        affected = error.removeprefix(PARTIAL_PATHE_FAILURE).strip()
+    if error.startswith(detect.PARTIAL_PATHE_FAILURE):
+        affected = error.removeprefix(detect.PARTIAL_PATHE_FAILURE).strip()
         return (
             f"Cause: Pathé listing data is unavailable ({affected}).",
             "Catalogue signals still work; retrying the missing data every 5 min.",
@@ -138,7 +137,7 @@ def build_error_finding(cfg, st: dict, error: str, now: datetime) -> Finding:
     """Fired once the local half is confidently blind or persistently degraded."""
     cause, tail = pathe_cause(error, ci=running_in_ci())
     when, blind_for = blind_since(st, now)
-    degraded = error.startswith(PARTIAL_PATHE_FAILURE)
+    degraded = error.startswith(detect.PARTIAL_PATHE_FAILURE)
     since = (
         f"Full listing coverage unavailable since {when}"
         if degraded
@@ -161,7 +160,7 @@ def build_recovered_finding(cfg, st: dict, now: datetime) -> Finding:
     _, blind_for = blind_since(st, now)
     label = (
         "Degraded"
-        if str(st.get("last_error", "")).startswith(PARTIAL_PATHE_FAILURE)
+        if str(st.get("last_error", "")).startswith(detect.PARTIAL_PATHE_FAILURE)
         else "Blind"
     )
     if blind_for:
@@ -182,8 +181,10 @@ def build_recovered_finding(cfg, st: dict, now: datetime) -> Finding:
 
 def record_pathe_failure(cfg, st: dict, error: str, now: datetime, *, dry_run: bool) -> bool:
     """Advance the shared Pathé supervision streak and alert at its threshold."""
-    previous_partial = str(st.get("last_error", "")).startswith(PARTIAL_PATHE_FAILURE)
-    current_partial = error.startswith(PARTIAL_PATHE_FAILURE)
+    previous_partial = str(st.get("last_error", "")).startswith(
+        detect.PARTIAL_PATHE_FAILURE
+    )
+    current_partial = error.startswith(detect.PARTIAL_PATHE_FAILURE)
     st["failure_streak"] = min(
         st.get("failure_streak", 0) + 1, cfg.failure_streak_threshold
     )
@@ -245,7 +246,7 @@ def build_stale_finding(cfg, st: dict, blind: timedelta, key: str, day: int) -> 
     """
     repeat = day > 1
     when = short_dt(detect.parse_iso(state_mod.catalogue_check_iso(st)))
-    partial = str(st.get("last_error", "")).startswith(PARTIAL_PATHE_FAILURE)
+    partial = str(st.get("last_error", "")).startswith(detect.PARTIAL_PATHE_FAILURE)
     if partial:
         cause = "Cause: the Mac stopped checking after reporting degraded listing data."
     elif st.get("error_alerted") and st.get("last_error"):

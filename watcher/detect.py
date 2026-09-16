@@ -152,6 +152,9 @@ def fmt_release(show: dict | None) -> str:
 
 # --------------------------------------------------------------------------- data
 
+PARTIAL_PATHE_FAILURE = "Per-listing Pathé failure:"
+
+
 class FetchHealth(str, Enum):
     """Trust level of one best-effort per-listing Pathé request."""
 
@@ -230,7 +233,7 @@ class Snapshot:
         affected = "; ".join(
             f"{endpoint}: {slug}" for slug, endpoint, _result in self.degraded_results
         )
-        return f"Per-listing Pathé failure: {affected}"
+        return f"{PARTIAL_PATHE_FAILURE} {affected}"
 
 
 @dataclass

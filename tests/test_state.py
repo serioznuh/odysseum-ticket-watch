@@ -584,16 +584,6 @@ def test_is_check_fresh():
     assert state_mod.is_check_fresh(st, 0, NOW) is False  # guard disabled
 
 
-def test_is_check_stale():
-    st = fresh_state()
-    assert state_mod.is_check_stale(st, 72, NOW) is False  # never checked -> setup phase
-    st["last_check_ok"] = iso_in(timedelta(hours=-10))
-    assert state_mod.is_check_stale(st, 72, NOW) is False
-    st["last_check_ok"] = iso_in(timedelta(hours=-80))
-    assert state_mod.is_check_stale(st, 72, NOW) is True
-    assert state_mod.is_check_stale(st, 0, NOW) is False  # disabled
-
-
 def test_catalogue_staleness_uses_liveness_not_full_health():
     st = fresh_state()
     st["last_check_ok"] = iso_in(timedelta(hours=-80))

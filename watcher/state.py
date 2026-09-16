@@ -647,17 +647,6 @@ def is_check_fresh(state: dict, hours: float, now: datetime) -> bool:
     return last is not None and (now - detect.as_aware(last)) < timedelta(hours=hours)
 
 
-def is_check_stale(state: dict, hours: int, now: datetime) -> bool:
-    """True when the last successful Pathé check is older than `hours`.
-
-    Never stale before the first successful check (setup phase).
-    """
-    if hours <= 0:
-        return False
-    last = detect.parse_iso(state.get("last_check_ok"))
-    return last is not None and (now - detect.as_aware(last)) > timedelta(hours=hours)
-
-
 CATALOGUE_LIVENESS_INTERVAL = timedelta(hours=1)
 
 
