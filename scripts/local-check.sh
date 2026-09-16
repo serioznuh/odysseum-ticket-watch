@@ -80,11 +80,20 @@ recover_state_rebase() {
 
 pull_with_state_recovery() {
   if git pull --rebase --quiet origin main; then
+    .venv/bin/python -m watcher.state_sync resolve --state state/state.json \
+      || echo "WARNING: could not resolve state-rebase failure marker" >&2
     return 0
   fi
   if [ "$(git diff --name-only --diff-filter=U)" = "state/state.json" ]; then
-    recover_state_rebase
-    return
+    if recover_state_rebase; then
+      .venv/bin/python -m watcher.state_sync resolve --state state/state.json \
+        || echo "WARNING: could not resolve state-rebase failure marker" >&2
+      return 0
+    fi
+    .venv/bin/python -m watcher.state_sync record \
+      --detail "automatic state/state.json rebase recovery failed" \
+      || echo "ERROR: could not record state-rebase failure marker" >&2
+    return 1
   fi
   # Preserve the established retry behavior for dirty trees, network errors,
   # and non-state failures. Only the known state rebase wedge is auto-merged.
@@ -98,7 +107,7 @@ pull_with_state_recovery() {
 # State-only conflicts are merged by delivery/baseline semantics and the rebase
 # continues in this firing; unrelated pull failures retain the normal retry.
 # It also lands a deploy one firing sooner.
-pull_with_state_recovery
+pull_with_state_recovery || true
 
 # Decides whether a check is due (≈4 h baseline, tightening to every firing
 # around the announced sale opening) and exits instantly otherwise.

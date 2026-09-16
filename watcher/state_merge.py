@@ -14,7 +14,7 @@ import json
 import sys
 from collections.abc import Iterable
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,8 @@ def _path_label(path: tuple[str, ...]) -> str:
 
 
 def _three_way(base: Any, upstream: Any, local: Any, path: tuple[str, ...]) -> Any:
+    if upstream is _MISSING and local is _MISSING:
+        return _MISSING
     if upstream == local:
         return deepcopy(upstream)
     if upstream == base:
@@ -59,8 +61,6 @@ def _three_way(base: Any, upstream: Any, local: Any, path: tuple[str, ...]) -> A
                 merged[key] = value
         return merged
 
-    if upstream is _MISSING and local is _MISSING:
-        return _MISSING
     raise StateMergeError(
         f"{_path_label(path)} changed differently upstream and locally; "
         "refusing to guess"
@@ -163,49 +163,62 @@ def _merge_sales(
     return merged
 
 
-def _sale_target_receipt(state: dict, target: str | None) -> str | None:
-    if target is None:
-        return None
-    receipts = [
-        receipt
-        for slug, sale_iso in state["sales"].items()
-        if sale_iso == target
-        for receipt in [_sale_receipt(state, slug, sale_iso)]
-        if receipt is not None
+def _validate_sale_target(state: dict, label: str) -> str | None:
+    target = state["sale_target"]
+    if target is not None and target not in state["sales"].values():
+        raise StateMergeError(f"{label} sale_target is not present in {label} sales")
+    return target
+
+
+def _merge_sale_target(
+    base: dict,
+    upstream: dict,
+    local: dict,
+    merged_sales: dict,
+    now: datetime,
+) -> str | None:
+    """Choose the earliest upcoming target still represented after merging.
+
+    Each side's target already encodes which sales belong to selected listings,
+    which the state file does not otherwise retain.  Taking the union of those
+    two candidates and then the earliest future value preserves that selection
+    while preventing a later-delivered, later opening from hiding an earlier
+    ladder.  A concurrent clear versus replacement is not safely distinguishable
+    from a withdrawn listing, so it fails closed.
+    """
+    old = _validate_sale_target(base, "base")
+    theirs = _validate_sale_target(upstream, "upstream")
+    ours = _validate_sale_target(local, "local")
+
+    if (theirs is None) != (ours is None):
+        remaining = ours if theirs is None else theirs
+        if old is not None and remaining != old:
+            raise StateMergeError(
+                "sale_target was concurrently cleared and replaced; refusing to guess"
+            )
+
+    merged_values = set(merged_sales.values())
+    candidates = {
+        target
+        for target in (theirs, ours)
+        if target is not None and target in merged_values
+    }
+    aware_now = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    upcoming = [
+        target
+        for target in candidates
+        if _parse_timestamp(target) > aware_now
     ]
-    return max(receipts, key=_parse_timestamp, default=None)
+    return min(upcoming, key=_parse_timestamp, default=None)
 
 
-def _merge_sale_target(base: dict, upstream: dict, local: dict) -> str | None:
-    old = base["sale_target"]
-    theirs = upstream["sale_target"]
-    ours = local["sale_target"]
-    if theirs == ours:
-        return theirs
-    if theirs == old:
-        return ours
-    if ours == old:
-        return theirs
-
-    upstream_receipt = _sale_target_receipt(upstream, theirs)
-    local_receipt = _sale_target_receipt(local, ours)
-    if upstream_receipt and local_receipt and upstream_receipt != local_receipt:
-        return (
-            theirs
-            if _parse_timestamp(upstream_receipt) > _parse_timestamp(local_receipt)
-            else ours
-        )
-    if upstream_receipt and not local_receipt:
-        return theirs
-    if local_receipt and not upstream_receipt:
-        return ours
-    raise StateMergeError(
-        "sale_target changed differently upstream and locally with no "
-        "unambiguous delivery order"
-    )
-
-
-def merge_states(base: dict, upstream: dict, local: dict) -> dict:
+def merge_states(
+    base: dict,
+    upstream: dict,
+    local: dict,
+    *,
+    now: datetime | None = None,
+) -> dict:
     """Merge validated state snapshots from a conflicted rebase.
 
     ``upstream`` is Git's stage 2 during a rebase; ``local`` is stage 3, the
@@ -244,7 +257,13 @@ def merge_states(base: dict, upstream: dict, local: dict) -> dict:
     merged["sales"] = _merge_sales(
         base["sales"], upstream["sales"], local["sales"], upstream, local
     )
-    merged["sale_target"] = _merge_sale_target(base, upstream, local)
+    merged["sale_target"] = _merge_sale_target(
+        base,
+        upstream,
+        local,
+        merged["sales"],
+        now or datetime.now(timezone.utc),
+    )
     # This baseline only ever moves False -> True.  Once tickets were observed
     # and any gated alert was delivered, a concurrent stale False must not undo
     # that evidence.

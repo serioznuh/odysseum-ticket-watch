@@ -7,12 +7,16 @@ import os
 import subprocess
 import sys
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from watcher.state import DEFAULT_STATE, load_state
 from watcher.state_merge import StateMergeError, merge_states, run
+from watcher.state_sync import load_failure
+
+MERGE_NOW = datetime.fromisoformat("2026-09-17T12:00:00+02:00")
 
 
 def fresh_state() -> dict:
@@ -45,7 +49,7 @@ def test_merge_preserves_both_delivery_histories_and_acknowledged_baselines():
     local["tickets_available"] = True
     local["last_check_ok"] = "2026-10-01T10:03:00+02:00"
 
-    merged = merge_states(base, upstream, local)
+    merged = merge_states(base, upstream, local, now=MERGE_NOW)
 
     assert set(merged["alerts"]) == {
         f"sale:cloud-listing:{target}",
@@ -93,9 +97,10 @@ def test_sales_baseline_is_not_lost_when_only_one_side_still_has_it():
     upstream = deepcopy(base)
     upstream["alerts"].clear()
     upstream["sales"].clear()
+    upstream["sale_target"] = None
     local = deepcopy(base)
 
-    merged = merge_states(base, upstream, local)
+    merged = merge_states(base, upstream, local, now=MERGE_NOW)
 
     assert merged["alerts"] == base["alerts"]
     assert merged["sales"] == base["sales"]
@@ -118,7 +123,7 @@ def test_concurrent_sale_changes_keep_the_most_recently_acknowledged_baseline():
     local["sale_target"] = local_sale
     local["alerts"][f"sale:dune:{local_sale}"] = "2026-10-01T10:05:00+02:00"
 
-    merged = merge_states(base, upstream, local)
+    merged = merge_states(base, upstream, local, now=MERGE_NOW)
 
     assert merged["sales"] == {"dune": local_sale}
     assert merged["sale_target"] == local_sale
@@ -126,6 +131,50 @@ def test_concurrent_sale_changes_keep_the_most_recently_acknowledged_baseline():
         f"sale:dune:{upstream_sale}",
         f"sale:dune:{local_sale}",
     }
+
+
+def test_concurrent_targets_choose_earliest_merged_upcoming_opening():
+    october = "2026-10-10T09:00:00+02:00"
+    november = "2026-11-10T09:00:00+01:00"
+    base = fresh_state()
+    upstream = fresh_state()
+    upstream["sales"] = {"october-listing": october}
+    upstream["sale_target"] = october
+    upstream["alerts"][f"sale:october-listing:{october}"] = (
+        "2026-09-17T10:00:00+02:00"
+    )
+    local = fresh_state()
+    local["sales"] = {"november-listing": november}
+    local["sale_target"] = november
+    # The later delivery receipt must not make the later opening win.
+    local["alerts"][f"sale:november-listing:{november}"] = (
+        "2026-09-17T10:05:00+02:00"
+    )
+
+    merged = merge_states(base, upstream, local, now=MERGE_NOW)
+
+    assert merged["sales"] == {
+        "november-listing": november,
+        "october-listing": october,
+    }
+    assert merged["sale_target"] == october
+
+
+def test_same_optional_key_removed_on_both_sides_stays_absent():
+    base = fresh_state()
+    base["last_error"] = "old failure"
+    upstream = deepcopy(base)
+    upstream.pop("last_error")
+    upstream["failure_streak"] = 1
+    local = deepcopy(base)
+    local.pop("last_error")
+    local["last_check_ok"] = "2026-09-17T11:00:00+02:00"
+
+    merged = merge_states(base, upstream, local, now=MERGE_NOW)
+
+    assert "last_error" not in merged
+    assert merged["failure_streak"] == 1
+    assert merged["last_check_ok"] == local["last_check_ok"]
 
 
 def test_unsafe_concurrent_scalar_change_fails_instead_of_guessing():
@@ -200,7 +249,8 @@ def test_local_check_recovers_a_state_rebase_within_the_same_firing(tmp_path):
     python_wrapper = project / ".venv" / "bin" / "python"
     python_wrapper.write_text(
         "#!/bin/sh\n"
-        'if [ "$1" = "-m" ] && [ "$2" = "watcher.state_merge" ]; then\n'
+        'if [ "$1" = "-m" ] && { [ "$2" = "watcher.state_merge" ] '
+        '|| [ "$2" = "watcher.state_sync" ]; }; then\n'
         '  exec "$REAL_PYTHON" "$@"\n'
         "fi\n"
         "exit 0\n",
@@ -282,3 +332,103 @@ exit 90
     merged = load_state(project / "state" / "state.json")
     assert set(merged["alerts"]) == {"cloud", "local"}
     assert merged["reminders_sent"][target] == ["120", "15"]
+
+
+def test_local_check_records_failed_recovery_and_still_runs_watcher(tmp_path):
+    """The pre-run failure must become alertable instead of stopping the pass."""
+    project = tmp_path / "project"
+    (project / "scripts").mkdir(parents=True)
+    (project / "state").mkdir()
+    (project / ".venv" / "bin").mkdir(parents=True)
+    (project / ".env").write_text("", encoding="utf-8")
+    source_script = Path(__file__).parents[1] / "scripts" / "local-check.sh"
+    local_check = project / "scripts" / "local-check.sh"
+    local_check.write_text(source_script.read_text(encoding="utf-8"), encoding="utf-8")
+
+    data = tmp_path / "git-data"
+    data.mkdir()
+    base = fresh_state()
+    upstream = fresh_state()
+    upstream["last_error"] = "upstream failure"
+    local = fresh_state()
+    local["last_error"] = "local failure"
+    for name, state in (("base", base), ("upstream", upstream), ("local", local)):
+        (data / f"{name}.json").write_text(json.dumps(state), encoding="utf-8")
+    (project / "state" / "state.json").write_text(
+        json.dumps(base), encoding="utf-8"
+    )
+
+    python_wrapper = project / ".venv" / "bin" / "python"
+    python_wrapper.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-m" ] && { [ "$2" = "watcher.state_merge" ] '
+        '|| [ "$2" = "watcher.state_sync" ]; }; then\n'
+        '  exec "$REAL_PYTHON" "$@"\n'
+        "fi\n"
+        ': > "$FAKE_GIT_DATA/watcher-ran"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    python_wrapper.chmod(0o755)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        """#!/bin/sh
+case "$1:$2" in
+  pull:--rebase)
+    exit 1
+    ;;
+  diff:--name-only)
+    echo state/state.json
+    exit 0
+    ;;
+  show::1:state/state.json)
+    exec /bin/cat "$FAKE_GIT_DATA/base.json"
+    ;;
+  show::2:state/state.json)
+    exec /bin/cat "$FAKE_GIT_DATA/upstream.json"
+    ;;
+  show::3:state/state.json)
+    exec /bin/cat "$FAKE_GIT_DATA/local.json"
+    ;;
+  rebase:--abort)
+    exit 0
+    ;;
+  status:--porcelain)
+    exit 0
+    ;;
+esac
+echo "unexpected fake git call: $*" >&2
+exit 90
+""",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_GIT_DATA": str(data),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "PYTHONPATH": str(Path(__file__).parents[1]),
+            "REAL_PYTHON": sys.executable,
+        }
+    )
+    result = subprocess.run(
+        ["/bin/bash", str(local_check)],
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # The strict post-run pull still reports failure, but the pre-run pull did
+    # not suppress the watcher pass that turns this marker into Telegram.
+    assert result.returncode != 0
+    assert (data / "watcher-ran").exists()
+    marker = load_failure(project / ".cache" / "state-rebase-failure.json")
+    assert marker is not None
+    assert marker["detail"] == "automatic state/state.json rebase recovery failed"

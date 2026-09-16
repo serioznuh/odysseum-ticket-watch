@@ -17,7 +17,7 @@ import os
 import re
 from datetime import datetime, timedelta
 
-from . import cdp, detect, notify
+from . import cdp, detect, notify, state_sync
 from . import state as state_mod
 from .detect import TZ_PARIS, Finding
 
@@ -172,6 +172,24 @@ def build_recovered_finding(cfg, st: dict, now: datetime) -> Finding:
         confidence="high",
         title="Pathé watch is back",
         lines=[watch_label(cfg), f"{line}Checks are running normally."],
+        url=cfg.film_page_url,
+    )
+
+
+def build_state_sync_failure_finding(cfg, marker: dict[str, str]) -> Finding:
+    """A local state commit could not be reconciled with shared state."""
+    return Finding(
+        kind="WATCHER_ERROR",
+        key=state_sync.failure_key(marker),
+        confidence="high",
+        title="State sync needs you",
+        lines=[
+            watch_label(cfg),
+            "Local state rebase recovery failed.",
+            "Unpushed alert and reminder receipts were preserved.",
+            f"Cause: {marker['detail']}",
+            "Needs you: inspect the production clone and reconcile state before retrying.",
+        ],
         url=cfg.film_page_url,
     )
 
@@ -487,4 +505,3 @@ def heartbeat_due(st: dict, now: datetime, days: int) -> bool:
         return False
     last = detect.parse_iso(st.get("last_heartbeat"))
     return last is None or (now - detect.as_aware(last)) >= timedelta(days=days)
-

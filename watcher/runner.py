@@ -7,10 +7,11 @@ The order *is* the contract (OTW-19):
    polling and retries. Re-reading the clock afterwards fixed the *wording* of a
    late reminder but could not give back a warning window a slow source had
    already eaten.
-2. **The adaptive-cadence guard**, still in front of everything the Pathé + news
-   half fetches, then the Pathé, news and Cinesa polling jobs. Each runs under
-   an aggregate time budget, and each is guarded, so a job that is skipped,
-   disabled or outright broken cannot take the rest of the pass with it.
+2. **Local-sync supervision**, then the adaptive-cadence guard, still in front
+   of everything the Pathé + news half fetches, then the Pathé, news and Cinesa
+   polling jobs. Each runs under an aggregate time budget, and each is guarded,
+   so a job that is skipped, disabled or outright broken cannot take the rest
+   of the pass with it.
 3. **Delivery** of this pass's findings (dedup, coalescing, sending), then the
    baselines those alerts gate.
 4. **Due reminders again**, recomputed against a fresh clock and the
@@ -137,6 +138,11 @@ def execute(ctx: RunContext, state_path: str) -> int:
 
     # Reminders first, before a single request. See this module's docstring.
     _guard(failed, "reminder", jobs.run_reminder_job, ctx, now)
+
+    # A failed pre-run rebase leaves a durable marker and then deliberately
+    # lets this pass continue. Surface it before polling, but never ahead of a
+    # due reminder: reminder timing remains the coordinator's first contract.
+    _guard(failed, "state-sync-supervision", jobs.run_state_sync_failure_job, ctx, now)
 
     if ctx.mode == "check":
         polling = ctx.budget(jobs.POLLING_BUDGET_SECONDS, "polling")
