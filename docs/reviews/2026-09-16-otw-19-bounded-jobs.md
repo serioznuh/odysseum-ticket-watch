@@ -58,3 +58,25 @@ Not scheduled — no machinery/ paths changed in this diff.
 ## Outcome
 <!-- cross-review-merge-state: CAPPED pr=21 -->
 Stopped at cap after round 5 of this continuation (round 8 overall on this backlog item): four completed rounds found and got fixes for 6 real P1 bugs, all in the Cinesa Chrome-mint cleanup/budget-enforcement chain (socket-timeout re-arming, SIGTERM-skip on stalled process lookup, profile-lock-based termination with PID verification, cleanup-integrity signal loss on the failing path, and leak-detection starvation by the cached-token fallback). The user pre-authorized up to 5 review rounds for this continuation; all 5 were used, with round 5 blocked purely on exhausted Codex quota rather than a code defect. Needs a human call: retry the round-5 review once Codex quota resets (provider message cited ~7:04 PM), authorize further rounds if another finding turns up, or inspect the diff directly and merge manually if satisfied.
+
+# OTW-19 second continuation: 4 more Cinesa cleanup gaps found, capped pending owner decision
+Flow 1 (/claude-build) · builder claude-opus-5/high · reviewer gpt-5.6-sol/xhigh · 2026-09-16
+<!-- cross-review-loop-id: 4a635635-fafa-457d-bce8-e10336334ef7 -->
+
+## Task
+OTW-19 second continuation: 4 more Cinesa cleanup gaps found, capped pending owner decision
+
+## Round 1 — VERDICT: REVISE
+1. [P1] watcher/cdp.py:522 — cleanup returns `True` (clean teardown) when post-SIGTERM process discovery is unavailable, and also when PIDs survive the deadline — so `evaluate_on_page` never raises `ChromeLeakError` for these cases, and a Chrome that may still hold the profile lock produces no leak signal, no non-zero exit, and no `leak_since` stamp.
+2. [P1] watcher/jobs.py:257 — leak tracking is conditional on the current exception being `ChromeLeakError`, while the fresh-profile check is additionally disabled when `detected=True` — an existing live leak followed by an ordinary Cinesa failure exits zero and stops its dedicated alert; cleanup uncertainty with an actually-free profile can also remain permanently stamped when required mints repeatedly fail.
+3. [P1] watcher/cdp.py:563 — `_locked_profile_pid` collapses every `readlink` error or unparsable lock target to `None`, which `profile_lock_status` treats as demonstrably free — a permission/I/O failure while a real lock exists silently clears `leak_since`, violating the tri-state contract that unanswerable checks must return `None` (unknown), not `False` (free).
+4. [P1] watcher/jobs.py:238 — alert loudness is derived from calendar-day distance rather than whether an alert was previously delivered — a leak detected shortly before midnight first becomes eligible after midnight with `day == 2`, so its first-ever alert is incorrectly silent (`WATCHER_STILL_BLIND`-shaped) instead of loud.
+No fixes applied yet — the loop was capped here rather than sent to another fix round, pending owner review.
+NOTES: the except BaseException/else cleanup-once structure, exception chaining, the unique `cinesa_leak:` key, its first-loud/repeat-silent config, the tri-state SIGTERM refusal on None, and the headed/offscreen/non-evasive Chrome design were all otherwise confirmed correct.
+
+## Required verification
+Not scheduled — no machinery/ paths changed in this diff.
+
+## Outcome
+<!-- cross-review-merge-state: CAPPED pr=21 -->
+Capped after one round of this second continuation, deliberately WITHOUT sending a further fix round: the user pre-authorized up to 5 review rounds for the Cinesa-cleanup thread, all 5 were used in the prior continuation (loop_id 7661c956-...), and this fresh round (needed only because the prior round-5 review was blocked by a Codex outage, not because of new authorization) immediately surfaced 4 more real P1s in the same area — a pattern of each fix uncovering another gap one layer deeper (tri-state leak detection now interacts with SIGTERM-deadline handling, job-level streak/backoff coupling, filesystem-level lock parsing, and calendar-vs-delivery-history alert timing). Rather than keep spending rounds unilaterally past the authorized budget, this loop stops here for an owner decision: authorize a bounded number of further rounds to close these out, accept the current unfixed state and merge only the earlier (already-reviewed and fixed) commits, or take a different approach to this cleanup path's design.
