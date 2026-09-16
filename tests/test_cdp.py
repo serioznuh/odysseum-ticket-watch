@@ -438,7 +438,8 @@ def test_the_profile_lock_still_finds_chrome_when_ps_cannot(
         if command[:2] == ["ps", "-p"]:  # the narrow verification query
             queried.append(command)
             return SimpleNamespace(
-                stdout=f"/Chrome --user-data-dir={os.path.abspath(profile)}\n"
+                returncode=0,
+                stdout=f"/Chrome --user-data-dir={os.path.abspath(profile)}\n",
             )
         raise subprocess.TimeoutExpired(cmd="ps", timeout=kwargs["timeout"])
 
@@ -465,7 +466,9 @@ def test_a_recycled_lock_pid_is_never_signalled(monkeypatch, caplog, tmp_path):
     monkeypatch.setattr(
         cdp.subprocess,
         "run",
-        lambda command, **_kw: SimpleNamespace(stdout="/usr/bin/some-other-app\n"),
+        lambda command, **_kw: SimpleNamespace(
+            returncode=0, stdout="/usr/bin/some-other-app\n"
+        ),
     )
     monkeypatch.setattr(cdp.os, "kill", lambda *_a: pytest.fail("signalled a stranger"))
     monkeypatch.setattr(cdp, "_discover_profile_pids", lambda *_a: None)
@@ -505,3 +508,105 @@ def test_a_mint_that_cannot_confirm_teardown_is_not_reported_as_clean(
 
     # Cleanup and the focus handoff still ran; only the verdict changed.
     assert ("cleanup", str(profile.resolve())) in events
+
+
+def test_a_leak_is_surfaced_even_when_the_evaluation_also_failed(
+    monkeypatch, tmp_path
+):
+    """The check used to sit after the outer `try/finally`, which the
+    interpreter never reaches when the body is already raising. So a leak that
+    coincided with a real failure — a Cloudflare block, say — was reported as
+    that ordinary CDPError, and the cached-token fallbacks absorbed it exactly
+    as before (round-6 review)."""
+    chrome, profile, _previous, events, _launches = _patch_evaluation(
+        monkeypatch, tmp_path, signalled=False
+    )
+    monkeypatch.setattr(
+        cdp,
+        "_devtools",
+        lambda url, method="GET", timeout=5.0: (
+            {"Browser": "Chrome"}
+            if url.endswith("/json/version")
+            else {"webSocketDebuggerUrl": "ws://127.0.0.1:4321/devtools/page/1"}
+        ),
+    )
+
+    def blocked(_url, timeout=30.0, budget=None):
+        raise cdp.CDPError("Cloudflare hard block: page title is 'Attention Required!'")
+
+    monkeypatch.setattr(cdp, "_WebSocket", blocked)
+
+    with pytest.raises(cdp.ChromeLeakError) as excinfo:
+        cdp.evaluate_on_page(
+            "https://www.cinesa.es/",
+            "token",
+            chrome_path=str(chrome),
+            profile_dir=str(profile),
+        )
+
+    # The leak wins the report, so every `except ChromeLeakError` still sees it…
+    assert "could not be confirmed terminated" in str(excinfo.value)
+    # …and the original cause is named, and chained, rather than dropped.
+    assert "Cloudflare hard block" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, cdp.CDPError)
+    assert ("cleanup", str(profile.resolve())) in events
+
+
+def test_a_failure_with_clean_teardown_keeps_its_own_cause(monkeypatch, tmp_path):
+    """The other half of that branch: when cleanup *is* confirmed, an ordinary
+    failure must still propagate as itself, or every Cloudflare block would look
+    like a leak and stop falling back to the cached token."""
+    chrome, profile, _previous, _events, _launches = _patch_evaluation(
+        monkeypatch, tmp_path, signalled=True
+    )
+    monkeypatch.setattr(
+        cdp,
+        "_devtools",
+        lambda url, method="GET", timeout=5.0: (
+            {"Browser": "Chrome"}
+            if url.endswith("/json/version")
+            else {"webSocketDebuggerUrl": "ws://127.0.0.1:4321/devtools/page/1"}
+        ),
+    )
+
+    def blocked(_url, timeout=30.0, budget=None):
+        raise cdp.CDPError("Cloudflare hard block")
+
+    monkeypatch.setattr(cdp, "_WebSocket", blocked)
+
+    with pytest.raises(cdp.CDPError) as excinfo:
+        cdp.evaluate_on_page(
+            "https://www.cinesa.es/",
+            "token",
+            chrome_path=str(chrome),
+            profile_dir=str(profile),
+        )
+
+    assert not isinstance(excinfo.value, cdp.ChromeLeakError)
+    assert "Cloudflare hard block" in str(excinfo.value)
+
+
+def test_an_unanswerable_ps_is_unknown_not_a_free_profile(monkeypatch, tmp_path):
+    """Deciding a leak is resolved needs evidence. A `ps` that cannot answer is
+    not evidence, and reading it as "no Chrome" would clear a live leak."""
+    profile = tmp_path / "watcher-profile"
+    profile.mkdir()
+    os.symlink("somehost-4242", profile / cdp.CHROME_PROFILE_LOCK)
+
+    def stalled(_command, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="ps", timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(cdp.subprocess, "run", stalled)
+    assert cdp.profile_lock_status(str(profile)) is None
+
+    # A lock naming a process that is not ours is stale: the profile is free.
+    monkeypatch.setattr(
+        cdp.subprocess,
+        "run",
+        lambda *_a, **_kw: SimpleNamespace(returncode=0, stdout="/usr/bin/other\n"),
+    )
+    assert cdp.profile_lock_status(str(profile)) is False
+
+    # And no lock file at all is the ordinary healthy answer.
+    os.unlink(profile / cdp.CHROME_PROFILE_LOCK)
+    assert cdp.profile_lock_status(str(profile)) is False

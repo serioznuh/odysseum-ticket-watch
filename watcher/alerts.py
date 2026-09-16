@@ -343,6 +343,35 @@ def build_cinesa_error_finding(
     )
 
 
+def build_cinesa_leak_finding(cfg, since: datetime, key: str, *, day: int = 1) -> Finding:
+    """A Chrome left holding the watcher profile, which needs the owner.
+
+    Separate from the outage alert on purpose: the cached token usually keeps
+    working for hours, so the watch is *not* dark and saying so would be wrong.
+    What is broken is every future token refresh, and only quitting Chrome fixes
+    it — so this fires on its own schedule rather than waiting for the outage
+    that eventually follows.
+    """
+    repeat = day > 1
+    return Finding(
+        kind="WATCHER_STILL_BLIND" if repeat else "WATCHER_ERROR",
+        key=key,
+        confidence="high",
+        title=(
+            f"Cinesa token step still stuck — day {day}"
+            if repeat
+            else "Cinesa token step needs you"
+        ),
+        lines=[
+            cinesa_label(cfg),
+            f"A leftover Chrome has held the watcher profile since {short_dt(since)}.",
+            "Cause: the token step could not confirm Chrome exited.",
+            "Needs you: quit Chrome — token refreshes keep failing until then.",
+        ],
+        url=cfg.cinesa_page_url,
+    )
+
+
 def build_cinesa_recovered_finding(cfg, now: datetime) -> Finding:
     return Finding(
         kind="RECOVERED",

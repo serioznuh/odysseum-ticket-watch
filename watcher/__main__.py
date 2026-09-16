@@ -29,6 +29,7 @@ from . import state as state_mod
 from .alerts import (  # noqa: F401  (re-exported: the alert builders' public home)
     blind_since,
     build_cinesa_error_finding,
+    build_cinesa_leak_finding,
     build_cinesa_recovered_finding,
     build_error_finding,
     build_heartbeat,

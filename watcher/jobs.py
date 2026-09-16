@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from . import alerts, cdp, cinesa, coalesce, detect, news, notify, pathe
@@ -186,6 +186,59 @@ def run_news_job(
         return []
 
 
+def track_profile_leak(
+    ctx: RunContext,
+    out: CinesaOutcome,
+    now: datetime,
+    detected: bool,
+    budget: Budget | None,
+) -> None:
+    """Keep a leak visible until the profile is actually free again.
+
+    A counter cannot do this job. The cached token keeps working for hours after
+    a leak, those runs succeed, and `update_from_cinesa` resets `failure_streak`
+    to zero — so a leak that recurs every 30 min (the mint backoff) never reaches
+    the alert threshold and never fires (round-6 review).
+
+    So the condition is re-tested instead of counted: `leak_since` is stamped
+    once when a leak is seen and cleared only when Chrome demonstrably no longer
+    holds the profile. An unknown answer is not "resolved" and leaves it set.
+    While it is set every run exits non-zero, and once it has outlasted what the
+    failure threshold means in wall-clock time, it alerts — loudly on day one,
+    silently each day after, like every other Cinesa supervision alert.
+
+    State is written twice per episode at most (stamped, then cleared), so a
+    long leak does not churn `state.json` at the 5-min cadence.
+    """
+    cin = ctx.state.setdefault("cinesa", {})
+    if detected:
+        cin.setdefault("leak_since", now.isoformat())
+    if not cin.get("leak_since"):
+        return
+
+    # Re-test rather than assume: a profile that is demonstrably free is the
+    # only thing that clears this. Unknown leaves it set.
+    if not detected and (
+        cdp.profile_lock_status(ctx.cfg.cinesa_chrome_profile, budget) is False
+    ):
+        log.info("cinesa: the watcher profile is free again — leak cleared")
+        cin.pop("leak_since", None)
+        return
+
+    out.integrity_failure = True
+    since = detect.as_aware(detect.parse_iso(cin["leak_since"]) or now)
+    # The same wall-clock meaning the failure threshold has for the local half:
+    # this many consecutive firings of the condition.
+    threshold = timedelta(
+        minutes=state_mod.LOCAL_FIRING_INTERVAL_MINUTES * ctx.cfg.failure_streak_threshold
+    )
+    if now - since < threshold:
+        return
+    key = f"cinesa_leak:{now:%Y-%m-%d}"
+    day = (now.date() - since.date()).days + 1
+    out.findings.append(alerts.build_cinesa_leak_finding(ctx.cfg, since, key, day=day))
+
+
 def run_cinesa_job(
     ctx: RunContext, now: datetime, budget: Budget | None
 ) -> CinesaOutcome:
@@ -202,11 +255,10 @@ def run_cinesa_job(
     except Exception as e:
         log.exception("Cinesa check failed")
         if isinstance(e, cdp.ChromeLeakError):
-            # Still goes through the capped streak and its alert, but a leaked
-            # Chrome is a local-integrity problem rather than a source outage:
-            # it also makes the run exit non-zero so it cannot pass for healthy
-            # in launchd's log or in Actions.
-            out.integrity_failure = True
+            # A leaked Chrome is a local-integrity problem rather than a source
+            # outage, so it is tracked separately (and makes the run exit
+            # non-zero) as well as feeding the ordinary streak below.
+            track_profile_leak(ctx, out, now, True, budget)
         # Capped at the alert threshold: nothing reads a larger value,
         # and a counter that kept growing would rewrite state.json on
         # every firing of a long outage, commit and push included.
@@ -238,6 +290,9 @@ def run_cinesa_job(
         out.findings.append(alerts.build_cinesa_recovered_finding(ctx.cfg, now))
     cin.pop("blind_since", None)
     out.findings.extend(detect.analyze_cinesa(snap, ctx.state, ctx.cfg, now))
+    # A successful poll says nothing about the profile: this one usually ran on
+    # the cached token precisely *because* the mint could not be repeated.
+    track_profile_leak(ctx, out, now, False, budget)
     return out
 
 

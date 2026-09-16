@@ -88,7 +88,11 @@ _CINESA_FIELDS = {
     "failure_streak",
     "error_alerted",
     "blind_since",
+    "leak_since",
 }
+# Written only while the condition they describe is live, so old state loads
+# without a migration and a healthy watch carries neither.
+_CINESA_OPTIONAL_FIELDS = {"blind_since", "leak_since"}
 
 
 def _type_name(value: Any) -> str:
@@ -185,7 +189,7 @@ def _validate_cinesa(value: Any, *, require_all: bool) -> None:
     unknown = set(cin) - _CINESA_FIELDS
     if unknown:
         raise StateError(f"cinesa: unknown field(s): {', '.join(sorted(unknown))}")
-    required = _CINESA_FIELDS - {"blind_since"}
+    required = _CINESA_FIELDS - _CINESA_OPTIONAL_FIELDS
     missing = required - set(cin)
     if require_all and missing:
         raise StateError(f"cinesa: missing required field(s): {', '.join(sorted(missing))}")
@@ -201,7 +205,7 @@ def _validate_cinesa(value: Any, *, require_all: bool) -> None:
             date.fromisoformat(horizon)
         except ValueError as exc:
             raise StateError(f"cinesa.horizon: invalid ISO date {horizon!r}") from exc
-    for field in ("last_change", "blind_since"):
+    for field in ("last_change", "blind_since", "leak_since"):
         if field in cin:
             _parse_optional_timestamp(cin[field], f"cinesa.{field}")
     if "error_alerted" in cin:

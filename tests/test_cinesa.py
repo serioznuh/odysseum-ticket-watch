@@ -6,7 +6,7 @@ import base64
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import ClassVar
 
 import httpx
@@ -844,3 +844,83 @@ def test_a_leaked_chrome_makes_the_run_exit_non_zero(tmp_path, monkeypatch):
         ["--config", str(runner.config), "--state", str(runner.state),
          "--mode", "check", "--skip-if-checked-within", "6"]
     ) == 0
+
+
+def test_a_recurring_leak_is_not_starved_by_cached_token_runs(tmp_path, monkeypatch):
+    """The starvation hole: after a leak, the mint backs off for 30 min, the
+    cached token keeps working, and `update_from_cinesa` resets `failure_streak`
+    to zero on every one of those successful runs. The ordinary streak therefore
+    never reaches its threshold, so the alert never fired and most runs exited 0
+    while Chrome still held the profile (round-6 review).
+
+    `leak_since` is re-tested against the profile instead of counted, so it
+    survives those successes and alerts on schedule.
+    """
+    runner = CheckRunner(tmp_path, monkeypatch, {"imax_present": True})
+    sent: list[str] = []
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda cfg, text, **kw: sent.append(text) or True
+    )
+    # Chrome is still holding the profile on every firing from here on.
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: True)
+
+    def leak(cfg, **_budget):
+        raise cdp.ChromeLeakError("could not be confirmed terminated")
+
+    def cached_ok(cfg, **_budget):
+        return CinesaSnapshot(days=days(("2026-08-01", True), ("2026-08-02", True)))
+
+    argv = ["--config", str(runner.config), "--state", str(runner.state),
+            "--mode", "check", "--skip-if-checked-within", "6"]
+
+    monkeypatch.setattr(cinesa, "fetch_snapshot", leak)
+    assert main.run(argv) == 1
+    st = json.loads(runner.state.read_text())
+    assert st["cinesa"]["leak_since"], "the leak must be remembered"
+
+    # Now the runs that used to bury it: the cached token works, the poll
+    # succeeds, and the ordinary streak goes back to zero.
+    monkeypatch.setattr(cinesa, "fetch_snapshot", cached_ok)
+    assert main.run(argv) == 1  # still not a healthy run
+    st = json.loads(runner.state.read_text())
+    assert st["cinesa"]["failure_streak"] == 0  # reset, exactly as before
+    assert st["cinesa"]["leak_since"]           # but the leak is still known
+
+    # Once it has outlasted what the failure threshold means in wall-clock time,
+    # it alerts on its own rather than waiting for a streak that never comes.
+    stamped = datetime.fromisoformat(st["cinesa"]["leak_since"])
+    st["cinesa"]["leak_since"] = (stamped - timedelta(minutes=20)).isoformat()
+    runner.state.write_text(json.dumps(st), encoding="utf-8")
+    sent.clear()
+    assert main.run(argv) == 1
+
+    assert len(sent) == 1
+    assert "Cinesa token step needs you" in sent[0]
+    assert "quit Chrome" in sent[0]
+
+
+def test_a_freed_profile_clears_the_leak_and_the_run_is_healthy_again(
+    tmp_path, monkeypatch
+):
+    """Only evidence clears it: the profile being demonstrably free."""
+    runner = CheckRunner(tmp_path, monkeypatch, {"imax_present": True})
+    st = json.loads(runner.state.read_text())
+    st["cinesa"]["leak_since"] = (datetime.now(PARIS) - timedelta(hours=2)).isoformat()
+    runner.state.write_text(json.dumps(st), encoding="utf-8")
+    monkeypatch.setattr(notify, "send_telegram", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        cinesa,
+        "fetch_snapshot",
+        lambda cfg, **_kw: CinesaSnapshot(days=days(("2026-08-01", True))),
+    )
+    argv = ["--config", str(runner.config), "--state", str(runner.state),
+            "--mode", "check", "--skip-if-checked-within", "6"]
+
+    # An unknown answer is not resolution: the leak stays, the run stays unhealthy.
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: None)
+    assert main.run(argv) == 1
+    assert json.loads(runner.state.read_text())["cinesa"]["leak_since"]
+
+    monkeypatch.setattr(cdp, "profile_lock_status", lambda *_a, **_kw: False)
+    assert main.run(argv) == 0
+    assert "leak_since" not in json.loads(runner.state.read_text())["cinesa"]

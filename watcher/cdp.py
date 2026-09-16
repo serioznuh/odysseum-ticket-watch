@@ -408,27 +408,34 @@ def _locked_profile_pid(profile_dir: str) -> int | None:
     return pid if pid > 0 else None
 
 
-def _is_our_chrome(pid: int, profile_dir: str, budget: Budget | None) -> bool:
+def _is_our_chrome(pid: int, profile_dir: str, budget: Budget | None) -> bool | None:
     """Whether `pid` really is a Chrome running on our profile.
 
     A stale lock file can name a PID the OS has since recycled, and signalling
     that would hit an unrelated process, so an unverifiable candidate is never
     signalled. This asks about one PID rather than the whole process table, so
     it can still answer when the full listing could not.
+
+    `None` means the question could not be asked at all, which is different from
+    "no": a caller deciding whether a leak has been resolved must not read a
+    broken `ps` as good news.
     """
     marker = f"--user-data-dir={os.path.abspath(profile_dir)}"
     try:
-        out = subprocess.run(
+        result = subprocess.run(
             ["ps", "-p", str(pid), "-o", "command="],
             capture_output=True,
             text=True,
             timeout=_step_timeout(budget, PROCESS_QUERY_TIMEOUT_SECONDS),
-            check=True,
-        ).stdout
+            check=False,  # a non-zero status is an answer ("no such process")
+        )
     except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        # `ps` answered: there is no such process. That is a real "no".
         return False
     try:
-        return marker in shlex.split(out)
+        return marker in shlex.split(result.stdout)
     except ValueError:
         return False
 
@@ -443,7 +450,7 @@ def _pids_from_profile_lock(
     pid = _locked_profile_pid(profile_dir)
     if pid is None:
         return None
-    if not _is_our_chrome(pid, profile_dir, budget):
+    if _is_our_chrome(pid, profile_dir, budget) is not True:
         log.warning(
             "Chrome profile lock for %s names PID %d, which could not be"
             " confirmed as ours — not signalling it",
@@ -531,6 +538,36 @@ def _terminate_by_profile(profile_dir: str, budget: Budget | None = None) -> boo
             ", ".join(str(pid) for pid in sorted(pids)),
         )
     return True  # signalled; a slow shutdown is not a leak
+
+
+def _profile_leak(profile: str, original: BaseException | None) -> ChromeLeakError:
+    """The leak report, with whatever else went wrong named inside it."""
+    detail = (
+        f"; the attempt itself also failed: {original}" if original is not None else ""
+    )
+    return ChromeLeakError(
+        f"Chrome on watcher profile {profile} could not be confirmed terminated"
+        " — refusing to report a clean mint while a leftover instance may hold"
+        f" the profile lock{detail}"
+    )
+
+
+def profile_lock_status(profile_dir: str, budget: Budget | None = None) -> bool | None:
+    """Whether a Chrome still holds this profile: True, False, or None.
+
+    `None` is *unknown* — a lock is present but its owner could not be checked —
+    and callers must not read it as resolved. Cheap enough to call on every
+    firing: one `readlink`, and a single-PID `ps` only when a lock exists.
+    """
+    pid = _locked_profile_pid(profile_dir)
+    if pid is None:
+        return False  # no lock at all: nothing holds the profile
+    ours = _is_our_chrome(pid, profile_dir, budget)
+    if ours is None:
+        return None
+    # A lock naming a process that is not ours is stale — Chrome died without
+    # cleaning up — so the profile is free.
+    return ours
 
 
 def _cleanup_chrome(profile: str, previous_app: str | None) -> bool:
@@ -695,15 +732,19 @@ def evaluate_on_page(
                 )
         finally:
             ws.close()
-    finally:
-        signalled = _cleanup_chrome(profile, previous_app)
-
-    # Only reached when the page produced a value: any failure above propagates
-    # through the `finally` instead, keeping its own cause.
-    if not signalled:
-        raise ChromeLeakError(
-            f"read the value, but Chrome on watcher profile {profile} could not be"
-            " confirmed terminated — refusing to report a clean mint while a"
-            " leftover instance may hold the profile lock"
-        )
-    return result
+    except BaseException as original:
+        # The verdict has to be taken on THIS path too. It used to sit after a
+        # `finally`, which the interpreter never reaches when the body is already
+        # raising — so a leak that coincided with a real failure (a Cloudflare
+        # block, say) was reported as that ordinary failure, and the cached-token
+        # fallbacks absorbed it exactly as before (round-6 review).
+        #
+        # The leak wins the report because it is the half that needs a human; the
+        # original cause is chained onto it and named in the message.
+        if not _cleanup_chrome(profile, previous_app):
+            raise _profile_leak(profile, original) from original
+        raise
+    else:
+        if not _cleanup_chrome(profile, previous_app):
+            raise _profile_leak(profile, None)
+        return result

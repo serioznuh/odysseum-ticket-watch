@@ -42,12 +42,11 @@ A single-user Telegram watcher covering **two independent targets**:
   baseline, tightening to every firing around the announced opening). Pending
   future wanted dates override this: check every existing 5-min firing until
   their alerts are delivered or the dates pass. No sub-minute guarantee; sleep
-  still pauses checks. It gates
-  neither the **Cinesa check** — one small call, not bot-gated — nor the
-  **reminder ladder**, both of which run on every firing. This half *owns* the
-  ladder: 5-min firings give three chances inside a 15-min warning. Runs from a
-  residential IP: Akamai blocks Pathé from datacenter IPs, and Cloudflare
-  challenges Cinesa from them.
+  still pauses checks. It gates neither the **Cinesa check** — one small call,
+  not bot-gated — nor the **reminder ladder**, both of which run on every
+  firing. This half *owns* the ladder: 5-min firings give three chances inside
+  a 15-min warning. Runs from a residential IP: Akamai blocks Pathé from
+  datacenter IPs, and Cloudflare challenges Cinesa from them.
 - **Cloud half** — `.github/workflows/watch.yml` cron `*/15`: supervision, plus
   reminders as a **failover** rather than as their owner. It passes
   `--reminder-grace-minutes 25` (> the local 5-min interval), so it only sends
@@ -55,14 +54,13 @@ A single-user Telegram watcher covering **two independent targets**:
   firing interval, so the failover can never reach a rung before the owner's
   worst-case first firing. The cloud grace exceeds the 15-min warning window,
   so that rung still belongs to the Mac alone; a sleeping Mac is covered by the
-  opening-time ping instead. Two writers
-  stay off `reminders_sent` because of that ordering *and* because
-  `local-check.sh` pulls before it runs — a Mac waking from sleep sees
-  what the cloud sent before deciding. Measured to 2026-09-03 this cron fired
-  10.9% of its schedule (median gap 58 min, max 11.5 h), which is why the
-  ladder is no longer cloud-owned (OTW-15). The scheduled pass never calls
-  Pathé (a manual `check` dispatch would, but is 403'd from datacenter IPs).
-  It never calls Cinesa either.
+  opening-time ping instead. Two writers stay off `reminders_sent` because of
+  that ordering *and* because `local-check.sh` pulls before it runs — a Mac
+  waking from sleep sees what the cloud sent before deciding. Measured to
+  2026-09-03 this cron fired 10.9% of its schedule (median gap 58 min, max 11.5
+  h), which is why the ladder is no longer cloud-owned (OTW-15). The scheduled
+  pass never calls Pathé (a manual `check` dispatch would, but is 403'd from
+  datacenter IPs). It never calls Cinesa either.
 - **Format-specific reminders** — standard tickets no longer cancel the IMAX
   ladder. Existing `formats_seen` provides the format evidence without manual
   state edits. The opening-time message says availability is unconfirmed and
@@ -114,7 +112,7 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Code** — Python package `watcher/`: `pathe.py`/`cinesa.py` API clients,
   `cdp.py` token step, `news.py`, `detect.py`, `state.py`, `notify.py`,
   `coalesce.py`, `alerts.py`, `budget.py`/`jobs.py`/`runner.py` orchestration,
-  `config.py`, thin `__main__.py` CLI; `config.toml`; `tests/` (264 passing).
+  `config.py`, thin `__main__.py` CLI; `config.toml`; `tests/` (269 passing).
 
 ## Cinesa specifics
 
@@ -146,13 +144,15 @@ A single-user Telegram watcher covering **two independent targets**:
 - The token is refreshed **3 h before expiry**, not at it, and a failed refresh
   falls back to the token still in hand, so one blocked attempt cannot take the
   half down — it has many firings to succeed, backed off to 30 min apart so a
-  long outage does not mean a Chrome launch every 5 min. A data-API **403**
-  is treated as a likely network/IP rejection: the watcher tries one forced mint,
+  long outage does not mean a Chrome launch every 5 min. A data-API **403** is
+  treated as a likely network/IP rejection: the watcher tries one forced mint,
   then keeps the still-valid token and records a one-hour cooldown in the
-  git-ignored credential cache if minting fails. During that window it retries
-  the API without reopening Chrome; a successful response clears the cooldown.
-  A token that is actually dead (or 401-rejected) still forces renewal and fails
-  loudly rather than going quiet.
+  git-ignored credential cache if minting fails. During it the API is retried
+  without reopening Chrome, and a good response clears the cooldown. A token
+  that is actually dead (or 401-rejected) still forces renewal and fails loudly
+  rather than going quiet. A mint that cannot confirm Chrome exited is the one
+  failure no fallback absorbs: `cinesa.leak_since` is re-tested against the
+  profile each firing and alerts on its own.
 - Verified IDs: film `HO00003228`, site `032` (Diagonal Mar), IMAX showtime
   attribute `0000000086`.
 - **The booking wall is fixed, not rolling** — observed 2026-07-29→08-25
