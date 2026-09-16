@@ -21,5 +21,5 @@ The round-3 Codex review dispatch failed twice against head 0bfd122: the initial
 Not scheduled — no machinery/ paths changed in this diff.
 
 ## Outcome
-<!-- cross-review-merge-state: CAPPED pr=TBD -->
+<!-- cross-review-merge-state: CAPPED pr=21 -->
 Stopped at cap after round 3: two completed review rounds found and got fixes for 3 real P1 bugs (Cinesa mint budget enforcement, twice, and a Pathé bookkeeping-before-analysis ordering bug), and the round-3 re-review of the final fix could not be completed because Codex's account-wide usage quota was exhausted, surviving both an immediate retry and a model substitution to gpt-5.6-terra. Needs a human call: retry the round-3 review once Codex quota resets (the provider message cited ~1:59 PM), or inspect the diff directly and merge manually if satisfied.
