@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 # bigger number would mean nothing, but it would keep the state file changing
 # on every firing (see update_from_cinesa).
 IMAX_ABSENT_CONFIRM = 2
-CURRENT_STATE_VERSION = 2
+CURRENT_STATE_VERSION = 3
 
 DEFAULT_STATE: dict = {
     "version": CURRENT_STATE_VERSION,
@@ -33,7 +33,8 @@ DEFAULT_STATE: dict = {
     "tickets_available": False,
     "failure_streak": 0,
     "error_alerted": False,
-    "last_check_ok": None,
+    "last_check_ok": None,       # last fully healthy Pathé snapshot
+    "last_catalogue_ok": None,   # throttled liveness pulse; partial snapshots count
     "last_heartbeat": None,
     # Cinesa (Diagonal Mar) half — namespaced so it never collides with Pathé.
     # No per-run timestamp lives here on purpose: the Cinesa check runs on
@@ -72,7 +73,12 @@ _CORE_FIELDS = {
     "last_check_ok",
     "last_heartbeat",
 }
-_TOP_LEVEL_FIELDS = _CORE_FIELDS | {"version", "last_error", "cinesa"}
+_CURRENT_ONLY_FIELDS = {"last_catalogue_ok"}
+_TOP_LEVEL_FIELDS = _CORE_FIELDS | _CURRENT_ONLY_FIELDS | {
+    "version",
+    "last_error",
+    "cinesa",
+}
 _CINESA_FIELDS = {
     "imax_present",
     "imax_absent_streak",
@@ -207,6 +213,8 @@ def _validate_fields(state: dict, *, require_all: bool) -> None:
     if unknown:
         raise StateError(f"state: unknown field(s): {', '.join(sorted(unknown))}")
     missing = _CORE_FIELDS - set(state)
+    if require_all:
+        missing |= _CURRENT_ONLY_FIELDS - set(state)
     if missing:
         raise StateError(f"state: missing required field(s): {', '.join(sorted(missing))}")
     if require_all and "cinesa" not in state:
@@ -222,6 +230,8 @@ def _validate_fields(state: dict, *, require_all: bool) -> None:
     _require_nonnegative_int(state["failure_streak"], "failure_streak")
     _require_bool(state["error_alerted"], "error_alerted")
     _parse_optional_timestamp(state["last_check_ok"], "last_check_ok")
+    if "last_catalogue_ok" in state:
+        _parse_optional_timestamp(state["last_catalogue_ok"], "last_catalogue_ok")
     _parse_optional_timestamp(state["last_heartbeat"], "last_heartbeat")
     if "last_error" in state:
         _require_string(state["last_error"], "last_error")
@@ -244,9 +254,19 @@ def _migrate_v1_to_v2(state: dict) -> dict:
     return migrated
 
 
+def _migrate_v2_to_v3(state: dict) -> dict:
+    migrated = deepcopy(state)
+    # Before partial health existed, every successful catalogue check was also
+    # fully healthy, so this is the strongest liveness evidence old state has.
+    migrated["last_catalogue_ok"] = migrated.get("last_check_ok")
+    migrated["version"] = 3
+    return migrated
+
+
 _MIGRATIONS = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
+    2: _migrate_v2_to_v3,
 }
 
 
@@ -421,7 +441,10 @@ def update_from_snapshot(
                 fmts = set(state["formats_seen"].get(slug, [])) | set(summary["counts"])
                 state["formats_seen"][slug] = sorted(fmts)
             state["tickets_available"] = True
-        elif entry.get("isBookable") or entry.get("bookable"):
+        elif (
+            (entry.get("isBookable") or entry.get("bookable"))
+            and snap.endpoint_healthy(slug, "showtimes")
+        ):
             if advance_one_shot:
                 fmt = detect.classify_format(show.get("title"), slug)
                 fmts = set(state["formats_seen"].get(slug, [])) | {fmt}
@@ -624,14 +647,30 @@ def is_check_fresh(state: dict, hours: float, now: datetime) -> bool:
     return last is not None and (now - detect.as_aware(last)) < timedelta(hours=hours)
 
 
-def is_check_stale(state: dict, hours: int, now: datetime) -> bool:
-    """True when the last successful Pathé check is older than `hours`.
+CATALOGUE_LIVENESS_INTERVAL = timedelta(hours=1)
 
-    Never stale before the first successful check (setup phase).
+
+def catalogue_check_iso(state: dict) -> str | None:
+    """Latest proof the local process completed the Pathé catalogue calls.
+
+    The fallback keeps direct callers and pre-migration in-memory fixtures safe;
+    persisted version-3 state always has `last_catalogue_ok` explicitly.
     """
+    return state.get("last_catalogue_ok") or state.get("last_check_ok")
+
+
+def refresh_catalogue_liveness(state: dict, now: datetime) -> None:
+    """Record local liveness without making a degraded 5-min retry churn state."""
+    last = detect.parse_iso(state.get("last_catalogue_ok"))
+    if last is None or now - detect.as_aware(last) >= CATALOGUE_LIVENESS_INTERVAL:
+        state["last_catalogue_ok"] = now.isoformat()
+
+
+def is_catalogue_check_stale(state: dict, hours: int, now: datetime) -> bool:
+    """True when the local process has not completed a catalogue fetch recently."""
     if hours <= 0:
         return False
-    last = detect.parse_iso(state.get("last_check_ok"))
+    last = detect.parse_iso(catalogue_check_iso(state))
     return last is not None and (now - detect.as_aware(last)) > timedelta(hours=hours)
 
 

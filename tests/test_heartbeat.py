@@ -141,6 +141,24 @@ def test_unrestricted_watch_keeps_live_sale_and_programme_availability(cfg, snap
     assert finding.url == cfg.film_page_url
 
 
+def test_heartbeat_reports_unexpected_listing_failures_instead_of_full_health(cfg, snap):
+    snap.listing_results = {
+        PRIMARY: {"showtimes": detect.FetchResult.failed("HTTP 500")},
+        OTHER: {"detail": detect.FetchResult.failed("timed out")},
+        EVENT: {"showtimes": detect.FetchResult.refused("No movie allowed !")},
+    }
+
+    finding = heartbeat(cfg, snap)
+    text = "\n".join(finding.lines)
+
+    assert finding.title == "All quiet — Pathé partly degraded"
+    assert "Pathé check degraded" in text
+    assert f"showtimes: {PRIMARY}" in text
+    assert f"detail: {OTHER}" in text
+    assert EVENT not in text
+    assert "All checks healthy." not in text
+
+
 def test_format_only_watch_does_not_treat_other_or_sold_out_sessions_as_bookable(cfg, snap):
     cfg = replace(cfg, pathe_target_dates=[])
     snap.cinema_entries.pop(EVENT)
@@ -148,3 +166,16 @@ def test_format_only_watch_does_not_treat_other_or_sold_out_sessions_as_bookable
     assert "booking not confirmed" in "\n".join(heartbeat(cfg, snap).lines)
     snap.showtimes[PRIMARY]["2026-12-19"][0]["status"] = "available"
     assert "booking confirmed" in "\n".join(heartbeat(cfg, snap).lines)
+
+
+def test_format_only_heartbeat_does_not_confirm_booking_from_a_failed_call(cfg, snap):
+    cfg = replace(cfg, pathe_target_dates=[])
+    snap.showtimes = {}
+    snap.listing_results = {
+        EVENT: {"showtimes": detect.FetchResult.failed("HTTP 500")}
+    }
+
+    text = "\n".join(heartbeat(cfg, snap).lines)
+
+    assert "booking not confirmed" in text
+    assert "All checks healthy" not in text

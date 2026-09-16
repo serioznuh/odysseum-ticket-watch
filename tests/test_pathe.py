@@ -13,7 +13,7 @@ from typing import ClassVar
 import httpx
 import pytest
 
-from watcher import pathe
+from watcher import detect, pathe
 
 PRIMARY = "dune-troisieme-partie-50828"
 EVENT = "dune-troisieme-partie-projection-imax-70mm-55289"
@@ -133,6 +133,12 @@ def test_a_failing_detail_call_does_not_blind_the_snapshot():
         "dune-troisieme-partie-imax-70mm-9999"
     ]
     assert snap.cinema_entries["dune-troisieme-partie-imax-70mm-9999"]["isBookable"]
+    assert snap.listing_results[Cfg.primary_slug]["detail"].health is (
+        detect.FetchHealth.UNEXPECTED_FAILURE
+    )
+    assert snap.listing_results["dune-troisieme-partie-imax-70mm-9999"]["detail"].health is (
+        detect.FetchHealth.UNEXPECTED_FAILURE
+    )
 
 
 def test_one_refused_listing_does_not_blind_the_whole_snapshot():
@@ -163,6 +169,10 @@ def test_one_refused_listing_does_not_blind_the_whole_snapshot():
     assert sorted(s["slug"] for s in snap.matched_shows) == sorted([PRIMARY, EVENT])
     assert snap.showtimes == {}
     assert PRIMARY in snap.cinema_entries
+    assert snap.listing_results[EVENT]["showtimes"].health is (
+        detect.FetchHealth.EXPECTED_REFUSAL
+    )
+    assert snap.healthy
 
 
 def test_a_transport_failure_on_one_listing_is_also_survivable():
@@ -182,6 +192,10 @@ def test_a_transport_failure_on_one_listing_is_also_survivable():
 
     assert [s["slug"] for s in snap.matched_shows] == [PRIMARY]
     assert snap.showtimes == {}
+    result = snap.listing_results[PRIMARY]["showtimes"]
+    assert result.health is detect.FetchHealth.UNEXPECTED_FAILURE
+    assert "500 Internal Server Error" in (result.diagnostic or "")
+    assert not snap.healthy
 
 
 def test_a_broken_catalogue_call_still_fails_the_check():

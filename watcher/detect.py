@@ -18,6 +18,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from enum import Enum
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -151,6 +152,49 @@ def fmt_release(show: dict | None) -> str:
 
 # --------------------------------------------------------------------------- data
 
+PARTIAL_PATHE_FAILURE = "Per-listing Pathé failure:"
+
+
+class FetchHealth(str, Enum):
+    """Trust level of one best-effort per-listing Pathé request."""
+
+    AUTHORITATIVE_DATA = "authoritative_data"
+    AUTHORITATIVE_EMPTY = "authoritative_empty"
+    EXPECTED_REFUSAL = "expected_refusal"
+    UNEXPECTED_FAILURE = "unexpected_failure"
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    """Data plus the health and diagnostic of the request that produced it.
+
+    Empty data and Pathé's permanent event-listing refusal are explicit healthy
+    outcomes. They must not be confused with an unexpected failure merely
+    because all three carry no usable payload.
+    """
+
+    data: Any = None
+    health: FetchHealth = FetchHealth.AUTHORITATIVE_EMPTY
+    diagnostic: str | None = None
+
+    @classmethod
+    def authoritative(cls, data: Any) -> FetchResult:
+        health = FetchHealth.AUTHORITATIVE_DATA if data else FetchHealth.AUTHORITATIVE_EMPTY
+        return cls(data=data, health=health)
+
+    @classmethod
+    def refused(cls, diagnostic: str) -> FetchResult:
+        return cls(health=FetchHealth.EXPECTED_REFUSAL, diagnostic=diagnostic)
+
+    @classmethod
+    def failed(cls, diagnostic: str) -> FetchResult:
+        return cls(health=FetchHealth.UNEXPECTED_FAILURE, diagnostic=diagnostic)
+
+    @property
+    def healthy(self) -> bool:
+        return self.health is not FetchHealth.UNEXPECTED_FAILURE
+
+
 @dataclass
 class Snapshot:
     """One fetch of everything we watch on the Pathé side."""
@@ -158,6 +202,38 @@ class Snapshot:
     matched_shows: list[dict] = field(default_factory=list)
     cinema_entries: dict[str, dict] = field(default_factory=dict)  # slug -> programme entry
     showtimes: dict[str, dict[str, list[dict]]] = field(default_factory=dict)  # slug -> day -> sessions
+    # slug -> endpoint name ("detail" / "showtimes") -> explicit outcome.
+    # Hand-built snapshots without this metadata remain authoritative for
+    # backwards-compatible pure-analysis tests and callers.
+    listing_results: dict[str, dict[str, FetchResult]] = field(default_factory=dict)
+
+    @property
+    def degraded_results(self) -> list[tuple[str, str, FetchResult]]:
+        return sorted(
+            (
+                (slug, endpoint, result)
+                for slug, endpoints in self.listing_results.items()
+                for endpoint, result in endpoints.items()
+                if not result.healthy
+            ),
+            key=lambda item: (item[1], item[0]),
+        )
+
+    @property
+    def healthy(self) -> bool:
+        return not self.degraded_results
+
+    def endpoint_healthy(self, slug: str, endpoint: str) -> bool:
+        result = self.listing_results.get(slug, {}).get(endpoint)
+        return result is None or result.healthy
+
+    def degradation_summary(self) -> str | None:
+        if not self.degraded_results:
+            return None
+        affected = "; ".join(
+            f"{endpoint}: {slug}" for slug, endpoint, _result in self.degraded_results
+        )
+        return f"{PARTIAL_PATHE_FAILURE} {affected}"
 
 
 @dataclass
@@ -252,7 +328,15 @@ def target_date_findings(snap: Snapshot, cfg: Any, now: datetime) -> list[Findin
             # is safe because its attributes belong to the same session.
             if wanted == FMT_IMAX70:
                 fmt = classify_format(show.get("title"), slug)
-            confirmed = bookable and fmt == wanted
+            # Programme/title inference is valid for an authoritative empty
+            # response and for event listings' expected refusal. An unexpected
+            # showtimes failure must not turn missing session evidence into a
+            # wanted-format alert.
+            confirmed = (
+                bookable
+                and fmt == wanted
+                and snap.endpoint_healthy(slug, "showtimes")
+            )
             for session in sessions_by_day.get(day, []):
                 session_fmt = classify_format(
                     show.get("title"), slug, " ".join(session.get("tags") or []),
@@ -396,7 +480,11 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
         entry = snap.cinema_entries.get(slug) or {}
         days = snap.showtimes.get(slug) or {}
         entry_bookable = bool(entry.get("isBookable") or entry.get("bookable"))
-        if days or entry_bookable:
+        # A programme-level bookable bit can stand in for empty/refused
+        # showtimes (event listings are permanently refused), but never for an
+        # unexpected call failure: guessing from the title in that case could
+        # invent a format that was not actually observed.
+        if days or (entry_bookable and snap.endpoint_healthy(slug, "showtimes")):
             summary = summarize_sessions(show, days)
             present = set(summary["counts"]) if summary["counts"] else {listing_fmt}
             new_fmts = present - formats_seen.get(slug, set())

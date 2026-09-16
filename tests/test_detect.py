@@ -195,6 +195,48 @@ def test_tickets_available_not_repeated_for_known_format():
     assert detect.analyze_pathe(snap, st, Cfg, NOW) == []
 
 
+def test_failed_showtimes_cannot_invent_a_format_from_a_bookable_entry():
+    """A programme-wide bookable bit survives a per-listing outage, but it is
+    not evidence that the format guessed from the title was actually seen."""
+    show = primary_show(title="Dune : Troisieme partie IMAX 70mm")
+    st = fresh_state()
+    st["shows_seen"] = [PRIMARY]
+    snap = Snapshot(
+        matched_shows=[show],
+        cinema_entries={PRIMARY: {"isBookable": True}},
+        listing_results={
+            PRIMARY: {
+                "showtimes": detect.FetchResult.failed("HTTP 500 from showtimes")
+            }
+        },
+    )
+
+    findings = detect.analyze_pathe(snap, st, Cfg, NOW)
+
+    assert "TICKETS_AVAILABLE" not in [finding.kind for finding in findings]
+
+
+def test_expected_showtimes_refusal_still_uses_the_programme_entry():
+    """Event listings never expose showtimes; their explicit origin refusal is
+    healthy, so a bookable dedicated listing remains valid format evidence."""
+    show = event_show()
+    st = fresh_state()
+    st["shows_seen"] = [show["slug"]]
+    snap = Snapshot(
+        matched_shows=[show],
+        cinema_entries={show["slug"]: {"isBookable": True}},
+        listing_results={
+            show["slug"]: {
+                "showtimes": detect.FetchResult.refused("No movie allowed !")
+            }
+        },
+    )
+
+    findings = detect.analyze_pathe(snap, st, Cfg, NOW)
+
+    assert [finding.kind for finding in findings] == ["TICKETS_AVAILABLE"]
+
+
 def test_cinema_listed_but_not_bookable():
     st = fresh_state()
     st["shows_seen"] = [PRIMARY]

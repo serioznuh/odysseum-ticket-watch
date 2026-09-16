@@ -12,7 +12,7 @@ to the opening. It never auto-buys; edit [config.toml](config.toml) for another 
 - 🎫 **Your wanted Pathé date opened** — IMAX 70mm on December 19 or 20; one alert per date, combined if both open together
 - 📍 **Listed at your cinema** (not bookable yet); without wanted dates configured, 🚨 **Tickets bookable NOW** reports new formats
 - 📰 **News lead** — early press hint via Google News (low/medium confidence, strictly filtered — see configuration)
-- 🔴 watcher blind, then a silent **"still blind — day N"** every 24 h until it recovers / ✅ recovery / 💤 weekly heartbeat
+- 🔴 watcher blind or persistently degraded, then a silent daily repeat until it recovers / ✅ recovery / 💤 weekly heartbeat
 
 From the second watch target (*La odisea* in IMAX at **Cinesa Diagonal Mar**,
 Barcelona — see [Cinesa target](#cinesa-target)):
@@ -47,10 +47,11 @@ datacenter IPs (verified: 403 from Actions, 200 from a home IP, same code):
 
 Not every 403 is a block: the showtimes endpoint serves only `isMovie` films, so
 event listings (the 70 mm ones) always answer `"No movie allowed !"`, and their
-bookability is read off the cinema programme. Only catalogue calls fail a check.
+bookability is read off the cinema programme. Unexpected detail/showtimes failures
+degrade health without discarding the rest of the snapshot.
 
-Safety nets so it never dies silently: 🔴 after 3 consecutive Pathé failures,
-🔴 if nothing has succeeded for 18 h — **then every 24 h until it recovers**, so
+Safety nets: 🔴 after 3 consecutive Pathé failures (including partial listing failures once full coverage has been absent for 6 h),
+🔴 if the local catalogue liveness pulse stops for 18 h — **then every 24 h**, so
 a long outage cannot fall out of mind — and 💤 a weekly heartbeat. Each names
 the cause it can prove (IP block, CI range, origin refusal, or a silent Mac).
 
