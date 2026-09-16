@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -267,3 +269,153 @@ def test_profile_cleanup_warns_when_exit_cannot_be_confirmed(
         cdp._terminate_by_profile(str(tmp_path / "watcher-profile"))
 
     assert "did not exit" in caplog.text
+
+
+# ------------------------------------------- budget enforcement (OTW-19 r3)
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += seconds
+
+
+class _StalledSocket:
+    """A socket that never answers: every recv burns its whole timeout.
+
+    Records the timeout in force for each read, which is the thing under test —
+    a deadline that is only *checked* between reads cannot stop a recv that has
+    already been armed with the connect-time ceiling.
+    """
+
+    def __init__(self, clock, handshake=b""):
+        self.clock = clock
+        self.timeouts: list[float] = []
+        self._timeout = 0.0
+        self._handshake = handshake
+
+    def settimeout(self, seconds):
+        self._timeout = seconds
+
+    def sendall(self, _payload):
+        pass
+
+    def recv(self, _size):
+        self.timeouts.append(self._timeout)
+        self.clock.t += self._timeout
+        if self._handshake:
+            out, self._handshake = self._handshake, b""
+            return out
+        raise TimeoutError("stalled socket")
+
+    def close(self):
+        pass
+
+
+def _stalled_websocket(monkeypatch, clock, budget):
+    """A real `_WebSocket` over a stalled socket, past the handshake."""
+    handshake = b"HTTP/1.1 101 x\r\n\r\n"
+    sock = _StalledSocket(clock, handshake)
+    monkeypatch.setattr(cdp.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(cdp.time, "sleep", clock.sleep)
+    monkeypatch.setattr(cdp.socket, "create_connection", lambda *a, **kw: sock)
+    monkeypatch.setattr(cdp, "_require_time", lambda *_a, **_kw: None)
+    ws = cdp._WebSocket.__new__(cdp._WebSocket)
+    ws._budget = budget
+    ws._timeout = cdp.WEBSOCKET_TIMEOUT_SECONDS
+    ws._deadline = None
+    ws.sock = sock
+    ws._buf = b""
+    ws._id = 0
+    # What __init__ arms at connect time, and what the read path must not keep
+    # using once the budget or the call deadline has nearly run out.
+    sock.settimeout(cdp.WEBSOCKET_TIMEOUT_SECONDS)
+    sock.timeouts.clear()
+    return ws, sock
+
+
+def test_a_socket_read_is_rearmed_from_the_remaining_budget(monkeypatch):
+    """The connect-time timeout is a ceiling, not a licence to block for it.
+
+    A CDP call that starts with a couple of seconds left used to hand the
+    already-armed 30 s socket timeout to `recv`, so one read could outlast the
+    whole Cinesa job budget before the deadline was looked at again.
+    """
+    clock = _FakeClock()
+    budget = cdp.Budget(
+        3.0, monotonic=clock.monotonic, sleep=clock.sleep, label="Cinesa token mint"
+    )
+    ws, sock = _stalled_websocket(monkeypatch, clock, budget)
+
+    with pytest.raises((cdp.CDPError, TimeoutError)):
+        ws.call("Runtime.evaluate", {"expression": "token"}, timeout=30.0)
+
+    assert sock.timeouts, "the read path was never exercised"
+    # Every read was armed from what was actually left, never from the ceiling.
+    assert max(sock.timeouts) < cdp.WEBSOCKET_TIMEOUT_SECONDS
+    assert clock.t <= 3.0 + cdp.MIN_SOCKET_READ_SECONDS + 1.0
+
+
+def test_an_unbudgeted_read_is_still_capped_by_the_calls_own_deadline(monkeypatch):
+    """Even with no budget, a read must not outlive the RPC it belongs to."""
+    clock = _FakeClock()
+    ws, sock = _stalled_websocket(monkeypatch, clock, None)
+
+    with pytest.raises((cdp.CDPError, TimeoutError)):
+        ws.call("Runtime.evaluate", {"expression": "token"}, timeout=5.0)
+
+    assert max(sock.timeouts) <= 5.0
+
+
+def test_a_stalled_process_lookup_never_reads_as_nothing_to_kill(
+    monkeypatch, caplog, tmp_path
+):
+    """`ps` is how Chrome is discovered for termination, and it is bounded like
+    every other step, so it can time out. Treating that as "no processes" (it
+    returns None, which is falsy) skipped SIGTERM and left a Chrome holding the
+    watcher profile lock for the next mint."""
+    attempts = []
+
+    def stalled_ps(_command, **kwargs):
+        attempts.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(cmd="ps", timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(cdp.subprocess, "run", stalled_ps)
+    monkeypatch.setattr(cdp.os, "kill", lambda _pid, _sig: pytest.fail("no PID known"))
+
+    with caplog.at_level(logging.WARNING, logger=cdp.log.name):
+        cdp._terminate_by_profile(str(tmp_path / "watcher-profile"))
+
+    # Retried rather than believed, then reported loudly instead of silently
+    # passing for a clean exit.
+    assert len(attempts) == cdp.PROFILE_LOOKUP_ATTEMPTS
+    assert "could not determine whether Chrome is still running" in caplog.text
+    assert any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+def test_a_lookup_that_fails_only_after_the_kill_still_reports_uncertainty(
+    monkeypatch, caplog, tmp_path
+):
+    """Discovery worked once, so SIGTERM went out. The follow-up lookup failing
+    means "unconfirmed", not "exited"."""
+    profile = tmp_path / "watcher-profile"
+    listings = [f"101 /Chrome --user-data-dir={os.path.abspath(profile)}\n"]
+    killed = []
+
+    def flaky_ps(_command, **kwargs):
+        if listings:
+            return SimpleNamespace(stdout=listings.pop(0))
+        raise subprocess.TimeoutExpired(cmd="ps", timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(cdp.subprocess, "run", flaky_ps)
+    monkeypatch.setattr(cdp.os, "kill", lambda pid, _sig: killed.append(pid))
+
+    with caplog.at_level(logging.WARNING, logger=cdp.log.name):
+        cdp._terminate_by_profile(str(profile))
+
+    assert killed == [101]
+    assert "could not confirm" in caplog.text

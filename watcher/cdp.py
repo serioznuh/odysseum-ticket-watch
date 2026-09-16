@@ -56,6 +56,16 @@ CDP_CALL_TIMEOUT_SECONDS = 30.0
 PROCESS_LIST_TIMEOUT_SECONDS = 15.0
 STARTUP_POLL_SECONDS = 0.3
 
+# A socket read is re-armed before every recv rather than once at connect time,
+# so it cannot block for the connect-time ceiling after the budget has run out.
+# Floored so a read that straddles the deadline still fails by timeout rather
+# than by turning the socket non-blocking.
+MIN_SOCKET_READ_SECONDS = 0.25
+
+# `ps` is how Chrome is discovered for termination, so a failed or timed-out
+# listing is *unknown*, never "nothing to kill" — it gets another try.
+PROFILE_LOOKUP_ATTEMPTS = 2
+
 # Teardown gets its own allowance rather than a slice of the caller's: the
 # throwaway profile must be torn down even when the mint ran out of time, and
 # it must not then run unbounded. `evaluate_on_page` mints this in its
@@ -95,6 +105,8 @@ class _WebSocket:
 
     def __init__(self, url: str, timeout: float = 30.0, budget: Budget | None = None):
         self._budget = budget
+        self._timeout = timeout  # the ceiling; each read re-derives its own
+        self._deadline: float | None = None  # set for the duration of one call
         _, _, rest = url.partition("://")
         hostport, _, path = rest.partition("/")
         host, _, port = hostport.partition(":")
@@ -116,10 +128,7 @@ class _WebSocket:
 
         buf = b""
         while b"\r\n\r\n" not in buf:
-            # Each recv is bounded by the socket timeout above; the budget check
-            # bounds the *loop*, so a peer dribbling bytes cannot extend it.
-            _require_time(budget, "the websocket handshake completing")
-            chunk = self.sock.recv(4096)
+            chunk = self._recv_bytes(4096, "the websocket handshake completing")
             if not chunk:
                 raise CDPError("websocket handshake closed early")
             buf += chunk
@@ -129,10 +138,30 @@ class _WebSocket:
         self._buf = tail
         self._id = 0
 
+    def _read_timeout(self) -> float:
+        """Timeout for the next socket read, re-derived every time.
+
+        The connect-time timeout is a *ceiling*, not a licence to block for it:
+        clamping only the RPC deadline still let one `recv` that started with
+        seconds left block for the original 30 s, overrunning the Cinesa and
+        aggregate polling budgets (round-3 review).
+        """
+        limit = self._timeout
+        if self._deadline is not None:
+            limit = min(limit, self._deadline - time.monotonic())
+        if self._budget is not None:
+            limit = min(limit, self._budget.remaining())
+        return max(MIN_SOCKET_READ_SECONDS, limit)
+
+    def _recv_bytes(self, size: int, what: str) -> bytes:
+        """One socket read, re-armed to whatever is actually left."""
+        _require_time(self._budget, what)
+        self.sock.settimeout(self._read_timeout())
+        return self.sock.recv(size)
+
     def _read(self, n: int) -> bytes:
         while len(self._buf) < n:
-            _require_time(self._budget, "the rest of a websocket frame")
-            chunk = self.sock.recv(65536)
+            chunk = self._recv_bytes(65536, "the rest of a websocket frame")
             if not chunk:
                 raise CDPError("websocket closed mid-frame")
             self._buf += chunk
@@ -191,10 +220,16 @@ class _WebSocket:
         )
         timeout = _step_timeout(self._budget, timeout)
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            msg = json.loads(self._recv())
-            if msg.get("id") == mid:  # otherwise an unsolicited CDP event
-                return msg
+        # Published to the read path so each recv is bounded by this call's
+        # remaining time as well, not just by the connect-time ceiling.
+        self._deadline = deadline
+        try:
+            while time.monotonic() < deadline:
+                msg = json.loads(self._recv())
+                if msg.get("id") == mid:  # otherwise an unsolicited CDP event
+                    return msg
+        finally:
+            self._deadline = None
         raise CDPError(f"no CDP reply for {method} within {timeout:.1f}s")
 
     def close(self) -> None:
@@ -291,10 +326,10 @@ def _profile_pids(profile_dir: str, budget: Budget | None = None) -> set[int] | 
             check=True,
         ).stdout
     except (OSError, subprocess.SubprocessError):
+        # `None` means *unknown*, not "none running". The caller must not read a
+        # failed or timed-out listing as "nothing to kill" (round-3 review).
         log.warning(
-            "could not inspect Chrome processes for watcher profile %s;"
-            " termination not confirmed",
-            profile_dir,
+            "could not list Chrome processes for watcher profile %s", profile_dir
         )
         return None
 
@@ -313,6 +348,26 @@ def _profile_pids(profile_dir: str, budget: Budget | None = None) -> set[int] | 
     return pids
 
 
+def _discover_profile_pids(
+    profile_dir: str, budget: Budget | None
+) -> set[int] | None:
+    """PIDs on our profile, retrying a failed lookup. `None` means *unknown*.
+
+    `ps` is the only way Chrome is discovered for termination, and it is now
+    bounded like every other step, so it can time out. Treating that as "no
+    processes" silently skipped SIGTERM and left a Chrome holding the profile
+    lock — which the next mint then trips over (round-3 review).
+    """
+    for attempt in range(PROFILE_LOOKUP_ATTEMPTS):
+        pids = _profile_pids(profile_dir, budget)
+        if pids is not None:
+            return pids
+        if attempt + 1 == PROFILE_LOOKUP_ATTEMPTS or (budget and budget.expired()):
+            break
+        _nap(budget, CLEANUP_POLL_SECONDS)
+    return None
+
+
 def _terminate_by_profile(profile_dir: str, budget: Budget | None = None) -> None:
     """Terminate only our Chrome profile and confirm it goes away.
 
@@ -323,10 +378,19 @@ def _terminate_by_profile(profile_dir: str, budget: Budget | None = None) -> Non
 
     `budget` bounds the `ps` calls too, not only the confirmation wait — two
     15 s process listings already outlast the whole cleanup reserve on their
-    own. SIGTERM is always sent: killing our own Chrome is never skipped for
-    want of time, only the *confirmation* is cut short.
+    own. SIGTERM is never skipped for want of time once a process is known;
+    only the *confirmation* is cut short, and a lookup that never succeeds is
+    reported rather than passed off as a clean exit.
     """
-    pids = _profile_pids(profile_dir, budget)
+    pids = _discover_profile_pids(profile_dir, budget)
+    if pids is None:
+        log.error(
+            "could not determine whether Chrome is still running on watcher"
+            " profile %s, so nothing could be signalled — a leftover instance"
+            " may hold the profile lock for the next mint",
+            profile_dir,
+        )
+        return
     if not pids:
         return
 
@@ -340,8 +404,17 @@ def _terminate_by_profile(profile_dir: str, budget: Budget | None = None) -> Non
 
         if budget is not None and budget.expired():
             break
-        current = _profile_pids(profile_dir, budget)
-        if current is None or not current:
+        current = _discover_profile_pids(profile_dir, budget)
+        if current is None:
+            # SIGTERM went out; only the confirmation is missing. Say so rather
+            # than returning as though Chrome had exited.
+            log.warning(
+                "signalled Chrome on watcher profile %s but could not confirm"
+                " it exited: process lookup unavailable",
+                profile_dir,
+            )
+            return
+        if not current:
             return
         pids = current
         remaining = deadline - time.monotonic()
