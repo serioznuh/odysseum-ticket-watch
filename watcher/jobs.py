@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
 
-from . import alerts, cinesa, coalesce, detect, news, notify, pathe
+from . import alerts, cdp, cinesa, coalesce, detect, news, notify, pathe
 from . import state as state_mod
 from .budget import Budget
 from .detect import Finding
@@ -80,6 +80,10 @@ class CinesaOutcome:
     snapshot: detect.CinesaSnapshot | None = None
     findings: list[Finding] = field(default_factory=list)
     error_key: str | None = None
+    # A Chrome that may still hold the watcher profile lock. Unlike an ordinary
+    # Cinesa outage, this needs the owner's hands and will break every later
+    # mint, so it makes the run exit non-zero as well as feeding the streak.
+    integrity_failure: bool = False
 
 
 # ------------------------------------------------------------------ cadence
@@ -197,6 +201,12 @@ def run_cinesa_job(
         snap = cinesa.fetch_snapshot(ctx.cfg, budget=budget)
     except Exception as e:
         log.exception("Cinesa check failed")
+        if isinstance(e, cdp.ChromeLeakError):
+            # Still goes through the capped streak and its alert, but a leaked
+            # Chrome is a local-integrity problem rather than a source outage:
+            # it also makes the run exit non-zero so it cannot pass for healthy
+            # in launchd's log or in Actions.
+            out.integrity_failure = True
         # Capped at the alert threshold: nothing reads a larger value,
         # and a counter that kept growing would rewrite state.json on
         # every firing of a long outage, commit and push included.

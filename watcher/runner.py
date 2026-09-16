@@ -111,6 +111,11 @@ def _run_source_jobs(
     if result is not None:
         cinesa_out = result
         findings.extend(cinesa_out.findings)
+        if cinesa_out.integrity_failure:
+            # A possibly-leaked Chrome still gets its alert through the normal
+            # streak, but must not let the run report success: it needs the
+            # owner, and every later mint will trip over the profile lock.
+            failed.append("cinesa-cleanup")
 
     sent_any = pathe_out.sent
     delivered = _guard(failed, "delivery", jobs.deliver, ctx, findings, now)

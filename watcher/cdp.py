@@ -84,6 +84,20 @@ class CDPError(RuntimeError):
     """Chrome could not be driven, or the page never yielded the value."""
 
 
+class ChromeLeakError(CDPError):
+    """Chrome may still be running on the watcher profile.
+
+    Deliberately its own type, because it means the opposite of every other
+    CDPError. An ordinary mint failure — the challenge did not clear, Chrome is
+    not installed, the budget ran out — leaves nothing behind, so a caller may
+    safely fall back to the token it already holds. This one says the value may
+    even have been read but a process was left holding the profile lock, which
+    is what the *next* mint trips over. Falling back to a cached token here
+    reports success and hides the leak until the watch has silently gone quiet,
+    so every fallback must let this through (round-5 review).
+    """
+
+
 def _step_timeout(budget: Budget | None, ceiling: float) -> float:
     """One blocking step's timeout: its own ceiling, never past the budget."""
     return ceiling if budget is None else budget.timeout(ceiling)
@@ -687,7 +701,7 @@ def evaluate_on_page(
     # Only reached when the page produced a value: any failure above propagates
     # through the `finally` instead, keeping its own cause.
     if not signalled:
-        raise CDPError(
+        raise ChromeLeakError(
             f"read the value, but Chrome on watcher profile {profile} could not be"
             " confirmed terminated — refusing to report a clean mint while a"
             " leftover instance may hold the profile lock"

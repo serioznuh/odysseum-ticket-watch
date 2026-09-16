@@ -29,13 +29,13 @@ A single-user Telegram watcher covering **two independent targets**:
   no rung goes out twice and a run that overruns its window still delivers the
   warning on time *and* the opening ping. Each polling job has an aggregate
   budget covering retries, feed loops and the token refresh (Pathé 120 s, news
-  45 s, Cinesa 60 s; 240 s for all polling, inside one launchd firing
-  interval), enforced at every blocking call, down to Chrome's launch and each
-  CDP round trip; teardown has its own allowance, falls back to the profile's
-  own lock when `ps` cannot find Chrome, and fails the mint rather than leave a
-  locked profile behind. A crashing job exits non-zero but never costs the pass
-  its reminders, supervision or state save, and banks nothing: Pathé analysis
-  precedes the health bookkeeping it would strand.
+  45 s, Cinesa 60 s; 240 s for all polling, under one launchd firing interval),
+  enforced at every blocking call, down to Chrome's launch and each CDP call;
+  teardown has its own allowance and falls back to the profile's own lock when
+  `ps` cannot find Chrome. A Chrome that may still hold that lock exits the run
+  non-zero and no token fallback absorbs it, as does a crashing job — neither
+  ever costs the pass its reminders, supervision or state save, and Pathé
+  analysis precedes the bookkeeping a crash would strand.
 - **Local half** — launchd agent `com.odysseum.ticket-watch` in the
   `~/.ticket-watch` clone fires `scripts/local-check.sh` every 5 min. An
   adaptive-cadence guard decides if a full Pathé + news check is due (≈4 h
@@ -114,7 +114,7 @@ A single-user Telegram watcher covering **two independent targets**:
 - **Code** — Python package `watcher/`: `pathe.py`/`cinesa.py` API clients,
   `cdp.py` token step, `news.py`, `detect.py`, `state.py`, `notify.py`,
   `coalesce.py`, `alerts.py`, `budget.py`/`jobs.py`/`runner.py` orchestration,
-  `config.py`, thin `__main__.py` CLI; `config.toml`; `tests/` (259 passing).
+  `config.py`, thin `__main__.py` CLI; `config.toml`; `tests/` (264 passing).
 
 ## Cinesa specifics
 

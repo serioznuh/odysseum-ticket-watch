@@ -316,6 +316,22 @@ def get_token(cfg: Any, *, force: bool = False, budget: Budget | None = None) ->
 
     try:
         token = mint_token(cfg, budget)
+    except cdp.ChromeLeakError:
+        # Never absorbed by the cached-token fallback below. That fallback exists
+        # for a mint that simply did not work and left nothing behind; this one
+        # left a Chrome holding the profile lock, so carrying on with the cached
+        # token would pass the API check, clear the health state and exit 0 while
+        # the next mint is already doomed.
+        if cached:
+            # Still record the attempt, so a persisting leak does not mean a
+            # Chrome launch on every 5-min firing while it is being fixed.
+            save_token(cfg.cinesa_token_cache, cached, last_attempt=now)
+        log.error(
+            "Cinesa token mint could not confirm Chrome was terminated —"
+            " failing the check instead of continuing on the cached token;"
+            " quit any leftover Chrome on the watcher profile"
+        )
+        raise
     except Exception as e:
         if cached and not force:
             # Still holding a usable token: stay up and try again later. Only a
@@ -378,6 +394,13 @@ def _token_after_403(cfg: Any, token: str, budget: Budget | None = None) -> str:
 
     try:
         return get_token(cfg, force=True, budget=budget)
+    except cdp.ChromeLeakError:
+        # The same exemption as in get_token, and needed here too: this fallback
+        # keeps the old token for a *network* rejection, and must not quietly
+        # absorb a Chrome that was left holding the profile lock. No cooldown
+        # either — that mechanism is for IP rejections, and arranging quiet
+        # retries is the opposite of what a leak needs.
+        raise
     except Exception as e:
         # The 403 is usually an IP/network rejection. Keep the token that was
         # just used; it may work as soon as the VPN/proxy is removed.

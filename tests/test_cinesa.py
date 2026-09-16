@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import time
 from datetime import datetime
 from typing import ClassVar
@@ -726,3 +727,120 @@ def test_cinesa_outage_stops_rewriting_state_once_capped(tmp_path, monkeypatch):
     runner.run(boom, delivered=False)
     runner.run(boom, delivered=False)
     assert runner.state.read_bytes() == settled
+
+
+# ------------------------- cleanup integrity must not be absorbed (OTW-19 r5)
+
+def _leak(_cfg, _budget=None):
+    raise cdp.ChromeLeakError(
+        "read the value, but Chrome on watcher profile /p could not be confirmed"
+        " terminated"
+    )
+
+
+def test_a_leaked_chrome_is_not_absorbed_by_the_cached_token_fallback(
+    tmp_path, monkeypatch, caplog
+):
+    """The proactive-refresh fallback is right for a mint that simply failed —
+    nothing was left behind, so the token in hand is still the best move. A
+    cleanup-integrity failure is the opposite: continuing on the cached token
+    passes the API check, clears the health state and exits 0 while the next
+    mint is already doomed by the profile lock."""
+    cfg = TokenCfg(tmp_path / "t.json")
+    good = make_jwt(time.time() + 2 * 3600)  # inside the 3 h refresh window
+    cinesa.save_token(cfg.cinesa_token_cache, good, last_attempt=0)
+    monkeypatch.setattr(cinesa, "mint_token", _leak)
+
+    with caplog.at_level(logging.ERROR, logger=cinesa.log.name), pytest.raises(
+        cdp.ChromeLeakError
+    ):
+        cinesa.get_token(cfg)
+
+    assert "could not confirm Chrome was terminated" in caplog.text
+    # The attempt is still recorded, so a leak that takes a while to fix does
+    # not mean a Chrome launch on every 5-min firing meanwhile.
+    assert cinesa.read_cache(cfg.cinesa_token_cache)["last_refresh_attempt"] > 0
+
+    # An ordinary mint failure still falls back exactly as before.
+    def boom(_cfg, _budget=None):
+        raise cdp.CDPError("Cloudflare challenge did not clear")
+
+    monkeypatch.setattr(cinesa, "mint_token", boom)
+    cinesa.save_token(cfg.cinesa_token_cache, good, last_attempt=0)
+    assert cinesa.get_token(cfg) == good
+
+
+def test_a_leaked_chrome_is_not_absorbed_by_the_403_fallback(tmp_path, monkeypatch):
+    """The other broad catch, on the 403 path: it keeps the old token for a
+    network rejection and must not swallow a leak either. No mint cooldown
+    either — that mechanism arranges quiet retries, which is the opposite of
+    what a leak needs."""
+    cfg = FetchCfg(tmp_path / "t.json")
+    cinesa.save_token(cfg.cinesa_token_cache, make_jwt(time.time() + 6 * 3600))
+    monkeypatch.setattr(cinesa, "mint_token", _leak)
+    mock_cinesa_api(monkeypatch, lambda _request: 403)
+
+    with pytest.raises(cdp.ChromeLeakError):
+        cinesa.fetch_snapshot(cfg)
+
+    assert "mint_cooldown_until" not in cinesa.read_cache(cfg.cinesa_token_cache)
+
+
+def test_a_forced_renewal_after_a_401_also_surfaces_a_leak(tmp_path, monkeypatch):
+    """force=True skips the proactive fallback, so this reaches the caller via
+    fetch_snapshot's 401 branch. Checked because it is a third route into the
+    same mint."""
+    cfg = FetchCfg(tmp_path / "t.json")
+    cinesa.save_token(cfg.cinesa_token_cache, make_jwt(time.time() + 6 * 3600))
+    monkeypatch.setattr(cinesa, "mint_token", _leak)
+    mock_cinesa_api(monkeypatch, lambda _request: 401)
+
+    with pytest.raises(cdp.ChromeLeakError):
+        cinesa.fetch_snapshot(cfg)
+
+
+def test_the_leak_alert_says_what_to_do_about_it():
+    """"check Chrome is installed and the Mac is awake" would send the owner
+    after the wrong thing entirely."""
+    leak = main.build_cinesa_error_finding(
+        Cfg, cdp.ChromeLeakError("could not be confirmed terminated"), "k"
+    )
+
+    assert "Cause: a leftover Chrome may still hold the watcher profile." in leak.lines
+    assert "Needs you: quit Chrome" in leak.lines[-1]
+    assert "check Chrome is installed" not in "\n".join(leak.lines)
+    # Still the ordinary loud Cinesa error, keyed and shaped like the others.
+    assert leak.kind == "WATCHER_ERROR"
+    assert leak.kind not in notify.DEFAULT_SILENT_KINDS
+
+
+def test_a_leaked_chrome_makes_the_run_exit_non_zero(tmp_path, monkeypatch):
+    """It still feeds the capped streak and its alert like any Cinesa failure,
+    but it must not pass for a healthy run in launchd's log or in Actions — a
+    locked profile needs the owner, and nothing else will clear it."""
+    runner = CheckRunner(tmp_path, monkeypatch, {"imax_present": True})
+
+    def leaking_fetch(cfg, **_budget):
+        raise cdp.ChromeLeakError("could not be confirmed terminated")
+
+    monkeypatch.setattr(cinesa, "fetch_snapshot", leaking_fetch)
+    monkeypatch.setattr(notify, "send_telegram", lambda *a, **kw: True)
+
+    assert main.run(
+        ["--config", str(runner.config), "--state", str(runner.state),
+         "--mode", "check", "--skip-if-checked-within", "6"]
+    ) == 1
+
+    # The streak still advanced, so the existing threshold alert still arrives.
+    assert json.loads(runner.state.read_text())["cinesa"]["failure_streak"] == 1
+
+    # An ordinary Cinesa outage stays exit 0: it is a source being down, not a
+    # local integrity problem, and the streak alert is the right channel.
+    def plain_outage(cfg, **_budget):
+        raise RuntimeError("HTTP 500 from vwc.cinesa.es")
+
+    monkeypatch.setattr(cinesa, "fetch_snapshot", plain_outage)
+    assert main.run(
+        ["--config", str(runner.config), "--state", str(runner.state),
+         "--mode", "check", "--skip-if-checked-within", "6"]
+    ) == 0

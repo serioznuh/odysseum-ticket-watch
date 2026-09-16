@@ -17,7 +17,7 @@ import os
 import re
 from datetime import datetime, timedelta
 
-from . import detect, notify
+from . import cdp, detect, notify
 from . import state as state_mod
 from .detect import TZ_PARIS, Finding
 
@@ -306,7 +306,12 @@ def build_cinesa_error_finding(
     """
     status = _cinesa_error_status(error)
     text = str(error)
-    if status == 403:
+    if isinstance(error, cdp.ChromeLeakError):
+        # Needs the owner's hands, and says so: "check Chrome is installed"
+        # would send them after the wrong thing entirely.
+        cause = "Cause: a leftover Chrome may still hold the watcher profile."
+        tail = "Needs you: quit Chrome — every token refresh fails until then."
+    elif status == 403:
         cause = "Cause: Cinesa is blocking your IP (403)."
         tail = "Retrying every 5 min — the cached token is kept."
     elif status == 401:
