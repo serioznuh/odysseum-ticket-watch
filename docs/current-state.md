@@ -82,8 +82,8 @@ A single-user Telegram watcher covering **two independent targets**:
   and reminder receipts and acknowledged baselines are preserved, while unsafe
   concurrent owner/health changes fail closed. Every remote, base and local
   snapshot passes the numbered schema/migration check before replacing live state.
-  A rejected push leaves the merged local receipt intact for the next retry and
-  records the existing durable `WATCHER_ERROR` episode. One process lock spans a
+  A rejected push preserves the local receipt; transient Git transport must fail
+  three times before marking, while schema/merge failures mark immediately. One process lock spans a
   whole local firing. Merging is recovery, not a delivery claim: the local-owner/
   cloud-grace ordering remains the cross-host guard; OTW-20 must add explicit
   claims/outcomes and cannot promise exactly-once delivery. Baselines still move

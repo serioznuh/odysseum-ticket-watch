@@ -36,10 +36,16 @@ DEFAULT_STORE_PATH = ".cache/state-sync"
 DEFAULT_STATE_REF = "refs/heads/runtime-state"
 FETCHED_STATE_REF = "refs/otw/runtime-state"
 STATE_REF_FILE = "state.json"
+TRANSPORT_FAILURE_FILE = "transport-failure.json"
+TRANSPORT_FAILURE_THRESHOLD = 3
 
 
 class StateSyncError(RuntimeError):
     """The shared state could not be synchronized without risking history."""
+
+
+class StateSyncTransportError(StateSyncError):
+    """The remote Git transport is temporarily unavailable or rejected."""
 
 
 def _resolve_under(repo: Path, path: str | Path) -> Path:
@@ -97,15 +103,19 @@ def _remote_state(
         return None, None
     if advertised.returncode != 0:
         detail = (advertised.stderr or advertised.stdout).strip()
-        raise StateSyncError(f"could not query shared state ref: {detail}")
+        raise StateSyncTransportError(f"could not query shared state ref: {detail}")
 
-    _git(
+    fetched = _git(
         repo,
         "fetch",
         "--quiet",
         remote,
         f"+{state_ref}:{FETCHED_STATE_REF}",
+        check=False,
     )
+    if fetched.returncode != 0:
+        detail = (fetched.stderr or fetched.stdout).strip()
+        raise StateSyncTransportError(f"could not fetch shared state ref: {detail}")
     commit = _git(repo, "rev-parse", FETCHED_STATE_REF).stdout.strip()
     shown = _git(repo, "show", f"{FETCHED_STATE_REF}:{STATE_REF_FILE}")
     return commit, _decode_state(shown.stdout, "shared state")
@@ -247,7 +257,7 @@ def synchronize(
                 return live_path
             last_error = (pushed.stderr or pushed.stdout).strip() or last_error
 
-        raise StateSyncError(
+        raise StateSyncTransportError(
             f"could not push shared state after {max(1, push_attempts)} attempt(s): "
             f"{last_error}"
         )
@@ -260,6 +270,76 @@ def failure_key(marker: dict[str, str]) -> str:
 
 def _clean_detail(detail: str) -> str:
     return " ".join(detail.split())[:200]
+
+
+def load_transport_failure(path: str | Path) -> dict[str, object] | None:
+    streak_path = Path(path)
+    if not streak_path.exists():
+        return None
+    try:
+        streak = json.loads(streak_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid state-sync transport streak {streak_path}: {exc}") from exc
+    if not isinstance(streak, dict):
+        raise TypeError(f"invalid state-sync transport streak {streak_path}: expected object")
+    count = streak.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise RuntimeError(
+            f"invalid state-sync transport streak {streak_path}: count is invalid"
+        )
+    for field in ("first_seen", "detail"):
+        if not isinstance(streak.get(field), str) or not streak[field]:
+            raise RuntimeError(
+                f"invalid state-sync transport streak {streak_path}: {field} is missing"
+            )
+    return {
+        "count": count,
+        "first_seen": streak["first_seen"],
+        "detail": streak["detail"],
+    }
+
+
+def record_transport_failure(
+    detail: str,
+    path: str | Path,
+    *,
+    threshold: int = TRANSPORT_FAILURE_THRESHOLD,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Advance a capped local streak for consecutive Git transport failures."""
+    streak_path = Path(path)
+    try:
+        previous = load_transport_failure(streak_path)
+    except (RuntimeError, TypeError):
+        log.exception("replacing invalid state-sync transport streak")
+        previous = None
+    limit = max(1, threshold)
+    count = min(int(previous["count"]) + 1, limit) if previous else 1
+    first_seen = (
+        str(previous["first_seen"])
+        if previous
+        else (now or datetime.now(TZ_PARIS)).astimezone(TZ_PARIS).isoformat()
+    )
+    streak = {
+        "count": count,
+        "first_seen": first_seen,
+        "detail": _clean_detail(detail) or "Git transport failed",
+    }
+    if previous == streak:
+        return streak
+    streak_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = streak_path.with_suffix(f"{streak_path.suffix}.tmp")
+    temporary.write_text(json.dumps(streak, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, streak_path)
+    return streak
+
+
+def clear_transport_failure(path: str | Path) -> None:
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        pass
 
 
 def load_failure(path: str | Path = DEFAULT_MARKER_PATH) -> dict[str, str] | None:
@@ -346,6 +426,11 @@ def run(argv: list[str] | None = None) -> int:
     sync.add_argument("--remote", default="origin")
     sync.add_argument("--ref", default=DEFAULT_STATE_REF)
     sync.add_argument("--push-attempts", type=int, default=3)
+    sync.add_argument(
+        "--transport-failure-threshold",
+        type=int,
+        default=TRANSPORT_FAILURE_THRESHOLD,
+    )
     sync.add_argument("--marker", default=DEFAULT_MARKER_PATH)
     locked = subparsers.add_parser("locked")
     locked.add_argument("--lock", default=".cache/local-check.lock")
@@ -361,6 +446,7 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "sync":
             repo = Path(args.repo).resolve()
             marker = _resolve_under(repo, args.marker)
+            transport_streak = _resolve_under(repo, args.store) / TRANSPORT_FAILURE_FILE
             try:
                 live_path = synchronize(
                     repo,
@@ -370,10 +456,30 @@ def run(argv: list[str] | None = None) -> int:
                     state_ref=args.ref,
                     push_attempts=args.push_attempts,
                 )
+            except StateSyncTransportError as exc:
+                streak = record_transport_failure(
+                    str(exc),
+                    transport_streak,
+                    threshold=args.transport_failure_threshold,
+                )
+                count = int(streak["count"])
+                threshold = max(1, args.transport_failure_threshold)
+                if count >= threshold:
+                    record_failure(
+                        f"runtime state transport failed {count} consecutive times: {exc}",
+                        marker,
+                    )
+                print(
+                    f"state synchronization transport failed ({count}/{threshold}): {exc}",
+                    file=sys.stderr,
+                )
+                return 1
             except (OSError, StateSyncError, state_mod.StateError) as exc:
+                clear_transport_failure(transport_streak)
                 record_failure(f"runtime state synchronization failed: {exc}", marker)
                 print(f"state synchronization failed: {exc}", file=sys.stderr)
                 return 1
+            clear_transport_failure(transport_streak)
             resolve_failure(live_path, marker)
         elif args.command == "locked":
             child: Sequence[str] = args.child

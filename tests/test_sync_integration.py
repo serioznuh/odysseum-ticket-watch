@@ -16,6 +16,9 @@ from watcher.state import DEFAULT_STATE, load_state, save_state
 from watcher.state_sync import (
     DEFAULT_MARKER_PATH,
     DEFAULT_STATE_REF,
+    DEFAULT_STORE_PATH,
+    TRANSPORT_FAILURE_FILE,
+    TRANSPORT_FAILURE_THRESHOLD,
     StateSyncError,
     failure_key,
     load_failure,
@@ -167,12 +170,17 @@ def test_rejected_push_preserves_local_receipt_and_retries_next_run(two_clones):
     hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     hook.chmod(0o755)
 
-    assert run(["sync", "--repo", str(local), "--push-attempts", "1"]) == 1
-    assert "receipt-before-reject" in load_state(live_path(local))["alerts"]
+    argv = ["sync", "--repo", str(local), "--push-attempts", "1"]
+    for _ in range(TRANSPORT_FAILURE_THRESHOLD - 1):
+        assert run(argv) == 1
+        assert load_failure(local / DEFAULT_MARKER_PATH) is None
+        assert "receipt-before-reject" in load_state(live_path(local))["alerts"]
+    assert run(argv) == 1
     assert load_failure(local / DEFAULT_MARKER_PATH) is not None
 
     hook.unlink()
-    synchronize(local)
+    assert run(["sync", "--repo", str(local)]) == 0
+    assert not (local / DEFAULT_STORE_PATH / TRANSPORT_FAILURE_FILE).exists()
     synchronize(cloud)
     assert "receipt-before-reject" in load_state(live_path(cloud))["alerts"]
 

@@ -84,3 +84,76 @@ def test_record_failure_preserves_one_episode_until_resolved(tmp_path):
     assert json.loads(marker_path.read_text(encoding="utf-8"))["detail"] == (
         "first detail"
     )
+
+
+def test_transient_transport_failures_require_a_consecutive_streak(
+    tmp_path, monkeypatch
+):
+    marker_path = tmp_path / state_sync.DEFAULT_MARKER_PATH
+    streak_path = (
+        tmp_path
+        / state_sync.DEFAULT_STORE_PATH
+        / state_sync.TRANSPORT_FAILURE_FILE
+    )
+
+    def fail_transport(*args, **kwargs):
+        raise state_sync.StateSyncTransportError("GitHub temporarily unavailable")
+
+    monkeypatch.setattr(state_sync, "synchronize", fail_transport)
+    argv = ["sync", "--repo", str(tmp_path)]
+    for expected_count in range(1, state_sync.TRANSPORT_FAILURE_THRESHOLD):
+        assert state_sync.run(argv) == 1
+        assert state_sync.load_failure(marker_path) is None
+        assert state_sync.load_transport_failure(streak_path)["count"] == expected_count
+    ctx = jobs.RunContext(
+        cfg=Cfg,
+        state=deepcopy(DEFAULT_STATE),
+        clock=lambda: NOW,
+        state_sync_marker=str(marker_path),
+    )
+    assert jobs.run_state_sync_failure_job(ctx, NOW) is False
+
+    assert state_sync.run(argv) == 1
+    marker = state_sync.load_failure(marker_path)
+    assert marker is not None
+    assert (
+        f"{state_sync.TRANSPORT_FAILURE_THRESHOLD} consecutive times"
+        in marker["detail"]
+    )
+
+
+def test_success_resets_transient_transport_streak(tmp_path, monkeypatch):
+    streak_path = (
+        tmp_path
+        / state_sync.DEFAULT_STORE_PATH
+        / state_sync.TRANSPORT_FAILURE_FILE
+    )
+    calls = iter(("fail", "fail", "success", "fail"))
+
+    def synchronize_once(*args, **kwargs):
+        if next(calls) == "fail":
+            raise state_sync.StateSyncTransportError("offline")
+        return tmp_path / "state.json"
+
+    monkeypatch.setattr(state_sync, "synchronize", synchronize_once)
+    argv = ["sync", "--repo", str(tmp_path)]
+    assert state_sync.run(argv) == 1
+    assert state_sync.run(argv) == 1
+    assert state_sync.load_transport_failure(streak_path)["count"] == 2
+    assert state_sync.run(argv) == 0
+    assert not streak_path.exists()
+    assert state_sync.run(argv) == 1
+    assert state_sync.load_transport_failure(streak_path)["count"] == 1
+    assert state_sync.load_failure(tmp_path / state_sync.DEFAULT_MARKER_PATH) is None
+
+
+def test_actionable_state_failure_marks_immediately(tmp_path, monkeypatch):
+    def fail_integrity(*args, **kwargs):
+        raise state_sync.StateSyncError("shared state schema is incompatible")
+
+    monkeypatch.setattr(state_sync, "synchronize", fail_integrity)
+
+    assert state_sync.run(["sync", "--repo", str(tmp_path)]) == 1
+    marker = state_sync.load_failure(tmp_path / state_sync.DEFAULT_MARKER_PATH)
+    assert marker is not None
+    assert "schema is incompatible" in marker["detail"]
