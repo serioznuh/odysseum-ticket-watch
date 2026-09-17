@@ -66,6 +66,7 @@ jobs:
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
 
       - name: Synchronize runtime state (before)
+        continue-on-error: true
         run: python -m watcher.state_sync sync
 
       - name: Run watcher (${{ steps.mode.outputs.mode }})

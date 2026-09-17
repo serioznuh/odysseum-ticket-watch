@@ -47,8 +47,10 @@ sync_state() {
 
 # Pull shared state BEFORE the run. The watcher must see a reminder the cloud
 # failover sent while this Mac slept, or it can re-send it. A failed sync keeps
-# the last validated local copy and records the durable WATCHER_ERROR marker;
-# as before, the watcher still runs so it can surface that marker to Telegram.
+# the last validated local copy; a transient network failure is retried
+# silently for a few consecutive firings, while a genuinely unrecoverable
+# (merge/schema) failure records the durable WATCHER_ERROR marker right away.
+# Either way, the watcher still runs so it can surface that marker to Telegram.
 sync_state || true
 
 # Decides whether a Pathé + news check is due. The reminder ladder and Cinesa

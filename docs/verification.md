@@ -60,8 +60,9 @@ source .env && .venv/bin/python -m watcher --test-telegram
   and check `logs/`.
 - **Actions** (`watch.yml` changes): Actions → *ticket-watch* → Run workflow with
   mode `test` (Telegram hello) or `remind` + dry-run.
-- **State file edits** (`state/state.json`): approval required — wrong edits
-  either re-send every past alert or silence future ones.
+- **State file edits** (live state at `.cache/state-sync/state.json`, or the
+  tracked seed at `state/state.json`): approval required — wrong edits either
+  re-send every past alert or silence future ones.
 
 ## PR verification notes
 
