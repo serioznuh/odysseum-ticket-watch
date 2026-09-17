@@ -1,10 +1,9 @@
-"""Three-way recovery for state.json conflicts during the local state rebase.
+"""Domain-aware three-way reconciliation for concurrent state.json snapshots.
 
-This is deliberately narrower than a general state store.  It reconciles the
-base, upstream and unpushed-local versions Git exposes for one conflicted state
-commit, preserving delivery receipts and the baselines those receipts allow to
-advance.  Fields without safe domain semantics still use a strict three-way
-merge and stop recovery if both sides changed them differently.
+It reconciles a previously shared base, the latest upstream snapshot and an
+unpushed local snapshot, preserving delivery receipts and the baselines those
+receipts allow to advance. Fields without safe domain semantics still use a
+strict three-way merge and stop recovery if both sides changed them differently.
 """
 
 from __future__ import annotations
@@ -231,9 +230,9 @@ def merge_states(
 ) -> dict:
     """Merge validated state snapshots from a conflicted rebase.
 
-    ``upstream`` is Git's stage 2 during a rebase; ``local`` is stage 3, the
-    unpushed state commit being replayed.  Receipts and append-only baselines
-    take a union.  Everything else follows ordinary three-way semantics.
+    ``upstream`` is the latest shared state and ``local`` is the unpushed
+    worker snapshot. Receipts and append-only baselines take a union.
+    Everything else follows ordinary three-way semantics.
     """
     base = migrate_state(base)
     upstream = migrate_state(upstream)
@@ -304,7 +303,7 @@ def run(argv: list[str] | None = None) -> int:
         )
         save_state(args.output, merged)
     except StateError as exc:
-        print(f"state rebase recovery failed: {exc}", file=sys.stderr)
+        print(f"state reconciliation failed: {exc}", file=sys.stderr)
         return 2
     return 0
 

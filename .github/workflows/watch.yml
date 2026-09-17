@@ -3,8 +3,8 @@
 # The daily Pathé check runs on a home machine via scripts/local-check.sh
 # (launchd), NOT here: Akamai blocks www.pathe.fr/api from GitHub's
 # datacenter IPs (verified 2026-07-06 — 403 on every request that succeeds
-# from a residential IP). The local check pushes state/state.json back to
-# this repo; this workflow reads it to alert if the local check stops running
+# from a residential IP). The local check pushes live JSON through the
+# dedicated runtime-state ref; this workflow reads it to alert if the local check stops running
 # (stale state), and to stand in as the *failover* for the 24h/2h/15min
 # pre-sale reminders — the local half owns those, because this cron is far too
 # unreliable to own them: measured over the 9.6 days to 2026-09-03 it ran 100
@@ -30,7 +30,7 @@ on:
         default: false
 
 permissions:
-  contents: write  # to persist state/state.json back to the repo
+  contents: write  # to persist the dedicated runtime-state ref
 
 concurrency:
   group: ticket-watch
@@ -65,13 +65,16 @@ jobs:
           fi
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
 
+      - name: Synchronize runtime state (before)
+        run: python -m watcher.state_sync sync
+
       - name: Run watcher (${{ steps.mode.outputs.mode }})
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           if [ "${{ steps.mode.outputs.mode }}" = "test" ]; then
-            python -m watcher --test-telegram
+            python -m watcher --state .cache/state-sync/state.json --test-telegram
           else
             # --reminder-grace-minutes makes this pass the reminder FAILOVER,
             # never the owner: it only sends a reminder whose window opened 25+
@@ -85,17 +88,9 @@ jobs:
             # a test against config.toml's offsets and the launchd plist.
             # It applies to check mode too — reminders are computed in both
             # modes, and a manual dispatch from here is still the cloud.
-            python -m watcher --mode "${{ steps.mode.outputs.mode }}" --reminder-grace-minutes 25 ${{ inputs.dry_run == true && '--dry-run' || '' }}
+            python -m watcher --state .cache/state-sync/state.json --mode "${{ steps.mode.outputs.mode }}" --reminder-grace-minutes 25 ${{ inputs.dry_run == true && '--dry-run' || '' }}
           fi
 
-      - name: Persist state
-        if: ${{ inputs.dry_run != true }}
-        run: |
-          if [ -n "$(git status --porcelain state/state.json)" ]; then
-            git config user.name "ticket-watch-bot"
-            git config user.email "actions@users.noreply.github.com"
-            git add state/state.json
-            git commit -m "state: $(date -u +%FT%TZ) [skip ci]"
-            git pull --rebase origin "${GITHUB_REF_NAME}"
-            git push
-          fi
+      - name: Synchronize runtime state (after)
+        if: ${{ always() && inputs.dry_run != true }}
+        run: python -m watcher.state_sync sync

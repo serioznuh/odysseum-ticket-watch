@@ -9,12 +9,13 @@ never buys tickets.
 
 Stack: Python 3.9+ stdlib + `httpx`, no framework. Package `watcher/` (entry:
 `python -m watcher`), config in `config.toml`, dedup/reminder state in
-`state/state.json` (committed by both halves), launchd bits in `scripts/`.
+`.cache/state-sync/state.json` (shared via `runtime-state`), launchd bits in `scripts/`.
 
 ## Commands
 
 - Lint: `.venv/bin/ruff check .`
 - Tests: `.venv/bin/python -m pytest -q`
+- State sync: `.venv/bin/python -m watcher.state_sync sync`
 - Manual run: `source .env && .venv/bin/python -m watcher --mode check --dry-run`
 - Telegram smoke test: `source .env && .venv/bin/python -m watcher --test-telegram`
 - Secrets are env-only: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — locally in a
@@ -32,15 +33,15 @@ Core facts agents need before editing:
 - Pathé's API is **blocked from GitHub datacenter IPs** (Akamai 403). Anything
   touching `www.pathe.fr` runs locally; the scheduled cloud pass is remind-only
   and never calls Pathé (a manual `check` dispatch would, and gets 403'd).
-- Both halves **commit `state/state.json` to `main`** (`[skip ci]`). Always
-  `git pull --rebase` before committing; never rewrite pushed history.
+- Both halves sync validated JSON on **`refs/heads/runtime-state`**, never `main`.
+  OTW-14's merge preserves receipts; never rewrite either pushed history.
 - The adaptive-cadence guard governs the **Pathé + news half only** and must
   stay before that half's network activity. The Cinesa half and the reminder
   ladder run on every firing by design.
-- `scripts/local-check.sh` fires every 5 min and pulls **both before and after**
-  the watcher run. The
-  pre-run pull is not redundant: without it the Mac cannot see a reminder the
-  cloud failover sent while it slept, and re-sends it or wedges the rebase.
+- `scripts/local-check.sh` fires every 5 min, fast-forwards code first, and syncs
+  state **both before and after** the watcher run. The pre-run sync is not
+  redundant: without it the Mac cannot see a reminder the cloud failover sent
+  while it slept and can re-send it.
 
 ### Cinesa half (second target)
 
@@ -56,7 +57,7 @@ Core facts agents need before editing:
   own merits. If that stops working, the watcher must fail loudly and the
   problem comes back to the user — escalating into evasion is out of bounds.
 - The token is a **credential**: it lives in git-ignored `.cache/`, mode 0600,
-  and must never reach `state/state.json`, logs or commits.
+  and must never reach live/shared state, logs or commits.
 - Cinesa state lives under the `cinesa` key and is written **only on real
   change**. Never add a per-run timestamp there: at 5-min cadence it would
   make `local-check.sh` commit and push ~288 times a day.
@@ -124,7 +125,7 @@ Use the lowest-risk check that proves the change — details in
 - Preserve unrelated user changes; never reset, clean, or force-push without
   explicit approval.
 - No real Telegram sends without approval — use `--dry-run` / `--test-telegram`.
-- Don't hand-edit `state/state.json` (dedup memory) without approval; a wrong
+- Don't hand-edit `.cache/state-sync/state.json` or the state ref without approval; a wrong
   edit either re-sends everything or silences future alerts.
 - Don't tighten the Actions cron below `*/15` or make the repo private without
   approval (billing: ~2900 min/month at 15-min on private repos).
@@ -160,7 +161,7 @@ When behavior changes, update the owner doc in the same change:
 - Merge after successful verification unless asked to keep the PR open; delete
   the branch after merge (remotely and locally).
 - Remember pushing to `main` deploys: the `~/.ticket-watch` clone pulls it and
-  the Actions cron runs it. State commits from both halves may land between
-  your push attempts — rebase, don't force.
+  the Actions cron runs it. Runtime-state commits use their separate ref and
+  cannot enter or block a code rebase; never force either history.
 - Cross-review loops (`/claude-build`, `/codex-build`) follow
   `~/.claude/cross-review-protocol.md` and keep their logs in `docs/reviews/`.

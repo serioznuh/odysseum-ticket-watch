@@ -73,21 +73,21 @@ A single-user Telegram watcher covering **two independent targets**:
   from live selected listings appear; old or withdrawn dates retained in dedup
   state do not. The heartbeat links to the selected format's event page and
   explicitly names any detail/showtimes calls that are currently degraded.
-- **Shared state** — `state/state.json`, committed to `main` by both halves
-  (`[skip ci]`); serves as dedup memory and reminder bookkeeping. The Cinesa
-  half writes only on real change, so the 5-min cadence causes no commit churn.
-  State is schema-validated before detection or delivery: invalid, unreadable,
-  or unsupported-version state makes `--mode check` exit non-zero with an
-  actionable diagnostic and leaves the file unchanged. A genuinely new
-  installation creates empty state explicitly with `--bootstrap-state`.
-  Failure streaks stop changing at their alert threshold, and every Pathé alert
-  baseline — listings, formats and `sales` — advances only after the alert it
-  gates was delivered, so one failed send cannot retire an announcement.
-  `last_error` records the failure cause for the cloud pass and is rewritten
-  only when the text changes. `last_check_ok` means fully healthy;
-  `last_catalogue_ok` is a separate, hourly-throttled local-liveness pulse that
-  also advances on partial snapshots. Thus a steady degradation does not write
-  every 5 min, and the cloud can still tell a live degraded Mac from a dark one.
+- **Shared state boundary** — live JSON is `.cache/state-sync/state.json`; Git
+  transports it on `refs/heads/runtime-state`, separate from `main`. The tracked
+  `state/state.json` is only the first-run seed. Both halves call
+  `watcher/state_sync.py` before and after a pass; Git plumbing commits the state
+  ref without checking it out, so state never dirties the code worktree.
+  OTW-14's three-way merge remains the sole reconciliation rule: confirmed alert
+  and reminder receipts and acknowledged baselines are preserved, while unsafe
+  concurrent owner/health changes fail closed. Every remote, base and local
+  snapshot passes the numbered schema/migration check before replacing live state.
+  A rejected push leaves the merged local receipt intact for the next retry and
+  records the existing durable `WATCHER_ERROR` episode. One process lock spans a
+  whole local firing. Merging is recovery, not a delivery claim: the local-owner/
+  cloud-grace ordering remains the cross-host guard; OTW-20 must add explicit
+  claims/outcomes and cannot promise exactly-once delivery. Baselines still move
+  only after delivery, health counters stay capped, and Cinesa writes on change.
 - **Pathé failure model** — catalogue failures still blind the check, while
   every best-effort detail/showtimes result explicitly distinguishes data,
   authoritative emptiness, expected refusal and unexpected failure. One bad
@@ -105,10 +105,10 @@ A single-user Telegram watcher covering **two independent targets**:
   "not yet" (measured: a bookable event still 403s), so the 70 mm listings use
   cinema-programme `isBookable`, without a `refCmd` deep link. That exact
   refusal is expected healthy state; the observed JSON Akamai block is not.
-- **Deploying needs no state change** — `local-check.sh` pulls on every firing; every
-  pull also recovers `state.json` conflicts via a validated three-way merge that
-  unions receipts and acknowledged baselines. An unsafe merge aborts rather than
-  guessing, leaves a marker, and produces one loud deduplicated watcher alert.
+- **Deployment is independent** — under the local process lock,
+  `local-check.sh` fast-forwards `main` and re-execs the deployed script before
+  its pre-run state sync. A corrupt state ref or rejected state push can fail and
+  alert, but cannot block, rebase or roll back that code update.
 - **Code** — Python package `watcher/`: `pathe.py`/`cinesa.py` API clients,
   `cdp.py` token step, `news.py`, `detect.py`, `state.py`/`state_merge.py`/`state_sync.py`, `notify.py`,
   `coalesce.py`, `alerts.py`, `budget.py`/`jobs.py`/`runner.py` orchestration,
@@ -164,8 +164,8 @@ A single-user Telegram watcher covering **two independent targets**:
 
 - Passive: alerts arrive on Telegram; quiet kinds (news leads, heartbeat,
   recovery) are silent, time-critical ones buzz.
-- Manual runs from a clone: `source .env && .venv/bin/python -m watcher
-  --mode check [--dry-run]`; `--test-telegram` for a smoke test.
+- Manual production-state runs: first `source .env && .venv/bin/python -m
+  watcher.state_sync sync`; then run `.venv/bin/python -m watcher --state .cache/state-sync/state.json --mode check [--dry-run]` (`--test-telegram` smokes).
 - Deploying = pushing to `main`: the `~/.ticket-watch` clone pulls on its next
   firing, healthy or not; Actions picks it up on the next cron tick.
 
@@ -173,8 +173,8 @@ A single-user Telegram watcher covering **two independent targets**:
 
 - Secrets (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`) are env-only: git-ignored
   `.env` locally, repo secrets in Actions.
-- `logs/`, `.env` and `.cache/` (Cinesa token + Chrome profile) are local-only;
-  `state/state.json` is the one runtime artifact that is committed and shared.
-  The Cinesa token is a credential and must never be committed.
+- `logs/`, `.env` and `.cache/` (live state, Cinesa token and Chrome profile) are
+  local-only; only the state ref's `state.json` is shared. The Cinesa token is a
+  credential and must never enter either Git history.
 - The repo is public (Actions billing: a private repo at `*/15` would exceed
   the free tier).

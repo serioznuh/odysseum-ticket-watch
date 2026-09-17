@@ -134,4 +134,6 @@ chrome_profile = ".cache/chrome-profile"
 chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 [general]
-state_file = "state/state.json"
+# Live dedup/reminder state is materialized from refs/heads/runtime-state by
+# watcher.state_sync. The tracked state/state.json is only its first-run seed.
+state_file = ".cache/state-sync/state.json"

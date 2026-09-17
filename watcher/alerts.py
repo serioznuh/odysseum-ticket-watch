@@ -177,7 +177,7 @@ def build_recovered_finding(cfg, st: dict, now: datetime) -> Finding:
 
 
 def build_state_sync_failure_finding(cfg, marker: dict[str, str]) -> Finding:
-    """A local state commit could not be reconciled with shared state."""
+    """A local state snapshot could not be reconciled with shared state."""
     return Finding(
         kind="WATCHER_ERROR",
         key=state_sync.failure_key(marker),
@@ -185,10 +185,10 @@ def build_state_sync_failure_finding(cfg, marker: dict[str, str]) -> Finding:
         title="State sync needs you",
         lines=[
             watch_label(cfg),
-            "Local state rebase recovery failed.",
+            "Runtime state synchronization failed.",
             "Unpushed alert and reminder receipts were preserved.",
             f"Cause: {marker['detail']}",
-            "Needs you: inspect the production clone and reconcile state before retrying.",
+            "Code deployment is unaffected; inspect the production clone's state-sync marker.",
         ],
         url=cfg.film_page_url,
     )

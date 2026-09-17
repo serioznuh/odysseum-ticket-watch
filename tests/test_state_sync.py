@@ -1,4 +1,4 @@
-"""User-facing supervision for failed local state-rebase recovery."""
+"""User-facing supervision for failed runtime-state synchronization."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ class Cfg:
 def test_failure_marker_reaches_one_loud_deduplicated_alert(tmp_path, monkeypatch):
     marker_path = tmp_path / "state-rebase-failure.json"
     marker = state_sync.record_failure(
-        "automatic state/state.json rebase recovery failed",
+        "runtime state synchronization failed",
         marker_path,
         now=NOW,
     )
@@ -49,7 +49,7 @@ def test_failure_marker_reaches_one_loud_deduplicated_alert(tmp_path, monkeypatc
     assert len(sent) == 1
     text, kwargs = sent[0]
     assert "Dune : Troisième partie · Pathé Odysseum" in text
-    assert "Local state rebase recovery failed" in text
+    assert "Runtime state synchronization failed" in text
     assert kwargs["silent"] is False
     assert state_sync.failure_key(marker) in state["alerts"]
 
