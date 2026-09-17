@@ -23,7 +23,7 @@ Barcelona — see [Cinesa target](#cinesa-target)):
 
 Every alert names its **film and cinema** first, so a second watch target is
 never mistaken for this one, plus its source URL and format. Findings are sent
-**once**, deduplicated forever via `state/state.json` — bar the outage
+**once**, deduplicated forever via the shared runtime state — bar the outage
 reminder, daily by design. Same-run findings that are one piece of news share
 **one message**. News leads, heartbeats, recoveries and "still blind" repeats
 are **silent** (`alerts.silent_kinds`).
@@ -42,7 +42,7 @@ datacenter IPs (verified: 403 from Actions, 200 from a home IP, same code):
 
 | Where | What | Why |
 |---|---|---|
-| your Mac — launchd, every 5 min | Pathé + news check (adaptive cadence); **owns the reminder ladder**; pushes `state/state.json` | needs a residential IP |
+| your Mac — launchd, every 5 min | Pathé + news check (adaptive cadence); **owns the reminder ladder**; syncs the `runtime-state` ref | needs a residential IP |
 | GitHub Actions — cron `*/15`, ~11% reliable | supervision + reminder **failover** (25 min grace), reading the shared state | covers a sleeping Mac; no Pathé access required |
 
 Not every 403 is a block: the showtimes endpoint serves only `isMovie` films, so
@@ -162,8 +162,8 @@ launchctl kickstart gui/$(id -u)/com.odysseum.ticket-watch            # run once
 The agent fires every 5 minutes with adaptive cadence: every 4 h normally, 2 h
 in the last week, 30 min in the last 48 h, every firing around opening, then 6 h
 once bookable. Wanted dates remain at 5 min until announced. Sleep pauses checks;
-failures retry on wake. Both halves commit `state/state.json`, so run
-`git pull --rebase` before editing any working copy.
+failures retry on wake. Both halves sync a dedicated `runtime-state` ref; code
+deployment on `main` is independent of that state history.
 
 ## Configuration reference (config.toml)
 
@@ -207,7 +207,7 @@ failures retry on wake. Both halves commit `state/state.json`, so run
 | `cinesa.token_cache` | `.cache/cinesa-token.json` | Cached 12 h token, mode 0600. **Git-ignored — it is a credential.** |
 | `cinesa.token_refresh_before_hours` | `3.0` | Refresh the token once it has less than this much life left, instead of at expiry. Gives a multi-hour retry window if the Mac is locked/asleep; a failed refresh keeps using the token in hand rather than failing the check. Retries are backed off to 30 min apart. A data-API 403 also preserves the token and suppresses another Chrome mint for at least 60 min; disable any VPN/proxy and wait for the automatic retry. |
 | `cinesa.chrome_path`, `cinesa.chrome_profile` | macOS Chrome, `.cache/chrome-profile` | Chrome binary for the token step, and a throwaway profile — never your own. |
-| `general.state_file` | `state/state.json` | Dedup/reminder state location. |
+| `general.state_file` | `.cache/state-sync/state.json` | Validated live state materialized from the dedicated Git ref. |
 
 Secrets are env-only (never in config.toml): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
 

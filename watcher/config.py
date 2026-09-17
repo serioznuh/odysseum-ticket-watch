@@ -184,7 +184,7 @@ def load_config(path: str | Path) -> Config:
         cinesa_chrome_profile=str(
             cinesa.get("chrome_profile", ".cache/chrome-profile")
         ),
-        state_file=general.get("state_file", "state/state.json"),
+        state_file=general.get("state_file", ".cache/state-sync/state.json"),
         telegram_token=os.environ.get("TELEGRAM_BOT_TOKEN") or None,
         telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID") or None,
     )

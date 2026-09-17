@@ -33,11 +33,12 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-18 | Validate state and make recovery explicit | P1 | M | Infra, tooling & docs | [x] |
 | OTW-19 | Split orchestration into bounded jobs | P2 | M | Infra, tooling & docs | [x] |
 | OTW-20 | Persist a notification outbox and delivery receipts | P1 | L | Infra, tooling & docs | [ ] |
-| OTW-21 | Separate deployment from runtime-state synchronization | P1 | L | Infra, tooling & docs | [ ] |
+| OTW-21 | Separate deployment from runtime-state synchronization | P1 | L | Infra, tooling & docs | [x] |
 | OTW-22 | Move the local owner to an always-on residential host | P2 | L | Infra, tooling & docs | [ ] |
 | OTW-23 | An uncaught save_state failure after delivery can re-send alerts | P2 | S | Bugs | [ ] |
 | OTW-24 | Harden Cinesa leak tracking against a builder exception, and always persist state in CI | P3 | S | Bugs | [ ] |
 | OTW-25 | Exercise OTW-14's rebase recovery against a real git rebase, not just a fake-Git test double | P3 | S | Infra, tooling & docs | [ ] |
+| OTW-26 | Bound the runtime-state git ref's unbounded history growth | P3 | S | Infra, tooling & docs | [ ] |
 
 ## Architecture implementation sequence
 
@@ -743,3 +744,32 @@ cleanly with the local commit intact.
 **Done when:** a real (not faked) conflicting rebase — including a resolvable
 case and an unresolvable one — is exercised in the test suite, without
 depending on the developer's own git config; ruff and pytest pass.
+**Superseded (2026-09-17):** OTW-21 replaced the `git pull --rebase`-based
+state-conflict mechanism this item targeted with a dedicated `runtime-state`
+git ref synchronized via plumbing (never rebased), so `scripts/local-check.sh`
+no longer has a rebase-recovery code path to test. `tests/test_sync_integration.py`
+(added by OTW-21) already exercises the equivalent real-git scenarios —
+conflicting receipts, failed pushes, overlapping invocations — against the
+new mechanism.
+
+### OTW-26 · Bound the runtime-state git ref's unbounded history growth
+**Priority:** P3 · **Effort:** S
+**Problem:** Raised in dual review (Claude + Codex) of OTW-21. The dedicated
+`refs/heads/runtime-state` ref that carries live `state/state.json` (see
+`watcher/state_sync.py`) is fetched with no `--depth` bound and grows by one
+commit per successful sync — roughly 288/day at the 5-min local cadence, plus
+the 15-min cloud cadence. On the local Mac this is a slow, harmless creep; on
+a GitHub Actions runner (`actions/checkout`, ephemeral per run) it means every
+firing re-fetches the whole ref history from scratch, growing linearly over
+the life of the ref.
+**Fix sketch:** periodically compact the ref (e.g. force-push a fresh
+single-commit history once it exceeds a size/commit-count threshold, keeping
+the latest state), or fetch/push with a bounded shallow history where the
+underlying git plumbing allows it. Preserve the compare-and-swap push
+semantics `watcher/state_sync.py` relies on across a compaction.
+**Files:** `watcher/state_sync.py`, `.github/workflows/watch.yml`.
+**Done when:** the runtime-state ref's history no longer grows unbounded
+(either compacted periodically or fetched with a bounded depth), a fresh
+GitHub Actions checkout's fetch of that ref does not scale with the ref's
+total lifetime, and no confirmed receipt is lost across a compaction; ruff
+and pytest pass.
