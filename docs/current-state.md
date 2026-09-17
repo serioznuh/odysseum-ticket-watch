@@ -78,16 +78,16 @@ A single-user Telegram watcher covering **two independent targets**:
   `state/state.json` is only the first-run seed. Both halves call
   `watcher/state_sync.py` before and after a pass; Git plumbing commits the state
   ref without checking it out, so state never dirties the code worktree.
-  OTW-14's three-way merge remains the sole reconciliation rule: confirmed alert
-  and reminder receipts and acknowledged baselines are preserved, while unsafe
-  concurrent owner/health changes fail closed. Every remote, base and local
-  snapshot passes the numbered schema/migration check before replacing live state.
-  A rejected push preserves the local receipt; transient Git transport must fail
-  three times before marking, while schema/merge failures mark immediately. One process lock spans a
-  whole local firing. Merging is recovery, not a delivery claim: the local-owner/
-  cloud-grace ordering remains the cross-host guard; OTW-20 must add explicit
-  claims/outcomes and cannot promise exactly-once delivery. Baselines still move
-  only after delivery, health counters stay capped, and Cinesa writes on change.
+  Validated three-way reconciliation unions confirmed attempts and acknowledged baselines;
+  unsafe conflicts fail closed, rejected pushes retain receipts, and one lock spans a firing.
+- **Delivery boundary** — every alert, reminder and heartbeat is saved to an
+  outbox before Telegram is called. Confirmation stores every member key plus
+  Telegram's message ID, then advances gated baselines. Definite failures remain pending.
+  A timeout or interrupted attempt is explicitly `uncertain` and is not replayed
+  automatically: avoiding a duplicate takes precedence over guessing it failed.
+  Moved openings, later reminder rungs and changed availability retire stale work.
+  Claims record attempts, but two overlapping hosts can still both send: this is neither
+  exactly-once nor cross-host exclusion. Credentials and raw responses are never stored.
 - **Pathé failure model** — catalogue failures still blind the check, while
   every best-effort detail/showtimes result explicitly distinguishes data,
   authoritative emptiness, expected refusal and unexpected failure. One bad

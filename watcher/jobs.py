@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
-from . import alerts, cdp, cinesa, coalesce, detect, news, notify, pathe, state_sync
+from . import alerts, cdp, cinesa, coalesce, delivery, detect, news, pathe, state_sync
 from . import state as state_mod
 from .budget import Budget
 from .detect import Finding
@@ -62,6 +62,8 @@ class RunContext:
     skip_if_checked_within: float = 0.0
     reminder_grace_minutes: float = 0.0
     state_sync_marker: str = state_sync.DEFAULT_MARKER_PATH
+    state_path: str | None = None
+    state_writer: Callable[[str, dict], None] | None = None
     monotonic: Callable[[], float] = time.monotonic
     sleeper: Callable[[float], None] = time.sleep
 
@@ -73,7 +75,7 @@ class RunContext:
 class PatheOutcome:
     snapshot: detect.Snapshot | None = None
     findings: list[Finding] = field(default_factory=list)
-    sent: bool = False
+    error_key: str | None = None
 
 
 @dataclass
@@ -141,9 +143,10 @@ def run_pathe_job(
         snap = pathe.fetch_snapshot(client, ctx.cfg, budget=budget)
     except Exception as e:
         log.exception("Pathé check failed")
-        out.sent = alerts.record_pathe_failure(
-            ctx.cfg, ctx.state, str(e), now, dry_run=ctx.dry_run
-        )
+        finding = alerts.record_pathe_failure(ctx.cfg, ctx.state, str(e), now)
+        if finding is not None:
+            out.findings.append(finding)
+            out.error_key = finding.key
         return out
 
     out.snapshot = snap
@@ -161,9 +164,10 @@ def run_pathe_job(
     if degradation:
         state_mod.refresh_catalogue_liveness(ctx.state, now)
         log.warning("%s", degradation)
-        out.sent = alerts.record_pathe_failure(
-            ctx.cfg, ctx.state, degradation, now, dry_run=ctx.dry_run
-        )
+        finding = alerts.record_pathe_failure(ctx.cfg, ctx.state, degradation, now)
+        if finding is not None:
+            out.findings.append(finding)
+            out.error_key = finding.key
     else:
         # Reads `st` before the clear below, so the blind span is recoverable.
         if ctx.state.get("error_alerted"):
@@ -317,12 +321,18 @@ def run_cinesa_job(
 
 # ---------------------------------------------------------------- delivery
 
-def deliver(ctx: RunContext, findings: list[Finding], now: datetime) -> bool:
+def deliver(
+    ctx: RunContext,
+    findings: list[Finding],
+    now: datetime,
+    force_keys: set[str] | None = None,
+) -> bool:
     """Filter what was already sent, merge one piece of news into one message,
     send, and mark every member key of a merged message — or none of them."""
     pending: list[Finding] = []
+    force_keys = force_keys or set()
     for f in findings:
-        if state_mod.already_sent(ctx.state, f.key):
+        if f.key not in force_keys and state_mod.already_sent(ctx.state, f.key):
             log.debug("suppressed duplicate alert %s", f.key)
             continue
         if any(p.key == f.key for p in pending):
@@ -345,14 +355,9 @@ def deliver(ctx: RunContext, findings: list[Finding], now: datetime) -> bool:
         log.info("alert [%s] %s (key=%s)", f.kind, f.title, f.key)
         # One loud member is enough to buzz: merging must never silence an
         # alert that would have arrived with sound on its own.
-        if notify.send_telegram(
-            ctx.cfg,
-            notify.render_finding(f),
-            dry_run=ctx.dry_run,
-            silent=all(notify.is_silent(ctx.cfg, k) for k in alert.kinds),
+        if delivery.deliver_alert(
+            ctx, alert, now, force=bool(set(alert.keys) & force_keys)
         ):
-            for key in alert.keys:
-                state_mod.mark_sent(ctx.state, key, now)
             sent_any = True
     return sent_any
 
@@ -367,6 +372,8 @@ def advance_baselines(
     """Move every baseline whose alert was actually delivered, and no other."""
     # The error flag flips only once the alert really went out, so a failed
     # send retries on the next run instead of being silently swallowed.
+    if pathe_out.error_key and state_mod.already_sent(ctx.state, pathe_out.error_key):
+        ctx.state["error_alerted"] = True
     if cinesa_out.error_key and state_mod.already_sent(ctx.state, cinesa_out.error_key):
         ctx.state.setdefault("cinesa", {})["error_alerted"] = True
 
@@ -425,13 +432,7 @@ def run_heartbeat_job(
     if not alerts.heartbeat_due(ctx.state, now, ctx.cfg.heartbeat_days):
         return
     hb = alerts.build_heartbeat(ctx.cfg, snap, ctx.state, now)
-    if notify.send_telegram(
-        ctx.cfg,
-        notify.render_finding(hb),
-        dry_run=ctx.dry_run,
-        silent=notify.is_silent(ctx.cfg, hb.kind),
-    ):
-        ctx.state["last_heartbeat"] = now.isoformat()
+    delivery.deliver_heartbeat(ctx, hb, now)
 
 
 # --------------------------------------------------- reminders, supervision
@@ -456,12 +457,8 @@ def run_reminder_job(ctx: RunContext, now: datetime) -> bool:
     )
     sent = False
     for r in due:
-        text = notify.render_reminder(r["offset"], r["target"], ctx.cfg, now)
         log.info("reminder due: %s before %s", r["offset"], r["target"])
-        if notify.send_telegram(ctx.cfg, text, dry_run=ctx.dry_run):
-            state_mod.mark_reminder(
-                ctx.state, r["target"], r["offset"], ctx.cfg.reminder_offsets_minutes
-            )
+        if delivery.deliver_reminder(ctx, r, now):
             sent = True
     return sent
 
@@ -485,10 +482,4 @@ def run_supervision_job(ctx: RunContext, now: datetime) -> None:
     if state_mod.already_sent(ctx.state, key):
         return
     stale = alerts.build_stale_finding(ctx.cfg, ctx.state, blind, key, period + 1)
-    if notify.send_telegram(
-        ctx.cfg,
-        notify.render_finding(stale),
-        dry_run=ctx.dry_run,
-        silent=notify.is_silent(ctx.cfg, stale.kind),
-    ):
-        state_mod.mark_sent(ctx.state, key, now)
+    deliver(ctx, [stale], now)

@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 # bigger number would mean nothing, but it would keep the state file changing
 # on every firing (see update_from_cinesa).
 IMAX_ABSENT_CONFIRM = 2
-CURRENT_STATE_VERSION = 3
+CURRENT_STATE_VERSION = 4
 
 DEFAULT_STATE: dict = {
     "version": CURRENT_STATE_VERSION,
@@ -29,6 +29,10 @@ DEFAULT_STATE: dict = {
     "formats_seen": {},    # show slug -> [format classes with sessions already alerted]
     "shows_seen": [],      # matched show slugs already known
     "reminders_sent": {},  # sale target ISO -> ["1440", "120", "15", "open"]
+    # Durable notification work and sanitised Telegram receipts.  Credentials,
+    # chat ids and raw API responses never belong in either collection.
+    "outbox": {},
+    "delivery_receipts": {},
     "sale_target": None,   # earliest upcoming salesOpeningDatetime (ISO)
     "tickets_available": False,
     "failure_streak": 0,
@@ -73,7 +77,7 @@ _CORE_FIELDS = {
     "last_check_ok",
     "last_heartbeat",
 }
-_CURRENT_ONLY_FIELDS = {"last_catalogue_ok"}
+_CURRENT_ONLY_FIELDS = {"last_catalogue_ok", "outbox", "delivery_receipts"}
 _TOP_LEVEL_FIELDS = _CORE_FIELDS | _CURRENT_ONLY_FIELDS | {
     "version",
     "last_error",
@@ -184,6 +188,99 @@ def _validate_reminders(value: Any) -> None:
                 )
 
 
+def _validate_ack(value: Any, field: str) -> None:
+    ack = _require_mapping(value, field)
+    ack_type = _require_string(ack.get("type"), f"{field}.type")
+    if ack_type == "alerts":
+        if set(ack) != {"type", "keys"}:
+            raise StateError(f"{field}: invalid alert acknowledgement fields")
+        _validate_string_list(ack.get("keys"), f"{field}.keys")
+    elif ack_type == "reminder":
+        if set(ack) != {"type", "target", "offset", "offsets"}:
+            raise StateError(f"{field}: invalid reminder acknowledgement fields")
+        _parse_timestamp(ack.get("target"), f"{field}.target")
+        _require_string(ack.get("offset"), f"{field}.offset")
+        _validate_string_list(ack.get("offsets"), f"{field}.offsets")
+    elif ack_type == "heartbeat":
+        if set(ack) != {"type", "at"}:
+            raise StateError(f"{field}: invalid heartbeat acknowledgement fields")
+        _parse_timestamp(ack.get("at"), f"{field}.at")
+    else:
+        raise StateError(f"{field}.type: unsupported acknowledgement {ack_type!r}")
+
+
+def _validate_outbox(value: Any) -> None:
+    outbox = _require_mapping(value, "outbox")
+    allowed = {
+        "keys", "kinds", "text", "silent", "created_at", "expires_at",
+        "topics", "status", "claim", "ack", "force",
+    }
+    for delivery_id, record_value in outbox.items():
+        _require_string(delivery_id, "outbox key")
+        record = _require_mapping(record_value, f"outbox[{delivery_id!r}]")
+        unknown = set(record) - allowed
+        if unknown:
+            raise StateError(
+                f"outbox[{delivery_id!r}]: unknown field(s): {', '.join(sorted(unknown))}"
+            )
+        required = allowed - {"expires_at", "claim"}
+        missing = required - set(record)
+        if missing:
+            raise StateError(
+                f"outbox[{delivery_id!r}]: missing field(s): {', '.join(sorted(missing))}"
+            )
+        _validate_string_list(record["keys"], f"outbox[{delivery_id!r}].keys")
+        if not record["keys"]:
+            raise StateError(f"outbox[{delivery_id!r}].keys: expected a non-empty array")
+        _validate_string_list(record["kinds"], f"outbox[{delivery_id!r}].kinds")
+        _require_string(record["text"], f"outbox[{delivery_id!r}].text")
+        _require_bool(record["silent"], f"outbox[{delivery_id!r}].silent")
+        _require_bool(record["force"], f"outbox[{delivery_id!r}].force")
+        _parse_timestamp(record["created_at"], f"outbox[{delivery_id!r}].created_at")
+        if "expires_at" in record:
+            _parse_timestamp(record["expires_at"], f"outbox[{delivery_id!r}].expires_at")
+        _validate_string_list(record["topics"], f"outbox[{delivery_id!r}].topics")
+        status = _require_string(record["status"], f"outbox[{delivery_id!r}].status")
+        if status not in {"pending", "sending", "uncertain"}:
+            raise StateError(f"outbox[{delivery_id!r}].status: invalid value {status!r}")
+        if "claim" in record:
+            claim = _require_mapping(record["claim"], f"outbox[{delivery_id!r}].claim")
+            if set(claim) != {"owner", "token", "at"}:
+                raise StateError(f"outbox[{delivery_id!r}].claim: invalid fields")
+            _require_string(claim["owner"], f"outbox[{delivery_id!r}].claim.owner")
+            _require_string(claim["token"], f"outbox[{delivery_id!r}].claim.token")
+            _parse_timestamp(claim["at"], f"outbox[{delivery_id!r}].claim.at")
+        _validate_ack(record["ack"], f"outbox[{delivery_id!r}].ack")
+
+
+def _validate_delivery_receipts(value: Any) -> None:
+    receipts = _require_mapping(value, "delivery_receipts")
+    allowed = {"delivery_id", "keys", "delivered_at", "telegram_message_id"}
+    for receipt_id, receipt_value in receipts.items():
+        _require_string(receipt_id, "delivery_receipts key")
+        receipt = _require_mapping(
+            receipt_value, f"delivery_receipts[{receipt_id!r}]"
+        )
+        unknown = set(receipt) - allowed
+        required = allowed - {"telegram_message_id"}
+        if unknown or not required.issubset(receipt):
+            raise StateError(f"delivery_receipts[{receipt_id!r}]: invalid fields")
+        _require_string(
+            receipt["delivery_id"], f"delivery_receipts[{receipt_id!r}].delivery_id"
+        )
+        _validate_string_list(
+            receipt["keys"], f"delivery_receipts[{receipt_id!r}].keys"
+        )
+        _parse_timestamp(
+            receipt["delivered_at"], f"delivery_receipts[{receipt_id!r}].delivered_at"
+        )
+        if "telegram_message_id" in receipt:
+            _require_nonnegative_int(
+                receipt["telegram_message_id"],
+                f"delivery_receipts[{receipt_id!r}].telegram_message_id",
+            )
+
+
 def _validate_cinesa(value: Any, *, require_all: bool) -> None:
     cin = _require_mapping(value, "cinesa")
     unknown = set(cin) - _CINESA_FIELDS
@@ -229,6 +326,10 @@ def _validate_fields(state: dict, *, require_all: bool) -> None:
     _validate_formats_seen(state["formats_seen"])
     _validate_string_list(state["shows_seen"], "shows_seen")
     _validate_reminders(state["reminders_sent"])
+    if "outbox" in state:
+        _validate_outbox(state["outbox"])
+    if "delivery_receipts" in state:
+        _validate_delivery_receipts(state["delivery_receipts"])
     _parse_optional_timestamp(state["sale_target"], "sale_target")
     _require_bool(state["tickets_available"], "tickets_available")
     _require_nonnegative_int(state["failure_streak"], "failure_streak")
@@ -267,10 +368,19 @@ def _migrate_v2_to_v3(state: dict) -> dict:
     return migrated
 
 
+def _migrate_v3_to_v4(state: dict) -> dict:
+    migrated = deepcopy(state)
+    migrated["outbox"] = {}
+    migrated["delivery_receipts"] = {}
+    migrated["version"] = 4
+    return migrated
+
+
 _MIGRATIONS = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
+    3: _migrate_v3_to_v4,
 }
 
 

@@ -12,12 +12,12 @@ The order *is* the contract (OTW-19):
    Pathé, news and Cinesa polling jobs. Each polling job runs under an
    aggregate time budget, and each job here is guarded, so a job that is
    skipped, disabled or outright broken cannot take the rest of the pass with it.
-3. **Delivery** of this pass's findings (dedup, coalescing, sending), then the
-   baselines those alerts gate.
+3. **Delivery** of this pass's findings (dedup, coalescing, durable outbox,
+   sending and immediate receipt persistence), then the baselines they gate.
 4. **Due reminders again**, recomputed against a fresh clock and the
    observations that just landed. `reminders_sent` is the dedup record, so a
    rung sent in step 1 cannot be sent twice.
-5. **Supervision**, then exactly one state save.
+5. **Supervision**, then a final state save for non-delivery bookkeeping.
 
 Everything runs in this process, one job after another. There is exactly one
 writer to `ctx.state` per run — the guarantee the monolithic `run()` had
@@ -30,7 +30,7 @@ import logging
 from datetime import datetime
 from typing import Callable
 
-from . import jobs, pathe
+from . import delivery, jobs, pathe
 from . import state as state_mod
 from .budget import Budget
 from .detect import Finding
@@ -56,7 +56,11 @@ def _guard(failed: list[str], name: str, fn: Callable, *args):
 
 
 def _run_source_jobs(
-    ctx: RunContext, now: datetime, polling: Budget, failed: list[str]
+    ctx: RunContext,
+    now: datetime,
+    polling: Budget,
+    failed: list[str],
+    sent_before_sources: bool,
 ) -> None:
     """The check half: poll the sources, deliver what they found, move the
     baselines those alerts gate."""
@@ -118,8 +122,11 @@ def _run_source_jobs(
             # owner, and every later mint will trip over the profile lock.
             failed.append("cinesa-cleanup")
 
-    sent_any = pathe_out.sent
-    delivered = _guard(failed, "delivery", jobs.deliver, ctx, findings, now)
+    sent_any = sent_before_sources
+    force_keys = {pathe_out.error_key} if pathe_out.error_key else set()
+    delivered = _guard(
+        failed, "delivery", jobs.deliver, ctx, findings, now, force_keys
+    )
     sent_any = bool(delivered) or sent_any
 
     _guard(
@@ -135,9 +142,15 @@ def execute(ctx: RunContext, state_path: str) -> int:
     # *when this batch ran*, and a single run has to agree with itself.
     now = ctx.clock()
     failed: list[str] = []
+    ctx.state_path = state_path
 
     # Reminders first, before a single request. See this module's docstring.
     _guard(failed, "reminder", jobs.run_reminder_job, ctx, now)
+
+    # A prior run may have saved other pending work and stopped before Telegram
+    # was called.  Retry it only after the time-critical ladder has had its
+    # first turn; an interrupted attempt is quarantined instead of replayed.
+    recovered = _guard(failed, "outbox-recovery", delivery.recover, ctx, now)
 
     # A failed pre-run rebase leaves a durable marker and then deliberately
     # lets this pass continue. Surface it before polling, but never ahead of a
@@ -146,7 +159,7 @@ def execute(ctx: RunContext, state_path: str) -> int:
 
     if ctx.mode == "check":
         polling = ctx.budget(jobs.POLLING_BUDGET_SECONDS, "polling")
-        _run_source_jobs(ctx, now, polling, failed)
+        _run_source_jobs(ctx, now, polling, failed, bool(recovered))
 
     # Read the clock AGAIN. Polling is budgeted but still not free, and a run
     # that started at T-16 and reaches this line at T+5 must send the "sale is

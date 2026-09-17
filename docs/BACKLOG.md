@@ -32,7 +32,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-17 | A merged sale message mixing new and moved openings reads oddly | P3 | S | UX & design | [ ] |
 | OTW-18 | Validate state and make recovery explicit | P1 | M | Infra, tooling & docs | [x] |
 | OTW-19 | Split orchestration into bounded jobs | P2 | M | Infra, tooling & docs | [x] |
-| OTW-20 | Persist a notification outbox and delivery receipts | P1 | L | Infra, tooling & docs | [ ] |
+| OTW-20 | Persist a notification outbox and delivery receipts | P1 | L | Infra, tooling & docs | [x] |
 | OTW-21 | Separate deployment from runtime-state synchronization | P1 | L | Infra, tooling & docs | [x] |
 | OTW-22 | Move the local owner to an always-on residential host | P2 | L | Infra, tooling & docs | [ ] |
 | OTW-23 | An uncaught save_state failure after delivery can re-send alerts | P2 | S | Bugs | [ ] |

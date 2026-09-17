@@ -299,7 +299,7 @@ def test_dry_run_migrates_only_in_memory_and_leaves_state_bytes_unchanged(tmp_pa
     assert result == 0
     assert state.read_bytes() == before
     assert json.loads(state.read_text())["version"] == 1
-    assert CURRENT_STATE_VERSION == 3
+    assert CURRENT_STATE_VERSION == 4
 
 
 class PatheCheckRunner:

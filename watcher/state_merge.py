@@ -98,6 +98,86 @@ def _merge_alerts(upstream: dict, local: dict) -> dict:
     return merged
 
 
+def _merge_delivery_receipts(base: dict, upstream: dict, local: dict) -> dict:
+    """Receipts are append-only and attempt ids are globally unique."""
+    merged = deepcopy(upstream)
+    for receipt_id, receipt in local.items():
+        if receipt_id in merged and merged[receipt_id] != receipt:
+            base_receipt = base.get(receipt_id, _MISSING)
+            merged[receipt_id] = _three_way(
+                base_receipt, merged[receipt_id], receipt, ("delivery_receipts", receipt_id)
+            )
+        else:
+            merged[receipt_id] = deepcopy(receipt)
+    return merged
+
+
+def _ack_satisfied(state: dict, ack: dict) -> bool:
+    if ack["type"] == "alerts":
+        return all(key in state["alerts"] for key in ack["keys"])
+    if ack["type"] == "reminder":
+        return ack["offset"] in state["reminders_sent"].get(ack["target"], [])
+    if ack["type"] == "heartbeat":
+        return state["last_heartbeat"] == ack["at"]
+    return False
+
+
+def _resolve_concurrent_outbox(upstream: dict, local: dict) -> dict:
+    if upstream["keys"] != local["keys"] or upstream["ack"] != local["ack"]:
+        raise StateMergeError("concurrent outbox records disagree on logical work")
+    first, second = sorted(
+        (upstream, local), key=lambda record: _parse_timestamp(record["created_at"])
+    )
+    merged = deepcopy(second)
+    merged["created_at"] = first["created_at"]
+    merged["topics"] = _stable_union(upstream["topics"], local["topics"])
+    statuses = {upstream["status"], local["status"]}
+    if statuses & {"uncertain", "sending"}:
+        # A synchronized in-flight claim is not permission to replay.  Whether
+        # Telegram accepted it is unknowable, so reconciliation quarantines it.
+        merged["status"] = "uncertain"
+        claim_source = (
+            upstream
+            if upstream["status"] in {"uncertain", "sending"}
+            else local
+        )
+        if "claim" in claim_source:
+            merged["claim"] = deepcopy(claim_source["claim"])
+    else:
+        merged["status"] = "pending"
+        merged.pop("claim", None)
+    return merged
+
+
+def _merge_outbox(
+    base: dict,
+    upstream: dict,
+    local: dict,
+    receipts: dict,
+    merged_state: dict,
+) -> dict:
+    delivered_ids = {receipt["delivery_id"] for receipt in receipts.values()}
+    merged: dict[str, dict] = {}
+    for delivery_id in sorted(set(base) | set(upstream) | set(local)):
+        old = base.get(delivery_id, _MISSING)
+        theirs = upstream.get(delivery_id, _MISSING)
+        ours = local.get(delivery_id, _MISSING)
+        if delivery_id in delivered_ids:
+            continue
+        try:
+            record = _three_way(old, theirs, ours, ("outbox", delivery_id))
+        except StateMergeError:
+            if theirs is _MISSING or ours is _MISSING:
+                raise
+            record = _resolve_concurrent_outbox(theirs, ours)
+        if record is _MISSING or (
+            not record["force"] and _ack_satisfied(merged_state, record["ack"])
+        ):
+            continue
+        merged[delivery_id] = record
+    return merged
+
+
 def _merge_reminders(upstream: dict, local: dict) -> dict:
     merged: dict[str, list[str]] = {}
     for target in sorted(set(upstream) | set(local)):
@@ -240,7 +320,9 @@ def merge_states(
 
     domain_fields = {
         "alerts",
+        "delivery_receipts",
         "formats_seen",
+        "outbox",
         "reminders_sent",
         "sale_target",
         "sales",
@@ -254,6 +336,11 @@ def merge_states(
     ordinary_local = {key: value for key, value in local.items() if key not in domain_fields}
     merged = _three_way(ordinary_base, ordinary_upstream, ordinary_local, ())
     merged["alerts"] = _merge_alerts(upstream["alerts"], local["alerts"])
+    merged["delivery_receipts"] = _merge_delivery_receipts(
+        base["delivery_receipts"],
+        upstream["delivery_receipts"],
+        local["delivery_receipts"],
+    )
     merged["reminders_sent"] = _merge_reminders(
         upstream["reminders_sent"], local["reminders_sent"]
     )
@@ -278,6 +365,13 @@ def merge_states(
     # that evidence.
     merged["tickets_available"] = (
         upstream["tickets_available"] or local["tickets_available"]
+    )
+    merged["outbox"] = _merge_outbox(
+        base["outbox"],
+        upstream["outbox"],
+        local["outbox"],
+        merged["delivery_receipts"],
+        merged,
     )
     return migrate_state(merged)
 

@@ -167,6 +167,21 @@ def test_v2_migration_seeds_catalogue_liveness_from_last_full_check():
     assert migrated["last_catalogue_ok"] == state["last_check_ok"]
 
 
+def test_v3_migration_adds_empty_delivery_boundary_without_losing_history():
+    state = fresh_state()
+    state["version"] = 3
+    state.pop("outbox")
+    state.pop("delivery_receipts")
+    state["alerts"]["sale:dune:x"] = NOW.isoformat()
+
+    migrated = migrate_state(state)
+
+    assert migrated["version"] == CURRENT_STATE_VERSION
+    assert migrated["outbox"] == {}
+    assert migrated["delivery_receipts"] == {}
+    assert migrated["alerts"] == state["alerts"]
+
+
 def test_current_schema_missing_delivery_fields_is_not_treated_as_empty_state(tmp_path):
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"version": CURRENT_STATE_VERSION}), encoding="utf-8")
