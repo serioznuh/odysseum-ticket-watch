@@ -1,5 +1,0 @@
-VERDICT: REVISE
-FINDINGS:
-1. [P1] watcher/delivery.py:498 — Pathé sale conditions are marked observed without checking a failed detail result — a cinema-only listing retained as a metadata-free placeholder after `UNEXPECTED_FAILURE` appears to have withdrawn its sale time, so its pending `SALE_DATE` is retired and can be permanently lost if degradation lasts past opening.
-2. [P1] watcher/delivery.py:526 — target-date authority checks only `selected_listing` entries, although `target_date_findings` can derive IMAX 70 mm availability from sessions on the regular primary listing — when that listing’s showtimes request fails, `selected` can be empty and `all([])` incorrectly treats the degraded snapshot as authoritative, retiring a still-valid pending `PATHE_TARGET_DATE`.
-NOTES: Symmetric retirement of pending `RECOVERED` alerts works. Empty Cinesa snapshots and `sale_target=None` remain unknown rather than causing retirement. The recorded test gate was accepted without rerunning the suite.
