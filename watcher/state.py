@@ -801,15 +801,36 @@ def adaptive_staleness_hours(state: dict, cfg: Any, now: datetime) -> float:
         for day in getattr(cfg, "pathe_target_dates", [])
     ):
         return 0.0  # every existing launchd firing, even if its interval drifts slightly
-    target = detect.parse_iso(state.get("sale_target"))
-    if target is not None:
+    target_isos = {state.get("sale_target")}
+    target_isos.update(state.get("sales", {}).values())
+    target_isos.update(
+        record.get("ack", {}).get("target")
+        for record in state.get("outbox", {}).values()
+        if record.get("ack", {}).get("type") == "reminder"
+        and record.get("ack", {}).get("offset") == "open"
+    )
+    candidate_hours = []
+    sale_target = state.get("sale_target")
+    for iso in target_isos:
+        target = detect.parse_iso(iso)
+        if target is None:
+            continue
         hours_to_target = (detect.as_aware(target) - now).total_seconds() / 3600
+        # Future cadence belongs to `sale_target`; historical `sales` and
+        # durable open work contribute only the still-valid post-opening window.
+        if iso == sale_target or -6 <= hours_to_target <= 0:
+            candidate_hours.append(hours_to_target)
+
+    cadences = []
+    for hours_to_target in candidate_hours:
         if -6 <= hours_to_target <= 4:
-            return cfg.cadence_opening_window_minutes / 60
-        if 0 < hours_to_target <= 48:
-            return cfg.cadence_final_48h_hours
-        if 0 < hours_to_target <= 7 * 24:
-            return cfg.cadence_within_week_hours
+            cadences.append(cfg.cadence_opening_window_minutes / 60)
+        elif 0 < hours_to_target <= 48:
+            cadences.append(cfg.cadence_final_48h_hours)
+        elif 0 < hours_to_target <= 7 * 24:
+            cadences.append(cfg.cadence_within_week_hours)
+    if cadences:
+        return min(cadences)
     if detect.target_format_available(state, cfg):
         return cfg.cadence_after_tickets_hours
     return cfg.cadence_baseline_hours

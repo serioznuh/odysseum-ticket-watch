@@ -117,6 +117,55 @@ def _valid_open_ping(record: dict, now: datetime) -> bool:
     )
 
 
+def _sale_target_slugs(state: dict, target: str) -> set[str]:
+    slugs = {
+        slug for slug, opening in state.get("sales", {}).items() if opening == target
+    }
+    suffix = f":{target}"
+    for key in state.get("alerts", {}):
+        if key.startswith("sale:") and key.endswith(suffix):
+            slugs.add(key[len("sale:"):-len(suffix)])
+    for record in state.get("outbox", {}).values():
+        for topic in record.get("topics", []):
+            parsed = _condition(topic)
+            if (
+                parsed is not None
+                and parsed[0].startswith("pathe-sale:")
+                and parsed[1] == target
+            ):
+                slugs.add(parsed[0].removeprefix("pathe-sale:"))
+    return slugs
+
+
+def _bookability_confirmed(state: dict, cfg: Any, domain: str) -> bool:
+    slug = domain.removeprefix("pathe-bookability:")
+    if any(key.startswith(f"tickets:{slug}:") for key in state.get("alerts", {})):
+        return True
+    formats = state.get("formats_seen", {}).get(slug, [])
+    wanted = getattr(cfg, "pathe_target_format", "")
+    return wanted in formats if wanted else bool(formats)
+
+
+def _open_ping_bookable(state: dict, cfg: Any, record: dict, now: datetime) -> bool:
+    return _valid_open_ping(record, now) and any(
+        parsed is not None
+        and parsed[0].startswith("pathe-bookability:")
+        and _bookability_confirmed(state, cfg, parsed[0])
+        for topic in record.get("topics", [])
+        for parsed in [_condition(topic)]
+    )
+
+
+def _reminder_topics(ctx: Any, target: str) -> list[str]:
+    return [
+        _condition_topic("pathe-sale-target", target),
+        *(
+            _condition_topic(f"pathe-bookability:{slug}", "not-bookable")
+            for slug in sorted(_sale_target_slugs(ctx.state, target))
+        ),
+    ]
+
+
 def _condition_topic(domain: str, value: str) -> str:
     return f"{_CONDITION_PREFIX}{domain}={value}"
 
@@ -634,6 +683,26 @@ def deliver_reminder(
     target = reminder["target"]
     offset = str(reminder["offset"])
     target_dt = as_aware(parse_iso(target))
+    topics = _reminder_topics(ctx, target)
+    bookability_domains = {
+        parsed[0]
+        for topic in topics
+        for parsed in [_condition(topic)]
+        if parsed is not None and parsed[0].startswith("pathe-bookability:")
+    }
+    if offset == "open" and any(
+        _bookability_confirmed(ctx.state, ctx.cfg, domain)
+        for domain in bookability_domains
+    ):
+        reconcile_observations(
+            ctx,
+            observed_domains=bookability_domains,
+            active_conditions={
+                _condition_topic(domain, "bookable")
+                for domain in bookability_domains
+            },
+        )
+        return False
     if offset == "open":
         expiry = target_dt + state_mod.OPEN_PING_VALIDITY
     else:
@@ -654,7 +723,7 @@ def deliver_reminder(
             "offsets": [str(value) for value in ctx.cfg.reminder_offsets_minutes],
         },
         now=now,
-        topics=[_condition_topic("pathe-sale-target", target)],
+        topics=topics,
         expires_at=expiry,
         retry_existing=retry_existing,
     )
@@ -736,6 +805,7 @@ def reconcile_source_observations(
     """Publish the latest authoritative source facts to the outbox."""
     observed: set[str] = set()
     active: set[str] = set()
+    topics_bound = False
 
     for domain, health in (
         ("pathe-health", pathe_health),
@@ -751,6 +821,25 @@ def reconcile_source_observations(
             for show in pathe_snapshot.matched_shows
             if show.get("slug")
         }
+        for record in ctx.state.setdefault("outbox", {}).values():
+            ack = record.get("ack", {})
+            if ack.get("type") != "reminder" or ack.get("offset") != "open":
+                continue
+            target = ack.get("target")
+            for slug, show in shows.items():
+                if (
+                    show.get("salesOpeningDatetime") == target
+                    and detect.selected_listing(show, ctx.cfg)
+                    and _listing_metadata_authoritative(
+                        pathe_snapshot, slug, show
+                    )
+                ):
+                    topic = _condition_topic(
+                        f"pathe-bookability:{slug}", "not-bookable"
+                    )
+                    if topic not in record["topics"]:
+                        record["topics"].append(topic)
+                        topics_bound = True
         for domain in _pending_condition_domains(ctx, "pathe-sale:"):
             slug = domain.removeprefix("pathe-sale:")
             show = shows.get(slug)
@@ -773,11 +862,21 @@ def reconcile_source_observations(
         for domain in _pending_condition_domains(ctx, "pathe-bookability:"):
             slug = domain.removeprefix("pathe-bookability:")
             show = shows.get(slug)
-            if not _listing_metadata_authoritative(pathe_snapshot, slug, show):
+            acknowledged = _bookability_confirmed(ctx.state, ctx.cfg, domain)
+            if not acknowledged and not _listing_metadata_authoritative(
+                pathe_snapshot, slug, show
+            ):
                 continue
-            if not pathe_snapshot.endpoint_healthy(slug, "showtimes"):
+            if not acknowledged and not pathe_snapshot.endpoint_healthy(
+                slug, "showtimes"
+            ):
+                continue
+            if not pathe_snapshot.healthy and not acknowledged:
                 continue
             observed.add(domain)
+            if acknowledged:
+                active.add(_condition_topic(domain, "bookable"))
+                continue
             if show is None:
                 continue
             days = pathe_snapshot.showtimes.get(slug) or {}
@@ -787,7 +886,7 @@ def reconcile_source_observations(
             )
             if days or entry_bookable:
                 active.add(_condition_topic(domain, "bookable"))
-            elif entry and detect.selected_listing(show, ctx.cfg):
+            elif detect.selected_listing(show, ctx.cfg):
                 active.add(_condition_topic(domain, "not-bookable"))
 
         for domain in _pending_condition_domains(ctx, "pathe-tickets:"):
@@ -874,6 +973,8 @@ def reconcile_source_observations(
     reconcile_observations(
         ctx, observed_domains=observed, active_conditions=active
     )
+    if topics_bound:
+        _persist(ctx)
 
 
 def recover(ctx: Any, now: datetime) -> bool:
@@ -881,7 +982,9 @@ def recover(ctx: Any, now: datetime) -> bool:
     sent = False
     changed = False
     for delivery_id, record in list(ctx.state.setdefault("outbox", {}).items()):
-        if _has_receipt(ctx.state, delivery_id):
+        if _has_receipt(ctx.state, delivery_id) or _open_ping_bookable(
+            ctx.state, ctx.cfg, record, now
+        ):
             ctx.state["outbox"].pop(delivery_id, None)
             changed = True
         elif record.get("members") is not None:

@@ -782,6 +782,88 @@ def test_passed_open_ping_retries_while_new_future_ladder_arms(
     assert "Scheduled sale time reached" in runner.sent[0]
 
 
+def test_bookable_confirmation_retires_open_ping_locally_and_in_cloud(
+    tmp_path, monkeypatch
+):
+    """BOOK NOW and the unconfirmed-availability ping must never arrive in
+    that order, including when cloud recovery sees only the delivered key."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    now = NOW
+    target = (now - timedelta(minutes=30)).isoformat()
+    slug = "dune-troisieme-partie-imax-70mm"
+    show = {
+        "slug": slug,
+        "title": "Dune : Troisième partie IMAX 70mm",
+        "salesOpeningDatetime": target,
+        "isMovie": True,
+    }
+    quiet = Snapshot(
+        matched_shows=[show],
+        listing_results={
+            slug: {
+                "detail": detect.FetchResult.authoritative(show),
+                "showtimes": detect.FetchResult.authoritative({}),
+            }
+        },
+    )
+    sessions = {
+        "2026-07-19": [
+            {"tags": ["IMAX 70mm"], "refCmd": "https://booking.invalid"}
+        ]
+    }
+    bookable = Snapshot(
+        matched_shows=[show],
+        showtimes={slug: sessions},
+        listing_results={
+            slug: {
+                "detail": detect.FetchResult.authoritative(show),
+                "showtimes": detect.FetchResult.authoritative(sessions),
+            }
+        },
+    )
+    state = json.loads(runner.state.read_text(encoding="utf-8"))
+    state["sale_target"] = target
+    state["sales"] = {slug: target}
+    state["shows_seen"] = [slug]
+    runner.state.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(now))
+
+    failed = runner.run(quiet, delivered=False)
+    assert len(failed["outbox"]) == 1
+    pending = runner.state.read_bytes()
+
+    local = runner.run(bookable, delivered=True)
+    assert len(runner.sent) == 1
+    assert "BOOK NOW" in runner.sent[0]
+    assert "Scheduled sale time reached" not in runner.sent[0]
+    assert local["outbox"] == {}
+
+    cloud_state = json.loads(pending)
+    cloud_state["alerts"][f"tickets:{slug}:imax70"] = now.isoformat()
+    runner.state.write_text(json.dumps(cloud_state), encoding="utf-8")
+    cloud_sent = []
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda cfg, text, **kw: cloud_sent.append(text) or True,
+    )
+    assert cli.run(
+        [
+            "--config",
+            str(runner.config),
+            "--state",
+            str(runner.state),
+            "--mode",
+            "remind",
+            "--reminder-grace-minutes",
+            "25",
+        ]
+    ) == 0
+    assert cloud_sent == []
+    assert json.loads(runner.state.read_text(encoding="utf-8"))["outbox"] == {}
+
+
 def test_healthy_poll_retires_failed_blind_alert_before_recovery(
     tmp_path, monkeypatch
 ):

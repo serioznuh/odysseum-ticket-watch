@@ -659,6 +659,16 @@ def test_adaptive_staleness_tiers():
     assert state_mod.adaptive_staleness_hours(st, CadenceCfg, NOW) == 0.25  # proximity wins
 
 
+def test_passed_reported_opening_keeps_war_room_with_later_future_target():
+    st = fresh_state()
+    passed = iso_in(timedelta(minutes=-30))
+    future = iso_in(timedelta(hours=23))
+    st["sales"] = {"dune-old": passed, "dune-new": future}
+    st["sale_target"] = future
+
+    assert state_mod.adaptive_staleness_hours(st, CadenceCfg, NOW) == 0.25
+
+
 def test_is_check_fresh():
     st = fresh_state()
     assert state_mod.is_check_fresh(st, 5, NOW) is False  # never checked yet
