@@ -124,6 +124,47 @@ def _pending_condition_domains(ctx: Any, prefix: str) -> set[str]:
     return domains
 
 
+def _listing_metadata_authoritative(
+    snapshot: Any, slug: str, show: dict | None
+) -> bool:
+    """Whether a listing's absence or metadata can contradict queued work.
+
+    Production snapshots attach a detail result when the catalogue could not
+    supply a full listing.  A failed result is unknown; a retained show with
+    an empty result is the cinema-feed placeholder and is partial evidence.
+    Hand-built snapshots without result metadata retain their documented
+    authoritative behaviour.
+    """
+    detail = snapshot.listing_results.get(slug, {}).get("detail")
+    if detail is None:
+        return True
+    if not detail.healthy:
+        return False
+    return show is None or bool(detail.data)
+
+
+def _pathe_dates_authoritative(snapshot: Any) -> bool:
+    """Whether this snapshot can disprove target-format date availability."""
+    shows = [show for show in snapshot.matched_shows if show.get("slug")]
+    if not shows or len(shows) != len(snapshot.matched_shows):
+        return False
+
+    # Any failed per-listing fetch can hide a listing or session carrying the
+    # target format, including sessions on a regular (non-selected) listing.
+    if any(
+        not result.healthy
+        for endpoints in snapshot.listing_results.values()
+        for result in endpoints.values()
+    ):
+        return False
+
+    return all(
+        _listing_metadata_authoritative(snapshot, show["slug"], show)
+        and snapshot.endpoint_healthy(show["slug"], "showtimes")
+        for show in shows
+    )
+
+
 def _retire_obsolete(ctx: Any, now: datetime, topics: list[str], keys: list[str]) -> None:
     changed = False
     wanted_topics = set(topics)
@@ -495,8 +536,10 @@ def reconcile_source_observations(
         }
         for domain in _pending_condition_domains(ctx, "pathe-sale:"):
             slug = domain.removeprefix("pathe-sale:")
-            observed.add(domain)
             show = shows.get(slug)
+            if not _listing_metadata_authoritative(pathe_snapshot, slug, show):
+                continue
+            observed.add(domain)
             sale = show.get("salesOpeningDatetime") if show else None
             if show and sale and detect.selected_listing(show, ctx.cfg):
                 active.add(_condition_topic(domain, sale))
@@ -504,7 +547,9 @@ def reconcile_source_observations(
         for domain in _pending_condition_domains(ctx, "pathe-tickets:"):
             slug = domain.removeprefix("pathe-tickets:")
             show = shows.get(slug)
-            if show is not None and not pathe_snapshot.endpoint_healthy(slug, "showtimes"):
+            if not _listing_metadata_authoritative(pathe_snapshot, slug, show):
+                continue
+            if not pathe_snapshot.endpoint_healthy(slug, "showtimes"):
                 continue
             observed.add(domain)
             if show is None:
@@ -512,22 +557,17 @@ def reconcile_source_observations(
             days = pathe_snapshot.showtimes.get(slug) or {}
             entry = pathe_snapshot.cinema_entries.get(slug) or {}
             if days:
-                formats = detect.summarize_sessions(show, days)["counts"]
+                counts = detect.summarize_sessions(show, days)["counts"]
+                formats = set(counts) or {
+                    detect.classify_format(show.get("title"), slug)
+                }
             elif entry.get("isBookable") or entry.get("bookable"):
                 formats = {detect.classify_format(show.get("title"), slug)}
             else:
                 formats = set()
             active.update(_condition_topic(domain, fmt) for fmt in formats)
 
-        selected = [
-            show for show in pathe_snapshot.matched_shows
-            if detect.selected_listing(show, ctx.cfg)
-        ]
-        dates_authoritative = all(
-            pathe_snapshot.endpoint_healthy(show.get("slug", ""), "showtimes")
-            for show in selected
-        )
-        if dates_authoritative:
+        if _pathe_dates_authoritative(pathe_snapshot):
             open_days = {
                 finding.key.rsplit(":", 1)[-1]
                 for finding in detect.target_date_findings(

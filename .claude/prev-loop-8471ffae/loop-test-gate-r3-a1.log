@@ -1,0 +1,25 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
+rootdir: /Users/serhii.afanasiev/Documents/Projects/odysseum-ticket-watch
+configfile: pytest.ini
+plugins: anyio-4.12.1
+collected 325 items
+
+tests/test_budget.py .................                                   [  5%]
+tests/test_cdp.py .....................                                  [ 11%]
+tests/test_cinesa.py .................................................   [ 26%]
+tests/test_coalesce.py ..................                                [ 32%]
+tests/test_config.py ...                                                 [ 33%]
+tests/test_delivery.py .............                                     [ 37%]
+tests/test_detect.py ...............................                     [ 46%]
+tests/test_heartbeat.py .................                                [ 52%]
+tests/test_main.py ..............................................        [ 66%]
+tests/test_notify.py .............                                       [ 70%]
+tests/test_pathe.py ..........                                           [ 73%]
+tests/test_pathe_targets.py ....................                         [ 79%]
+tests/test_state.py ...........................................          [ 92%]
+tests/test_state_merge.py ............                                   [ 96%]
+tests/test_state_sync.py ......                                          [ 98%]
+tests/test_sync_integration.py ......                                    [100%]
+
+============================= 325 passed in 6.01s ==============================

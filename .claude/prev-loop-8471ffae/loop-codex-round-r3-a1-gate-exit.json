@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "operation": "codex-round",
+  "loopId": "8471ffae-c45d-40ae-91d2-abab8fdbe13b",
+  "round": 3,
+  "attempt": 1,
+  "stage": "authoritative-test-gate",
+  "headSha": "6c04617451b753aed8aefdae63332660e1f28d06",
+  "exitCode": 0,
+  "testGateReceipt": {
+    "result": "pass",
+    "exitCode": 0,
+    "durationMs": 6247,
+    "commandProfile": "pytest",
+    "sandboxMode": "trusted",
+    "logFile": ".claude/loop-test-gate-r3-a1.log",
+    "headStability": {
+      "before": "6c04617451b753aed8aefdae63332660e1f28d06",
+      "after": "6c04617451b753aed8aefdae63332660e1f28d06",
+      "stable": true
+    },
+    "trackedState": {
+      "before": "",
+      "after": "",
+      "clean": true
+    },
+    "authoritative": true,
+    "bindingId": "6c9db4b8-7940-4947-9ff7-9a00bee44fd8",
+    "recorded": true
+  }
+}

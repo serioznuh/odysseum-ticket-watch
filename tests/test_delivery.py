@@ -9,7 +9,7 @@ from typing import ClassVar
 import pytest
 
 from watcher import coalesce, delivery, jobs, notify
-from watcher.detect import TZ_PARIS, CinesaSnapshot, Finding, Snapshot
+from watcher.detect import TZ_PARIS, CinesaSnapshot, FetchResult, Finding, Snapshot
 from watcher.state import DEFAULT_STATE, load_state, save_state
 from watcher.state_merge import merge_states
 
@@ -431,6 +431,157 @@ def test_latest_snapshots_retire_all_disproved_availability_alerts(
     assert ctx.state["outbox"] == {}
     assert delivery.recover(ctx, NOW + timedelta(minutes=1)) is False
     assert calls == ["attempt", "attempt", "attempt"]
+
+
+def test_failed_detail_placeholder_does_not_retire_pending_sale(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    sale = (NOW + timedelta(days=10)).isoformat()
+    item = finding(
+        f"sale:dune-imax:{sale}", kind="SALE_DATE", sale_datetime=sale
+    )
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda *args, **kwargs: notify.SendResult("failed")
+    )
+
+    assert delivery.deliver_alert(ctx, alert(item), NOW) is False
+    delivery.reconcile_source_observations(
+        ctx,
+        now=NOW,
+        pathe_snapshot=Snapshot(
+            matched_shows=[{"slug": "dune-imax", "title": "dune-imax"}],
+            listing_results={
+                "dune-imax": {
+                    "detail": FetchResult.failed("detail request failed")
+                }
+            },
+        ),
+        pathe_health="unhealthy",
+    )
+
+    assert next(iter(ctx.state["outbox"].values()))["keys"] == [item.key]
+
+
+def test_failed_primary_showtimes_does_not_retire_pending_target_date(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    day = "2026-09-20"
+    monkeypatch.setattr(Cfg, "pathe_target_dates", [day])
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda *args, **kwargs: notify.SendResult("failed")
+    )
+    item = finding(
+        f"pathe_target:{Cfg.cinema_slug}:{Cfg.primary_slug}:imax70:{day}",
+        kind="PATHE_TARGET_DATE",
+    )
+
+    assert delivery.deliver_alert(ctx, alert(item), NOW) is False
+    delivery.reconcile_source_observations(
+        ctx,
+        now=NOW,
+        pathe_snapshot=Snapshot(
+            matched_shows=[{"slug": Cfg.primary_slug, "title": "Dune"}],
+            listing_results={
+                Cfg.primary_slug: {
+                    "showtimes": FetchResult.failed("showtimes request failed")
+                }
+            },
+        ),
+        pathe_health="unhealthy",
+    )
+
+    assert next(iter(ctx.state["outbox"].values()))["keys"] == [item.key]
+
+
+def test_empty_pathe_selection_does_not_retire_pending_target_date(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    day = "2026-09-20"
+    monkeypatch.setattr(Cfg, "pathe_target_dates", [day])
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda *args, **kwargs: notify.SendResult("failed")
+    )
+    item = finding(
+        f"pathe_target:{Cfg.cinema_slug}:{Cfg.primary_slug}:imax70:{day}",
+        kind="PATHE_TARGET_DATE",
+    )
+
+    assert delivery.deliver_alert(ctx, alert(item), NOW) is False
+    delivery.reconcile_source_observations(
+        ctx,
+        now=NOW,
+        pathe_snapshot=Snapshot(),
+        pathe_health="healthy",
+    )
+
+    assert next(iter(ctx.state["outbox"].values()))["keys"] == [item.key]
+
+
+def test_empty_session_day_preserves_detected_listing_format(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda *args, **kwargs: notify.SendResult("failed")
+    )
+    item = finding("tickets:dune-imax:imax70", kind="TICKETS_AVAILABLE")
+
+    assert delivery.deliver_alert(ctx, alert(item), NOW) is False
+    delivery.reconcile_source_observations(
+        ctx,
+        now=NOW,
+        pathe_snapshot=Snapshot(
+            matched_shows=[
+                {"slug": "dune-imax", "title": "Dune IMAX 70mm"}
+            ],
+            showtimes={"dune-imax": {"2026-09-20": []}},
+        ),
+        pathe_health="healthy",
+    )
+
+    assert next(iter(ctx.state["outbox"].values()))["keys"] == [item.key]
+
+
+def test_complete_contradicting_sale_evidence_retires_pending_sale(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    old_sale = (NOW + timedelta(days=10)).isoformat()
+    new_sale = (NOW + timedelta(days=11)).isoformat()
+    item = finding(
+        f"sale:dune-imax:{old_sale}",
+        kind="SALE_DATE",
+        sale_datetime=old_sale,
+    )
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda *args, **kwargs: notify.SendResult("failed")
+    )
+
+    assert delivery.deliver_alert(ctx, alert(item), NOW) is False
+    delivery.reconcile_source_observations(
+        ctx,
+        now=NOW,
+        pathe_snapshot=Snapshot(
+            matched_shows=[
+                {
+                    "slug": "dune-imax",
+                    "title": "Dune IMAX 70mm",
+                    "salesOpeningDatetime": new_sale,
+                }
+            ]
+        ),
+        pathe_health="healthy",
+    )
+
+    assert ctx.state["outbox"] == {}
 
 
 def test_missing_sale_target_does_not_disprove_pending_open_ping(

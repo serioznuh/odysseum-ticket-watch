@@ -1,0 +1,6 @@
+VERDICT: REVISE
+FINDINGS:
+1. [P1] watcher/runner.py:147 — the pre-poll reminder job retries pending reminders before fresh Pathé observations — if an opening moves after a failed reminder attempt, the next check sends the obsolete reminder before polling can supersede it.
+2. [P1] watcher/delivery.py:282 — outage alerts receive no expiry or supersession topic — after a definite send failure, a subsequent healthy poll can still be followed by recovery sending the stale “watch is BLIND” message.
+3. [P1] watcher/delivery.py:128 — the record is mutated to `sending` before the pre-send claim is persisted — if that save fails once, the coordinator catches it and same-run recovery changes the definitely-unsent work to `uncertain`, permanently preventing automatic retry.
+NOTES: The ReadError/RemoteProtocolError quarantine and independent `sale_target` fixes work. The `state_merge.py` deletion is consistent with `sale_target` becoming current-observation state; realistic local-check/cloud-reminder merges preserve receipts, acknowledgements, and outbox retirement. No credential or raw Telegram-response leakage found. The recorded passing test gate was accepted without rerunning it.

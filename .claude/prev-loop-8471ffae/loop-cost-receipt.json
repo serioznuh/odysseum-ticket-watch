@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "flow": 2,
+  "covers_loop_start": true,
+  "missing_agent_context_count": 0,
+  "unknown_model_activation_count": 0,
+  "totals": {
+    "input_tokens": 218,
+    "cache_creation_input_tokens": 488702,
+    "cache_read_input_tokens": 11372806,
+    "output_tokens": 109044
+  },
+  "conductor_activation_count": 33,
+  "resident_context_tokens_at_first_dispatch": 221509,
+  "resident_context_over_threshold": true,
+  "distinct_claude_context_count": 4,
+  "reviewer_wall_time_ms_by_round": [
+    517423,
+    286707,
+    338878
+  ],
+  "total_wall_time_ms": 2645175,
+  "roles": {
+    "conductor": {
+      "context_count": 1,
+      "activation_count": 33,
+      "input_tokens": 82,
+      "cache_creation_input_tokens": 211393,
+      "cache_read_input_tokens": 7505402,
+      "output_tokens": 20574
+    },
+    "builder": {
+      "context_count": 0,
+      "activation_count": 0,
+      "input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 0
+    },
+    "fixer": {
+      "context_count": 0,
+      "activation_count": 0,
+      "input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 0
+    },
+    "reviewer": {
+      "context_count": 3,
+      "activation_count": 68,
+      "input_tokens": 136,
+      "cache_creation_input_tokens": 277309,
+      "cache_read_input_tokens": 3867404,
+      "output_tokens": 88470
+    }
+  },
+  "models": [
+    {
+      "model": "claude-opus-5",
+      "roles": [
+        {
+          "role": "reviewer",
+          "context_count": 3,
+          "activation_count": 68,
+          "input_tokens": 136,
+          "cache_creation_input_tokens": 277309,
+          "cache_read_input_tokens": 3867404,
+          "output_tokens": 88470
+        }
+      ]
+    },
+    {
+      "model": "claude-sonnet-5",
+      "roles": [
+        {
+          "role": "conductor",
+          "context_count": 1,
+          "activation_count": 33,
+          "input_tokens": 82,
+          "cache_creation_input_tokens": 211393,
+          "cache_read_input_tokens": 7505402,
+          "output_tokens": 20574
+        }
+      ]
+    }
+  ],
+  "phase_wall_time_ms": {
+    "preflight": 45326,
+    "build_fix": 1224617,
+    "review": 1188158,
+    "handoff": 155656,
+    "wrap_up": 31418
+  }
+}
