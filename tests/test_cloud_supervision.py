@@ -9,9 +9,9 @@ from types import SimpleNamespace
 
 import httpx
 
-from watcher import cloud, jobs
+from watcher import cloud, delivery, jobs, notify, runner
 from watcher import state as state_mod
-from watcher.detect import TZ_PARIS
+from watcher.detect import TZ_PARIS, Finding, Snapshot
 
 NOW = datetime(2026, 9, 20, 12, 0, tzinfo=TZ_PARIS)
 
@@ -35,6 +35,14 @@ def _context():
         clock=lambda: NOW,
         mode="check",
     )
+
+
+def _durable_context(tmp_path):
+    ctx = _context()
+    state_path = tmp_path / "state.json"
+    state_mod.save_state(state_path, ctx.state)
+    ctx.state_path = str(state_path)
+    return ctx
 
 
 def _capture_delivery(monkeypatch, ctx):
@@ -79,8 +87,9 @@ def test_quiet_but_successful_cloud_run_is_healthy_and_changes_no_state(monkeypa
         lambda *args: NOW - timedelta(minutes=30),
     )
 
-    jobs.run_cloud_supervision_job(ctx, NOW)
+    health = jobs.run_cloud_supervision_job(ctx, NOW)
 
+    assert health == "healthy"
     assert delivered == []
     assert ctx.state == before
 
@@ -95,8 +104,9 @@ def test_github_api_blip_fails_quietly(monkeypatch):
 
     monkeypatch.setattr(cloud, "latest_successful_scheduled_run", unavailable)
 
-    jobs.run_cloud_supervision_job(ctx, NOW)
+    health = jobs.run_cloud_supervision_job(ctx, NOW)
 
+    assert health == "unknown"
     assert delivered == []
     assert ctx.state == before
 
@@ -129,6 +139,124 @@ def test_cloud_alert_dedups_per_outage_and_rearms_after_a_later_success(monkeypa
         f"cloud_stale:{old_success.isoformat()}",
         f"cloud_stale:{later_success.isoformat()}",
     ]
+
+
+def test_fresh_cloud_retires_failed_stale_alert_before_recovery(tmp_path, monkeypatch):
+    ctx = _durable_context(tmp_path)
+    attempts = []
+    latest = [NOW - timedelta(days=2)]
+    monkeypatch.setattr(
+        cloud, "latest_successful_scheduled_run", lambda *args: latest[0]
+    )
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda cfg, text, **kwargs: attempts.append(text)
+        or notify.SendResult("failed"),
+    )
+
+    assert jobs.run_cloud_supervision_job(ctx, NOW) == "stale"
+    assert len(attempts) == 1
+    assert next(iter(ctx.state["outbox"].values()))["topics"] == [
+        "condition:cloud-health=stale"
+    ]
+
+    # Compatibility with a failed alert queued by the first OTW-09 revision,
+    # before cloud-health conditions existed on outbox records.
+    pending = next(iter(ctx.state["outbox"].values()))
+    pending["topics"] = []
+    for member in pending["members"]:
+        member["topics"] = []
+
+    # The next run proves recovery before outbox replay. The pending loud alert
+    # is contradicted and removed, never sent after the outage has ended.
+    ctx.delivery_attempts.clear()
+    latest[0] = NOW + timedelta(minutes=1)
+    assert jobs.run_cloud_supervision_job(ctx, NOW + timedelta(minutes=5)) == "healthy"
+    assert ctx.state["outbox"] == {}
+    assert delivery.recover(ctx, NOW + timedelta(minutes=5)) is False
+    assert len(attempts) == 1
+
+
+def test_stale_cloud_suppresses_weekly_healthy_heartbeat(monkeypatch):
+    ctx = _context()
+    ctx.cfg.heartbeat_days = 7
+    monkeypatch.setattr(
+        delivery,
+        "deliver_heartbeat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("stale cloud must suppress a healthy heartbeat")
+        ),
+    )
+
+    jobs.run_heartbeat_job(ctx, Snapshot(), NOW, False, "stale")
+
+
+def test_pending_healthy_heartbeat_is_retired_when_cloud_turns_stale(
+    tmp_path, monkeypatch
+):
+    ctx = _durable_context(tmp_path)
+    attempts = []
+    heartbeat = Finding(
+        kind="HEARTBEAT",
+        key="heartbeat:2026-09-20",
+        confidence="high",
+        title="All quiet — nothing new",
+        lines=["Dune : Troisième partie · Pathé Odysseum", "All checks healthy."],
+        url=None,
+    )
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda cfg, text, **kwargs: attempts.append(text)
+        or notify.SendResult("failed"),
+    )
+    assert delivery.deliver_heartbeat(ctx, heartbeat, NOW) is False
+    assert "All checks healthy" in attempts[0]
+
+    ctx.delivery_attempts.clear()
+    monkeypatch.setattr(
+        cloud,
+        "latest_successful_scheduled_run",
+        lambda *args: NOW - timedelta(days=2),
+    )
+    assert jobs.run_cloud_supervision_job(ctx, NOW + timedelta(minutes=5)) == "stale"
+    assert all(
+        record["kinds"] != ["HEARTBEAT"]
+        for record in ctx.state["outbox"].values()
+    )
+    delivery.recover(ctx, NOW + timedelta(minutes=5))
+    assert sum("All checks healthy" in text for text in attempts) == 1
+
+
+def test_runner_probes_cloud_before_recovery_and_heartbeat(monkeypatch, tmp_path):
+    ctx = _context()
+    ctx.dry_run = True
+    trace = []
+    monkeypatch.setattr(
+        runner, "_run_source_jobs", lambda *args: (False, Snapshot())
+    )
+    monkeypatch.setattr(jobs, "run_reminder_job", lambda *args, **kwargs: False)
+    monkeypatch.setattr(jobs, "run_state_sync_failure_job", lambda *args: False)
+    monkeypatch.setattr(jobs, "run_supervision_job", lambda *args: None)
+    monkeypatch.setattr(
+        jobs,
+        "run_cloud_supervision_job",
+        lambda *args: trace.append("cloud") or "stale",
+    )
+    monkeypatch.setattr(
+        delivery,
+        "recover",
+        lambda *args, **kwargs: trace.append("recover") or False,
+    )
+
+    def heartbeat(*args):
+        trace.append(("heartbeat", args[-1]))
+
+    monkeypatch.setattr(jobs, "run_heartbeat_job", heartbeat)
+
+    assert runner.execute(ctx, str(tmp_path / "state.json")) == 0
+    assert trace == ["cloud", "recover", ("heartbeat", "stale")]
 
 
 def test_actions_api_requests_only_the_latest_scheduled_success(monkeypatch):

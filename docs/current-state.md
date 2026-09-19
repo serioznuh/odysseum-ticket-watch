@@ -45,8 +45,8 @@ A single-user Telegram watcher covering **two independent targets**:
   still pauses checks. It gates neither the **Cinesa check** — one small call,
   not bot-gated — nor the **reminder ladder**, both of which run on every
   firing. This half *owns* the ladder: 5-min firings give three chances inside
-  a 15-min warning. It also queries the public Actions API and buzzes once per
-  stale cloud episode; an unreachable API is not outage evidence and stays quiet.
+  a 15-min warning. It queries the public Actions API before outbox replay and
+  heartbeat; an unreachable API raises no outage alert but withholds “healthy”.
 - **Cloud half** — `.github/workflows/watch.yml` cron `*/15`: cloud-safe news,
   supervision, and reminders as a **failover** rather than their owner. It passes
   `--reminder-grace-minutes 25` (> the local 5-min interval), so it only sends
@@ -71,8 +71,8 @@ A single-user Telegram watcher covering **two independent targets**:
   in the selected format, using the same rules as the date alerts. Other dates
   and formats cannot confirm those bookings. Only future national sale openings
   from live selected listings appear; old or withdrawn dates retained in dedup
-  state do not. The heartbeat links to the selected format's event page and
-  explicitly names any detail/showtimes calls that are currently degraded.
+  state do not. It links to the selected format's event page and names degraded
+  listing calls, but is withheld unless current cloud health is also proven.
 - **Shared state boundary** — live JSON is `.cache/state-sync/state.json`; Git
   transports it on `refs/heads/runtime-state`, separate from `main`. The tracked
   `state/state.json` is only the first-run seed. Both halves call
@@ -84,8 +84,8 @@ A single-user Telegram watcher covering **two independent targets**:
   Definite failures remain pending; a failed pre-send claim save rolls back to pending. A
   post-send timeout is `uncertain` and is not replayed automatically. Current observations
   stay independent: an uncertain sale alert cannot freeze its opening or reminder ladder.
-  Only complete, positive contradictory evidence retires a member. Per-member conditions and
-  expiries preserve unaffected merged siblings across supersession, acknowledgement and expiry.
+  Only complete, positive contradictory evidence retires a member. Cloud-health
+  conditions retire recovered outage alerts and stale “healthy” heartbeats before replay.
   The next opening owns the ladder; booking retires old pings while recent openings keep war-room cadence.
   Overlapping local/cloud hosts can still send the same news finding: claims are not distributed locks.
 - **Pathé failure model** — catalogue failures still blind the check, while

@@ -887,6 +887,11 @@ def test_every_condition_policy_has_an_observation_path_or_expiry():
         [
             finding("error:2026-09-17", kind="WATCHER_ERROR", title="DEGRADED"),
             finding("stale:last-ok:0", kind="WATCHER_ERROR", title="Blind"),
+            finding(
+                "cloud_stale:2026-09-17T10:00:00+02:00",
+                kind="WATCHER_ERROR",
+                title="Cloud checks stopped",
+            ),
             finding("cinesa_error:2026-09-17", kind="WATCHER_ERROR"),
             finding("cinesa_recovered:2026-09-17T1200", kind="RECOVERED"),
             finding(
@@ -897,6 +902,7 @@ def test_every_condition_policy_has_an_observation_path_or_expiry():
     )
     exact = {
         "pathe-health",
+        "cloud-health",
         "cinesa-health",
         "cinesa-token",
         "cinesa-imax-presence",

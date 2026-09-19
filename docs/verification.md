@@ -16,11 +16,11 @@ Expected current result: Ruff reports no errors and all collected tests pass.
 For reverse cloud supervision and its read-only Telegram probe:
 
 ```bash
-.venv/bin/python -m pytest -q tests/test_cloud_supervision.py tests/test_notify.py tests/test_config.py tests/test_main.py
+.venv/bin/python -m pytest -q tests/test_cloud_supervision.py tests/test_delivery.py tests/test_heartbeat.py tests/test_main.py tests/test_notify.py tests/test_config.py
 ```
 
-These mocked tests cover stale, fresh/idle, API-failure and dedup behavior without
-calling GitHub or Telegram. A real `--check-telegram` validates credentials but
+These mocked tests cover stale, fresh/idle, API-failure, heartbeat/outbox ordering
+and dedup behavior without calling GitHub or Telegram. A real `--check-telegram` validates credentials but
 sends no message; testing the edited Actions workflow still needs approval below.
 
 ## Watcher behavior check

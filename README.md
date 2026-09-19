@@ -48,7 +48,7 @@ event listings (the 70 mm ones) always answer `"No movie allowed !"`, and their
 bookability is read off the cinema programme. Unexpected detail/showtimes failures
 degrade health without discarding the rest of the snapshot.
 
-Safety nets: 🔴 after 3 consecutive Pathé failures (including partial failures after 6 h), if the local catalogue pulse stops for 18 h (then every 24 h), or if no scheduled cloud run has succeeded for 18 h. The local check reads the public Actions API; each cloud run first validates its bot token and target chat without sending. An API blip stays quiet, and no liveness timestamp churns shared state. If **both halves die**, only the absence of the 7-day heartbeat remains.
+Safety nets: 🔴 after 3 consecutive Pathé failures (including partial failures after 6 h), if the local catalogue pulse stops for 18 h (then every 24 h), or if no scheduled cloud run has succeeded for 18 h. The local check reads the public Actions API before outbox replay or heartbeat; recovery retires a pending stale-cloud alert, while stale/unknown health withholds the “healthy” heartbeat. Each cloud run validates its bot and chat without sending. An API blip raises no alert, and no liveness timestamp churns shared state. If **both halves die**, only the absence of the 7-day heartbeat remains.
 
 ### Cinesa target
 

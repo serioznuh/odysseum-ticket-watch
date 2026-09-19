@@ -207,6 +207,14 @@ def _pending_condition_domains(ctx: Any, prefix: str) -> set[str]:
     return domains
 
 
+def _has_condition_domain(record: dict, domains: set[str]) -> bool:
+    return any(
+        parsed is not None and parsed[0] in domains
+        for topic in record.get("topics", [])
+        for parsed in [_condition(topic)]
+    )
+
+
 def _listing_metadata_authoritative(
     snapshot: Any, slug: str, show: dict | None
 ) -> bool:
@@ -607,6 +615,8 @@ def _finding_policy(finding: Finding, now: datetime) -> tuple[list[str], datetim
         return [_condition_topic("pathe-health", level)], None
     if finding.key.startswith("stale:"):
         return [_condition_topic("pathe-health", "blind")], now + timedelta(days=1)
+    if finding.key.startswith("cloud_stale:"):
+        return [_condition_topic("cloud-health", "stale")], now + timedelta(days=1)
     if finding.key.startswith("recovered:"):
         return [_condition_topic("pathe-health", "healthy")], None
     if finding.key.startswith("cinesa_error:"):
@@ -622,7 +632,9 @@ def _finding_policy(finding: Finding, now: datetime) -> tuple[list[str], datetim
     if finding.kind == "NEWS_LEAD":
         return [], now + timedelta(days=7)
     if finding.kind == "HEARTBEAT":
-        return [], now + timedelta(days=7)
+        return [
+            _condition_topic("cloud-health", "healthy")
+        ], now + timedelta(days=7)
     return [], None
 
 
@@ -790,6 +802,44 @@ def reconcile_observations(
             changed = True
     if changed:
         _persist(ctx)
+
+
+def reconcile_cloud_health(ctx: Any, health: str) -> None:
+    """Publish an authoritative Actions result before outbox recovery.
+
+    Older pending heartbeats predate their cloud-health topic. Bind it here so
+    upgrading during an outage cannot replay an unqualified "healthy" message.
+    """
+    if health not in {"healthy", "stale"}:
+        raise ValueError(f"unsupported cloud health {health!r}")
+    healthy_topic = _condition_topic("cloud-health", "healthy")
+    stale_topic = _condition_topic("cloud-health", "stale")
+    changed = False
+    for record in ctx.state.setdefault("outbox", {}).values():
+        if (
+            record.get("ack", {}).get("type") == "heartbeat"
+            and healthy_topic not in record.get("topics", [])
+        ):
+            record.setdefault("topics", []).append(healthy_topic)
+            changed = True
+        if any(key.startswith("cloud_stale:") for key in record.get("keys", [])):
+            if stale_topic not in record.get("topics", []):
+                record.setdefault("topics", []).append(stale_topic)
+                changed = True
+            for member in record.get("members", []):
+                if (
+                    member.get("key", "").startswith("cloud_stale:")
+                    and stale_topic not in member.get("topics", [])
+                ):
+                    member.setdefault("topics", []).append(stale_topic)
+                    changed = True
+    if changed:
+        _persist(ctx)
+    reconcile_observations(
+        ctx,
+        observed_domains={"cloud-health"},
+        active_conditions={_condition_topic("cloud-health", health)},
+    )
 
 
 def reconcile_source_observations(
@@ -977,8 +1027,14 @@ def reconcile_source_observations(
         _persist(ctx)
 
 
-def recover(ctx: Any, now: datetime) -> bool:
+def recover(
+    ctx: Any,
+    now: datetime,
+    *,
+    blocked_condition_domains: set[str] | None = None,
+) -> bool:
     """Retire stale work, quarantine interrupted attempts, retry safe pending work."""
+    blocked_condition_domains = blocked_condition_domains or set()
     sent = False
     changed = False
     for delivery_id, record in list(ctx.state.setdefault("outbox", {}).items()):
@@ -1022,6 +1078,8 @@ def recover(ctx: Any, now: datetime) -> bool:
     if changed:
         _persist(ctx)
     for delivery_id, record in list(ctx.state["outbox"].items()):
-        if record["status"] == "pending":
+        if record["status"] == "pending" and not _has_condition_domain(
+            record, blocked_condition_domains
+        ):
             sent = _attempt(ctx, delivery_id, now) or sent
     return sent
