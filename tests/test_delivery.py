@@ -9,6 +9,7 @@ from typing import ClassVar
 import pytest
 
 from watcher import coalesce, delivery, jobs, notify
+from watcher import state as state_mod
 from watcher.detect import TZ_PARIS, CinesaSnapshot, FetchResult, Finding, Snapshot
 from watcher.state import DEFAULT_STATE, load_state, save_state
 from watcher.state_merge import merge_states
@@ -641,6 +642,62 @@ def test_confirmed_blind_alert_supersedes_failed_degraded_alert(
     assert ctx.state["outbox"] == {}
 
 
+def test_watcher_error_identity_survives_changing_duration_and_respects_receipt(
+    tmp_path, monkeypatch
+):
+    """A definite failure must not fork one outage into many queued IDs, and
+    a later forced pass must honor the receipt for that same condition."""
+    state_path = tmp_path / "state.json"
+    calls = []
+    outcomes = iter(
+        (notify.SendResult("failed"), notify.SendResult("confirmed", 77))
+    )
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda _cfg, text, **kwargs: calls.append(text) or next(outcomes),
+    )
+    first = finding(
+        "error:2026-09-17",
+        kind="WATCHER_ERROR",
+        title="Pathé watch is BLIND (6 h)",
+    )
+    later = finding(
+        first.key,
+        kind="WATCHER_ERROR",
+        title="Pathé watch is BLIND (7 h)",
+    )
+
+    first_ctx = context(state_path)
+    assert delivery.deliver_alert(first_ctx, alert(first), NOW, force=True) is False
+    failed = load_state(state_path)
+    assert len(failed["outbox"]) == 1
+    delivery_id = next(iter(failed["outbox"]))
+
+    retry_ctx = context(state_path, state=failed)
+    assert delivery.deliver_alert(
+        retry_ctx, alert(later), NOW + timedelta(hours=1), force=True
+    ) is True
+    confirmed = load_state(state_path)
+    assert confirmed["outbox"] == {}
+    assert next(iter(confirmed["delivery_receipts"].values()))["delivery_id"] == delivery_id
+
+    acknowledged_ctx = context(state_path, state=confirmed)
+    assert delivery.deliver_alert(
+        acknowledged_ctx,
+        alert(
+            finding(
+                first.key,
+                kind="WATCHER_ERROR",
+                title="Pathé watch is BLIND (8 h)",
+            )
+        ),
+        NOW + timedelta(hours=2),
+        force=True,
+    ) is False
+    assert len(calls) == 2
+
+
 def test_book_now_supersedes_failed_cinema_listed_alert(
     tmp_path, monkeypatch
 ):
@@ -726,6 +783,36 @@ def test_merged_observation_contradiction_retires_only_its_member(
     ]
 
 
+def test_merged_split_does_not_recreate_an_acknowledged_member(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    first_day = "2026-09-20"
+    later_day = "2026-09-22"
+    first = finding(
+        f"pathe_target:{Cfg.cinema_slug}:{Cfg.primary_slug}:imax70:{first_day}",
+        kind="PATHE_TARGET_DATE",
+    )
+    later = finding(
+        f"pathe_target:{Cfg.cinema_slug}:{Cfg.primary_slug}:imax70:{later_day}",
+        kind="PATHE_TARGET_DATE",
+    )
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda *args, **kwargs: notify.SendResult("failed")
+    )
+
+    assert delivery.deliver_alert(ctx, alert(first, later), NOW) is False
+    state_mod.mark_sent(ctx.state, later.key, NOW)
+    delivery.reconcile_observations(
+        ctx,
+        observed_domains={f"pathe-availability:{first_day}"},
+        active_conditions=set(),
+    )
+
+    assert ctx.state["outbox"] == {}
+
+
 POLICY_CASES = [
     (
         "SALE_DATE",
@@ -790,13 +877,112 @@ def test_policy_matrix_covers_every_non_error_alert_kind():
     }
 
 
-def test_missing_sale_target_does_not_disprove_pending_open_ping(
+def test_every_condition_policy_has_an_observation_path_or_expiry():
+    """Keep condition emitters paired with reconciliation as policies grow."""
+    items = [
+        finding(key, kind=kind, title=title, sale_datetime=sale_datetime)
+        for kind, key, title, sale_datetime in POLICY_CASES
+    ]
+    items.extend(
+        [
+            finding("error:2026-09-17", kind="WATCHER_ERROR", title="DEGRADED"),
+            finding("stale:last-ok:0", kind="WATCHER_ERROR", title="Blind"),
+            finding("cinesa_error:2026-09-17", kind="WATCHER_ERROR"),
+            finding("cinesa_recovered:2026-09-17T1200", kind="RECOVERED"),
+            finding(
+                "cinesa_leak:2026-09-17T10:00:00+02:00:0",
+                kind="WATCHER_ERROR",
+            ),
+        ]
+    )
+    exact = {
+        "pathe-health",
+        "cinesa-health",
+        "cinesa-token",
+        "cinesa-imax-presence",
+        "pathe-sale-target",
+    }
+    prefixes = (
+        "pathe-sale:",
+        "pathe-listing:",
+        "pathe-bookability:",
+        "pathe-tickets:",
+        "pathe-availability:",
+        "cinesa-availability:",
+    )
+
+    policies = [delivery._finding_policy(item, NOW) for item in items]
+    policies.append(([delivery._condition_topic("pathe-sale-target", "target")], None))
+    for topics, expiry in policies:
+        for topic in topics:
+            condition = delivery._condition(topic)
+            if condition is None:
+                continue
+            domain, _value = condition
+            assert expiry is not None or domain in exact or domain.startswith(prefixes)
+
+
+def test_cleared_cinesa_lock_retires_failed_owner_advice(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    calls = []
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda *args, **kwargs: calls.append("attempt") or notify.SendResult("failed"),
+    )
+    leak = finding(
+        "cinesa_leak:2026-09-17T10:00:00+02:00:0",
+        kind="WATCHER_ERROR",
+        title="Cinesa token step needs you",
+    )
+
+    assert delivery.deliver_alert(ctx, alert(leak), NOW) is False
+    delivery.reconcile_source_observations(
+        ctx,
+        now=NOW + timedelta(minutes=5),
+        cinesa_token_stuck=False,
+    )
+
+    assert ctx.state["outbox"] == {}
+    assert delivery.recover(ctx, NOW + timedelta(minutes=6)) is False
+    assert calls == ["attempt"]
+
+
+def test_authoritative_sale_withdrawal_retires_failed_open_ping(
     tmp_path, monkeypatch
 ):
-    """`None` can mean sales just went live. Only a different observed target
-    contradicts the old ladder; the high-value open ping remains retryable."""
+    """A complete snapshot can prove that an old future opening was removed."""
     state_path = tmp_path / "state.json"
-    target = (NOW - timedelta(minutes=1)).isoformat()
+    target = (NOW + timedelta(hours=2)).isoformat()
+    ctx = context(state_path)
+    calls = []
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda *args, **kwargs: calls.append("attempt") or notify.SendResult("failed"),
+    )
+
+    assert delivery.deliver_reminder(
+        ctx, {"target": target, "offset": 120}, NOW
+    ) is False
+    ctx.state["sale_target"] = None
+    delivery.reconcile_source_observations(
+        ctx,
+        now=NOW,
+        pathe_snapshot=Snapshot(),
+        pathe_health="healthy",
+    )
+
+    assert ctx.state["outbox"] == {}
+    assert delivery.recover(ctx, NOW + timedelta(minutes=1)) is False
+    assert calls == ["attempt"]
+
+
+def test_unknown_sale_withdrawal_preserves_failed_open_ping(tmp_path, monkeypatch):
+    """A missing target on a degraded detail response remains unknown."""
+    state_path = tmp_path / "state.json"
+    target = (NOW + timedelta(hours=2)).isoformat()
     ctx = context(state_path)
     calls = []
     outcomes = iter((notify.SendResult("failed"), notify.SendResult("confirmed")))
@@ -807,14 +993,19 @@ def test_missing_sale_target_does_not_disprove_pending_open_ping(
     )
 
     assert delivery.deliver_reminder(
-        ctx, {"target": target, "offset": "open"}, NOW
+        ctx, {"target": target, "offset": 120}, NOW
     ) is False
     ctx.state["sale_target"] = None
     delivery.reconcile_source_observations(
         ctx,
         now=NOW,
-        pathe_snapshot=Snapshot(),
-        pathe_health="healthy",
+        pathe_snapshot=Snapshot(
+            matched_shows=[{"slug": "dune", "title": "Dune"}],
+            listing_results={
+                "dune": {"detail": FetchResult.failed("detail unavailable")}
+            },
+        ),
+        pathe_health="degraded",
     )
 
     assert len(ctx.state["outbox"]) == 1

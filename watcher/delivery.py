@@ -119,6 +119,26 @@ def _condition(topic: str) -> tuple[str, str] | None:
     return (domain, value) if domain and separator and value else None
 
 
+def _alert_identity(kinds: list[str], topics: list[str]) -> str | None:
+    """Return a stable identity when one historical key can name two events.
+
+    Pathé deliberately reuses one daily WATCHER_ERROR key when a degraded
+    watch escalates to blind. The condition distinguishes those owed messages;
+    rendered outage duration does not, because it changes every run.
+    """
+    if "WATCHER_ERROR" not in kinds:
+        return None
+    conditions = sorted(topic for topic in topics if _condition(topic) is not None)
+    return json.dumps(["WATCHER_ERROR", conditions], separators=(",", ":"))
+
+
+def _member_delivery_id(member: dict) -> str:
+    return _delivery_id(
+        [member["key"]],
+        _alert_identity([member["kind"]], member.get("topics", [])),
+    )
+
+
 def _pending_condition_domains(ctx: Any, prefix: str) -> set[str]:
     domains: set[str] = set()
     for record in ctx.state.setdefault("outbox", {}).values():
@@ -195,7 +215,12 @@ def _retain_members(
     ctx.state["outbox"].pop(delivery_id, None)
     replacement_ids = []
     for member in survivors:
-        replacement_id = _delivery_id([member["key"]])
+        replacement_id = _member_delivery_id(member)
+        if _has_receipt(ctx.state, replacement_id) or (
+            not record["force"]
+            and state_mod.already_sent(ctx.state, member["key"])
+        ):
+            continue
         replacement_ids.append(replacement_id)
         replacement = _standalone_record(record, member)
         existing = ctx.state["outbox"].get(replacement_id)
@@ -580,13 +605,9 @@ def deliver_alert(ctx: Any, alert: Alert, now: datetime, *, force: bool = False)
         topics=list(dict.fromkeys(topics)),
         members=member_records,
         # Pathé's degraded -> blind escalation deliberately reuses its
-        # historical Finding.key on the same day.  Content distinguishes those
-        # two owed messages without changing that key format.
-        identity=(
-            notify.render_finding(alert.finding)
-            if alert.finding.kind == "WATCHER_ERROR"
-            else None
-        ),
+        # historical Finding.key on the same day. The condition distinguishes
+        # those events while remaining stable as rendered durations change.
+        identity=_alert_identity(alert.kinds, topics),
         force=force,
     )
 
@@ -698,6 +719,7 @@ def reconcile_source_observations(
     pathe_health: str | None = None,
     cinesa_snapshot: Any = None,
     cinesa_health: str | None = None,
+    cinesa_token_stuck: bool | None = None,
 ) -> None:
     """Publish the latest authoritative source facts to the outbox."""
     observed: set[str] = set()
@@ -793,8 +815,9 @@ def reconcile_source_observations(
                     active.add(_condition_topic(domain, "open"))
 
         target = ctx.state.get("sale_target")
-        if target is not None:
+        if target is not None or pathe_snapshot.sale_observations_complete():
             observed.add("pathe-sale-target")
+        if target is not None:
             active.add(_condition_topic("pathe-sale-target", target))
 
     if cinesa_snapshot is not None and cinesa_snapshot.days:
@@ -819,6 +842,11 @@ def reconcile_source_observations(
                 "cinesa-imax-presence", "present" if imax else "absent"
             )
         )
+
+    if cinesa_token_stuck is not None:
+        observed.add("cinesa-token")
+        if cinesa_token_stuck:
+            active.add(_condition_topic("cinesa-token", "stuck"))
 
     reconcile_observations(
         ctx, observed_domains=observed, active_conditions=active

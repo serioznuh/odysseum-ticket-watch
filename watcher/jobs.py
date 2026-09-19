@@ -93,6 +93,9 @@ class CinesaOutcome:
     # Cinesa outage, this needs the owner's hands and will break every later
     # mint, so it makes the run exit non-zero as well as feeding the streak.
     integrity_failure: bool = False
+    # None means the profile lock could not be classified. Only True/False is
+    # authoritative enough to preserve or retire pending owner advice.
+    token_profile_stuck: bool | None = None
 
 
 # ------------------------------------------------------------------ cadence
@@ -239,6 +242,7 @@ def track_profile_leak(
     """
     cin = ctx.state.setdefault("cinesa", {})
     status = cdp.profile_lock_status(ctx.cfg.cinesa_chrome_profile, budget)
+    out.token_profile_stuck = status
     if status is False:
         if cin.pop("leak_since", None):
             log.info("cinesa: the watcher profile is free again — leak cleared")

@@ -142,6 +142,7 @@ def _run_source_jobs(
         pathe_health=pathe_out.health,
         cinesa_snapshot=cinesa_out.snapshot,
         cinesa_health=cinesa_out.health,
+        cinesa_token_stuck=cinesa_out.token_profile_stuck,
     )
     return sent_any, pathe_out.snapshot
 

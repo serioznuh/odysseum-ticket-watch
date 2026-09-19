@@ -86,7 +86,7 @@ A single-user Telegram watcher covering **two independent targets**:
   stay independent: an uncertain sale alert cannot freeze its opening or reminder ladder.
   Only complete, positive contradictory evidence retires a member. Per-member conditions and
   expiries preserve unaffected merged siblings across supersession, acknowledgement and expiry.
-  BOOK NOW supersedes CINEMA LISTED and BLIND supersedes DEGRADED; partial evidence stays unknown.
+  Stable condition facts define delivery identity; cleared locks and withdrawn openings retire stale advice.
   Overlapping hosts can still both send: this is not exactly-once or cross-host exclusion.
 - **Pathé failure model** — catalogue failures still blind the check, while
   every best-effort detail/showtimes result explicitly distinguishes data,
