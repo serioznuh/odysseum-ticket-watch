@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "operation": "codex-round",
+  "loopId": "ae3b041a-e293-40bd-aa20-d6582cc27561",
+  "round": 2,
+  "attempt": 1,
+  "outcome": "fail",
+  "exitCode": 1,
+  "headBefore": "f1b5e1cc04443c6ead3beea9bc1c400e1dbc1202"
+}

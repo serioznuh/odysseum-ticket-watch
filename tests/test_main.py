@@ -328,7 +328,7 @@ class PatheCheckRunner:
 
         def fake_send(cfg, text, **kw):
             self.sent.append(text)
-            return delivered
+            return delivered(text) if callable(delivered) else delivered
 
         self.monkeypatch.setattr(notify, "send_telegram", fake_send)
         assert (
@@ -521,23 +521,90 @@ def test_failed_pathe_one_shot_alerts_are_retried_on_the_next_run(
     st = runner.run(snap, delivered=False)
     assert st["shows_seen"] == []
     assert st["formats_seen"] == {}
-    # `sales` used to be recorded here regardless ("sale truth is ungated"),
-    # which armed the reminder ladder one run sooner — at the price of marking
-    # the opening known, so SALE_DATE was never raised again and the single
-    # alert this watcher exists for was lost to one failed send.
+    # The delivered `sales` baseline stays frozen so SALE_DATE remains
+    # eligible, while current observation still arms the independent ladder.
     assert st["sales"] == {}
+    assert st["sale_target"] == sale
     assert st["tickets_available"] is True  # current session truth is still ungated
 
     st = runner.run(snap, delivered=True)
     assert st["shows_seen"] == [show["slug"]]
     assert st["formats_seen"] == {show["slug"]: ["imax70"]}
     assert st["sales"] == {show["slug"]: sale}
-    assert st["sale_target"] == sale  # the ladder is armed, one run later
+    assert st["sale_target"] == sale
     assert set(st["alerts"]) == {
         f"new_show:{show['slug']}",
         f"tickets:{show['slug']}:imax70",
         f"sale:{show['slug']}:{sale}",
     }
+
+
+def test_uncertain_sale_alert_still_arms_and_delivers_the_reminder_ladder(
+    tmp_path, monkeypatch
+):
+    """A lost Telegram response quarantines only that message, not the fresh
+    Pathé observation which drives the independent reminder ladder."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    sale = (datetime.now(TZ_PARIS) + timedelta(minutes=10)).isoformat()
+    show = {
+        "slug": "dune-troisieme-partie",
+        "title": "Dune : Troisième partie",
+        "salesOpeningDatetime": sale,
+        "isMovie": True,
+    }
+    outcomes = iter(
+        (
+            notify.SendResult("uncertain"),
+            notify.SendResult("confirmed", 314),
+        )
+    )
+
+    st = runner.run(
+        Snapshot(matched_shows=[show]), delivered=lambda _text: next(outcomes)
+    )
+
+    assert len(runner.sent) == 2
+    assert st["sales"] == {}
+    assert st["sale_target"] == sale
+    assert "15" in st["reminders_sent"][sale]
+    assert any(
+        record["status"] == "uncertain" and f"sale:{show['slug']}:{sale}" in record["keys"]
+        for record in st["outbox"].values()
+    )
+
+
+def test_fresh_opening_supersedes_pending_alert_before_outbox_recovery(
+    tmp_path, monkeypatch
+):
+    """A failed old alert must not be replayed before polling discovers that
+    Pathé moved the opening and enqueues the corrected message."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    slug = "dune-troisieme-partie"
+    old = "2026-10-01T09:00:00+02:00"
+    moved = "2026-10-02T09:00:00+02:00"
+
+    def snapshot(sale):
+        return Snapshot(
+            matched_shows=[
+                    {
+                        "slug": slug,
+                        "title": "Dune : Troisième partie",
+                        "salesOpeningDatetime": sale,
+                        "isMovie": True,
+                }
+            ]
+        )
+
+    first = runner.run(snapshot(old), delivered=False)
+    assert first["outbox"]
+    assert first["alerts"] == {}
+
+    second = runner.run(snapshot(moved), delivered=True)
+
+    assert len(runner.sent) == 1
+    assert f"sale:{slug}:{old}" not in second["alerts"]
+    assert f"sale:{slug}:{moved}" in second["alerts"]
+    assert second["outbox"] == {}
 
 
 def test_stale_period_fires_once_at_the_threshold_then_daily():

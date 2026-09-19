@@ -78,16 +78,16 @@ A single-user Telegram watcher covering **two independent targets**:
   `state/state.json` is only the first-run seed. Both halves call
   `watcher/state_sync.py` before and after a pass; Git plumbing commits the state
   ref without checking it out, so state never dirties the code worktree.
-  Validated three-way reconciliation unions confirmed attempts and acknowledged baselines;
-  unsafe conflicts fail closed, rejected pushes retain receipts, and one lock spans a firing.
+  Reconciliation unions receipts/baselines; conflicts fail closed and pushes retain receipts.
 - **Delivery boundary** — every alert, reminder and heartbeat is saved to an
-  outbox before Telegram is called. Confirmation stores every member key plus
-  Telegram's message ID, then advances gated baselines. Definite failures remain pending.
-  A timeout or interrupted attempt is explicitly `uncertain` and is not replayed
-  automatically: avoiding a duplicate takes precedence over guessing it failed.
-  Moved openings, later reminder rungs and changed availability retire stale work.
-  Claims record attempts, but two overlapping hosts can still both send: this is neither
-  exactly-once nor cross-host exclusion. Credentials and raw responses are never stored.
+  outbox before Telegram is called. Confirmation stores every member key plus Telegram's
+  message ID, then advances gated baselines. Definite failures remain pending. A timeout
+  or interrupted attempt is `uncertain` and is not replayed automatically: avoiding a
+  duplicate takes precedence over guessing it failed. Current observations remain
+  independent: an uncertain sale alert cannot freeze the opening or its reminder ladder.
+  On check runs, fresh polling supersedes stale pending advice before safe pending work is
+  recovered. Moved openings, reminder rungs and changed availability retire stale work first.
+  Overlapping hosts can still both send: this is not exactly-once or cross-host exclusion.
 - **Pathé failure model** — catalogue failures still blind the check, while
   every best-effort detail/showtimes result explicitly distinguishes data,
   authoritative emptiness, expected refusal and unexpected failure. One bad

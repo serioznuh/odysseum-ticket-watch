@@ -18,6 +18,20 @@ def fresh_state() -> dict:
     return deepcopy(DEFAULT_STATE)
 
 
+def pending_alert(key: str) -> dict:
+    return {
+        "keys": [key],
+        "kinds": ["SALE_DATE"],
+        "text": "sale alert",
+        "silent": False,
+        "created_at": "2026-09-17T10:00:00+02:00",
+        "topics": ["sale:dune"],
+        "status": "pending",
+        "ack": {"type": "alerts", "keys": [key]},
+        "force": False,
+    }
+
+
 def test_merge_preserves_both_delivery_histories_and_acknowledged_baselines():
     base = fresh_state()
     upstream = fresh_state()
@@ -83,7 +97,55 @@ def test_merge_unions_same_receipt_keys_and_keeps_earliest_delivery_proof():
     assert merged["formats_seen"]["dune"] == ["imax", "imax70", "other"]
 
 
-def test_sales_baseline_is_not_lost_when_only_one_side_still_has_it():
+def test_confirmed_receipt_wins_over_other_sides_still_pending_outbox_record():
+    """OTW-14 reconciliation must never resurrect work after another host
+    confirmed it, even when the local snapshot still contains the base item."""
+    target = "2026-12-01T09:00:00+01:00"
+    key = f"sale:dune:{target}"
+    delivery_id = "telegram:pending-sale"
+    base = fresh_state()
+    base["outbox"][delivery_id] = pending_alert(key)
+    local = deepcopy(base)
+    upstream = deepcopy(base)
+    upstream["outbox"].clear()
+    upstream["alerts"][key] = "2026-09-17T10:05:00+02:00"
+    upstream["sales"]["dune"] = target
+    upstream["delivery_receipts"]["attempt-upstream"] = {
+        "delivery_id": delivery_id,
+        "keys": [key],
+        "delivered_at": "2026-09-17T10:05:00+02:00",
+        "telegram_message_id": 42,
+    }
+
+    merged = merge_states(base, upstream, local)
+
+    assert merged["outbox"] == {}
+    assert merged["alerts"][key] == "2026-09-17T10:05:00+02:00"
+    assert merged["sales"] == {"dune": target}
+    assert merged["delivery_receipts"] == upstream["delivery_receipts"]
+
+
+def test_merge_unions_independent_delivery_receipts_from_both_hosts():
+    base = fresh_state()
+    upstream = fresh_state()
+    local = fresh_state()
+    upstream["delivery_receipts"]["cloud-attempt"] = {
+        "delivery_id": "telegram:cloud",
+        "keys": ["cloud-key"],
+        "delivered_at": "2026-09-17T10:00:00+02:00",
+    }
+    local["delivery_receipts"]["local-attempt"] = {
+        "delivery_id": "telegram:local",
+        "keys": ["local-key"],
+        "delivered_at": "2026-09-17T10:01:00+02:00",
+    }
+
+    merged = merge_states(base, upstream, local)
+
+    assert set(merged["delivery_receipts"]) == {"cloud-attempt", "local-attempt"}
+
+
+def test_sales_receipt_is_preserved_while_current_observation_can_clear():
     target = "2026-12-01T09:00:00+01:00"
     base = fresh_state()
     base["alerts"][f"sale:dune:{target}"] = "2026-10-01T10:00:00+02:00"
@@ -99,7 +161,7 @@ def test_sales_baseline_is_not_lost_when_only_one_side_still_has_it():
 
     assert merged["alerts"] == base["alerts"]
     assert merged["sales"] == base["sales"]
-    assert merged["sale_target"] == target
+    assert merged["sale_target"] is None
 
 
 def test_concurrent_sale_changes_keep_the_most_recently_acknowledged_baseline():
@@ -108,27 +170,24 @@ def test_concurrent_sale_changes_keep_the_most_recently_acknowledged_baseline():
     local_sale = "2026-11-03T09:00:00+01:00"
     base = fresh_state()
     base["sales"] = {"dune": old}
-    base["sale_target"] = old
     upstream = deepcopy(base)
     upstream["sales"]["dune"] = upstream_sale
-    upstream["sale_target"] = upstream_sale
     upstream["alerts"][f"sale:dune:{upstream_sale}"] = "2026-10-01T10:00:00+02:00"
     local = deepcopy(base)
     local["sales"]["dune"] = local_sale
-    local["sale_target"] = local_sale
     local["alerts"][f"sale:dune:{local_sale}"] = "2026-10-01T10:05:00+02:00"
 
     merged = merge_states(base, upstream, local, now=MERGE_NOW)
 
     assert merged["sales"] == {"dune": local_sale}
-    assert merged["sale_target"] == local_sale
+    assert merged["sale_target"] is None
     assert set(merged["alerts"]) == {
         f"sale:dune:{upstream_sale}",
         f"sale:dune:{local_sale}",
     }
 
 
-def test_concurrent_targets_choose_earliest_merged_upcoming_opening():
+def test_concurrent_current_observations_fail_closed():
     october = "2026-10-10T09:00:00+02:00"
     november = "2026-11-10T09:00:00+01:00"
     base = fresh_state()
@@ -146,13 +205,8 @@ def test_concurrent_targets_choose_earliest_merged_upcoming_opening():
         "2026-09-17T10:05:00+02:00"
     )
 
-    merged = merge_states(base, upstream, local, now=MERGE_NOW)
-
-    assert merged["sales"] == {
-        "november-listing": november,
-        "october-listing": october,
-    }
-    assert merged["sale_target"] == october
+    with pytest.raises(StateMergeError, match="sale_target changed differently"):
+        merge_states(base, upstream, local, now=MERGE_NOW)
 
 
 def test_agreed_elapsed_target_survives_for_open_now_reminder():
@@ -185,7 +239,7 @@ def test_divergent_elapsed_targets_fail_closed():
     local["sales"] = {"later": later}
     local["sale_target"] = later
 
-    with pytest.raises(StateMergeError, match="multiple elapsed candidates"):
+    with pytest.raises(StateMergeError, match="sale_target changed differently"):
         merge_states(base, upstream, local, now=MERGE_NOW)
 
 

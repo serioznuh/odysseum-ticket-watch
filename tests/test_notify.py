@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import ClassVar
 
 import httpx
+import pytest
 
 from watcher import notify
 from watcher.detect import TZ_PARIS
@@ -84,6 +85,27 @@ def test_read_timeout_is_uncertain_and_is_not_retried(monkeypatch):
 
     assert notify.send_telegram(LiveCfg, "hello", dry_run=False).status == "uncertain"
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("error_type", [httpx.ReadError, httpx.RemoteProtocolError])
+def test_lost_response_transport_errors_are_uncertain_and_not_retried(
+    monkeypatch, error_type
+):
+    class LiveCfg(Cfg):
+        telegram_token = "token"
+        telegram_chat_id = "chat"
+
+    calls = []
+
+    def lost_response(*args, **kwargs):
+        calls.append(1)
+        request = httpx.Request("POST", "https://api.telegram.org")
+        raise error_type("response lost", request=request)
+
+    monkeypatch.setattr(httpx, "post", lost_response)
+
+    assert notify.send_telegram(LiveCfg, "hello", dry_run=False).status == "uncertain"
+    assert calls == [1]
 
 
 def test_escaping_keeps_apostrophes_literal_but_neutralises_markup():

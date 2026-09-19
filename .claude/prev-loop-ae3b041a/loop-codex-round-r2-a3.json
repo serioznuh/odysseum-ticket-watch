@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "operation": "codex-round",
+  "loop_id": "ae3b041a-e293-40bd-aa20-d6582cc27561",
+  "started": 1789636497,
+  "activity": 1789636497,
+  "status": "in-progress",
+  "completed": [],
+  "active_step": "codex-dispatch"
+}

@@ -14,6 +14,8 @@ The order *is* the contract (OTW-19):
    skipped, disabled or outright broken cannot take the rest of the pass with it.
 3. **Delivery** of this pass's findings (dedup, coalescing, durable outbox,
    sending and immediate receipt persistence), then the baselines they gate.
+   Fresh findings get the first chance to supersede stale pending work before
+   safe pending records from an earlier run are recovered.
 4. **Due reminders again**, recomputed against a fresh clock and the
    observations that just landed. `reminders_sent` is the dedup record, so a
    rung sent in step 1 cannot be sent twice.
@@ -33,7 +35,7 @@ from typing import Callable
 from . import delivery, jobs, pathe
 from . import state as state_mod
 from .budget import Budget
-from .detect import Finding
+from .detect import Finding, Snapshot
 from .jobs import RunContext
 
 log = logging.getLogger("watcher.runner")
@@ -60,8 +62,7 @@ def _run_source_jobs(
     now: datetime,
     polling: Budget,
     failed: list[str],
-    sent_before_sources: bool,
-) -> None:
+) -> tuple[bool, Snapshot | None]:
     """The check half: poll the sources, deliver what they found, move the
     baselines those alerts gate."""
     try:
@@ -69,12 +70,12 @@ def _run_source_jobs(
         if not due and not ctx.cfg.cinesa_enabled:
             # Nothing to poll. The original zero-network no-op, and it still
             # falls through to the ladder, which the local half owns (OTW-15).
-            return
+            return False, None
         client = pathe.make_client()
     except Exception:
         log.exception("source setup failed")
         failed.append("sources")
-        return
+        return False, None
 
     findings: list[Finding] = []
     pathe_out = jobs.PatheOutcome()
@@ -122,17 +123,16 @@ def _run_source_jobs(
             # owner, and every later mint will trip over the profile lock.
             failed.append("cinesa-cleanup")
 
-    sent_any = sent_before_sources
     force_keys = {pathe_out.error_key} if pathe_out.error_key else set()
     delivered = _guard(
         failed, "delivery", jobs.deliver, ctx, findings, now, force_keys
     )
-    sent_any = bool(delivered) or sent_any
+    sent_any = bool(delivered)
 
     _guard(
         failed, "baselines", jobs.advance_baselines, ctx, pathe_out, cinesa_out, findings, now
     )
-    _guard(failed, "heartbeat", jobs.run_heartbeat_job, ctx, pathe_out.snapshot, now, sent_any)
+    return sent_any, pathe_out.snapshot
 
 
 def execute(ctx: RunContext, state_path: str) -> int:
@@ -147,11 +147,6 @@ def execute(ctx: RunContext, state_path: str) -> int:
     # Reminders first, before a single request. See this module's docstring.
     _guard(failed, "reminder", jobs.run_reminder_job, ctx, now)
 
-    # A prior run may have saved other pending work and stopped before Telegram
-    # was called.  Retry it only after the time-critical ladder has had its
-    # first turn; an interrupted attempt is quarantined instead of replayed.
-    recovered = _guard(failed, "outbox-recovery", delivery.recover, ctx, now)
-
     # A failed pre-run rebase leaves a durable marker and then deliberately
     # lets this pass continue. Surface it before polling, but never ahead of a
     # due reminder: reminder timing remains the coordinator's first contract.
@@ -159,7 +154,25 @@ def execute(ctx: RunContext, state_path: str) -> int:
 
     if ctx.mode == "check":
         polling = ctx.budget(jobs.POLLING_BUDGET_SECONDS, "polling")
-        _run_source_jobs(ctx, now, polling, failed, bool(recovered))
+        sent_now, pathe_snapshot = _run_source_jobs(ctx, now, polling, failed)
+        # Polling and delivery of the current observations deliberately happen
+        # before recovery. Their topic policy can retire a failed message whose
+        # opening or availability changed while it was pending; replaying first
+        # would send stale advice and then its correction back-to-back.
+        recovered = _guard(failed, "outbox-recovery", delivery.recover, ctx, now)
+        _guard(
+            failed,
+            "heartbeat",
+            jobs.run_heartbeat_job,
+            ctx,
+            pathe_snapshot,
+            now,
+            sent_now or bool(recovered),
+        )
+    else:
+        # Remind-only runs have no source observations that could supersede the
+        # queue, so safe pending work can be recovered immediately.
+        _guard(failed, "outbox-recovery", delivery.recover, ctx, now)
 
     # Read the clock AGAIN. Polling is budgeted but still not free, and a run
     # that started at T-16 and reaches this line at T+5 must send the "sale is

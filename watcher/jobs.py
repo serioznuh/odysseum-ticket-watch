@@ -66,6 +66,10 @@ class RunContext:
     state_writer: Callable[[str, dict], None] | None = None
     monotonic: Callable[[], float] = time.monotonic
     sleeper: Callable[[float], None] = time.sleep
+    # Process-local guard: source delivery and later outbox recovery share one
+    # pass, but a definite failure must wait for the next firing rather than
+    # being attempted twice back-to-back.
+    delivery_attempts: set[str] = field(default_factory=set)
 
     def budget(self, seconds: float, label: str) -> Budget:
         return Budget(seconds, monotonic=self.monotonic, sleep=self.sleeper, label=label)

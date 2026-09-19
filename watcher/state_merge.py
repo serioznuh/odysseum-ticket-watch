@@ -13,7 +13,7 @@ import json
 import sys
 from collections.abc import Iterable
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -242,65 +242,6 @@ def _merge_sales(
     return merged
 
 
-def _validate_sale_target(state: dict, label: str) -> str | None:
-    target = state["sale_target"]
-    if target is not None and target not in state["sales"].values():
-        raise StateMergeError(f"{label} sale_target is not present in {label} sales")
-    return target
-
-
-def _merge_sale_target(
-    base: dict,
-    upstream: dict,
-    local: dict,
-    merged_sales: dict,
-    now: datetime,
-) -> str | None:
-    """Reconcile selected targets that are still represented after merging.
-
-    Each side's target already encodes which sales belong to selected listings,
-    which the state file does not otherwise retain.  Taking the union of those
-    two candidates and then the earliest future value prevents a later-delivered,
-    later opening from hiding an earlier ladder.  One agreed or carried-forward
-    target remains valid after opening so the six-hour "open now" grace survives.
-    Ambiguous clears/replacements or multiple elapsed targets fail closed.
-    """
-    old = _validate_sale_target(base, "base")
-    theirs = _validate_sale_target(upstream, "upstream")
-    ours = _validate_sale_target(local, "local")
-
-    if (theirs is None) != (ours is None):
-        remaining = ours if theirs is None else theirs
-        if old is not None and remaining != old:
-            raise StateMergeError(
-                "sale_target was concurrently cleared and replaced; refusing to guess"
-            )
-
-    merged_values = set(merged_sales.values())
-    candidates = {
-        target
-        for target in (theirs, ours)
-        if target is not None and target in merged_values
-    }
-    if len(candidates) <= 1:
-        # update_from_snapshot deliberately retains an elapsed target while it
-        # is still in sales: due_reminders needs it for the six-hour "open now"
-        # window.  A merge must preserve that same invariant.
-        return next(iter(candidates), None)
-
-    aware_now = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
-    upcoming = [
-        target
-        for target in candidates
-        if _parse_timestamp(target) > aware_now
-    ]
-    if upcoming:
-        return min(upcoming, key=_parse_timestamp)
-    raise StateMergeError(
-        "sale_target has multiple elapsed candidates; refusing to guess"
-    )
-
-
 def merge_states(
     base: dict,
     upstream: dict,
@@ -324,7 +265,6 @@ def merge_states(
         "formats_seen",
         "outbox",
         "reminders_sent",
-        "sale_target",
         "sales",
         "shows_seen",
         "tickets_available",
@@ -352,13 +292,6 @@ def merge_states(
     )
     merged["sales"] = _merge_sales(
         base["sales"], upstream["sales"], local["sales"], upstream, local
-    )
-    merged["sale_target"] = _merge_sale_target(
-        base,
-        upstream,
-        local,
-        merged["sales"],
-        now or datetime.now(timezone.utc),
     )
     # This baseline only ever moves False -> True.  Once tickets were observed
     # and any gated alert was delivered, a concurrent stale False must not undo

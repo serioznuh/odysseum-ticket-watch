@@ -268,6 +268,13 @@ def send_telegram(
             # request.  Retrying automatically would risk a duplicate.
             log.error("telegram send outcome is uncertain: %s", msg)
             return SendResult("uncertain")
+        except (httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError) as e:
+            # The connection was established and may have carried the POST;
+            # losing the response (or failing mid-write) cannot prove Telegram
+            # rejected it.  An automatic retry could create an immediate copy.
+            msg = str(e).replace(cfg.telegram_token, "***")
+            log.error("telegram send outcome is uncertain: %s", msg)
+            return SendResult("uncertain")
         except httpx.HTTPError as e:
             # httpx exception messages include the URL — redact the token.
             msg = str(e).replace(cfg.telegram_token, "***")

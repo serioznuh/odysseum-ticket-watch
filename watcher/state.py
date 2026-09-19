@@ -33,7 +33,9 @@ DEFAULT_STATE: dict = {
     # chat ids and raw API responses never belong in either collection.
     "outbox": {},
     "delivery_receipts": {},
-    "sale_target": None,   # earliest upcoming salesOpeningDatetime (ISO)
+    # Current observed opening used by the reminder ladder.  Unlike `sales`,
+    # this is not a delivery acknowledgement baseline.
+    "sale_target": None,
     "tickets_available": False,
     "failure_streak": 0,
     "error_alerted": False,
@@ -528,9 +530,9 @@ def update_from_snapshot(
     `advance_sales=False` does the same for `sales`, which is the baseline
     behind SALE_DATE: recording an opening is what makes it "known", so doing
     that after a failed send retired the sale alert — the watcher's whole
-    point — permanently. It is a separate flag because the two baselines fail
-    independently, and holding `sales` back also holds back `sale_target` and
-    the reminder ladder until the next run.
+    point — permanently. `sale_target` is separate current-observation state:
+    it still follows the snapshot so an uncertain sale alert cannot disable
+    the reminder ladder.
     """
     if not advance_one_shot:
         log.info(
@@ -565,15 +567,20 @@ def update_from_snapshot(
                 state["formats_seen"][slug] = sorted(fmts)
             state["tickets_available"] = True
 
-    future = []
-    shows = {s.get("slug"): s for s in snap.matched_shows}
-    selected_sales = {
-        slug: iso for slug, iso in state["sales"].items()
-        if detect.selected_listing(shows.get(slug, {"slug": slug}), cfg)
+    # The ladder follows what Pathé currently says, independently of whether
+    # the SALE_DATE notification was confirmed.  `sales` above remains the
+    # delivered baseline used by analyze_pathe, so the alert stays eligible.
+    observed_sales = {
+        show["slug"]: show["salesOpeningDatetime"]
+        for show in snap.matched_shows
+        if show.get("slug")
+        and show.get("salesOpeningDatetime")
+        and detect.selected_listing(show, cfg)
     }
-    if state.get("sale_target") not in selected_sales.values():
+    if state.get("sale_target") not in observed_sales.values():
         state["sale_target"] = None
-    for iso in selected_sales.values():
+    future = []
+    for iso in observed_sales.values():
         dt = detect.parse_iso(iso)
         if dt and detect.as_aware(dt) > now:
             future.append((detect.as_aware(dt), iso))

@@ -118,8 +118,9 @@ def _retire_obsolete(ctx: Any, now: datetime, topics: list[str], keys: list[str]
 
 def _attempt(ctx: Any, delivery_id: str, now: datetime) -> bool:
     record = ctx.state["outbox"][delivery_id]
-    if record["status"] != "pending":
+    if record["status"] != "pending" or delivery_id in ctx.delivery_attempts:
         return False
+    ctx.delivery_attempts.add(delivery_id)
 
     claim_token = uuid.uuid4().hex
     record["status"] = "sending"

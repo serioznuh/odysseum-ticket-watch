@@ -359,8 +359,8 @@ def reminders_cover(
 ) -> bool:
     """Whether the reminder ladder will actually fire for this opening.
 
-    `due_reminders` tracks a single `sale_target` — the earliest *future*
-    opening across selected listings — and stops once that format is
+    `due_reminders` tracks the current observed `sale_target` — the earliest
+    *future* opening across selected listings — and stops once that format is
     known to be bookable. Announcing "reminders set" for anything else was a
     promise the watcher does not keep.
     """
