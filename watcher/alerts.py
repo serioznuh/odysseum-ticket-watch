@@ -17,7 +17,7 @@ import os
 import re
 from datetime import datetime, timedelta
 
-from . import cdp, detect, notify, state_sync
+from . import cdp, detect, state_sync
 from . import state as state_mod
 from .detect import TZ_PARIS, Finding
 
@@ -194,8 +194,12 @@ def build_state_sync_failure_finding(cfg, marker: dict[str, str]) -> Finding:
     )
 
 
-def record_pathe_failure(cfg, st: dict, error: str, now: datetime, *, dry_run: bool) -> bool:
-    """Advance the shared Pathé supervision streak and alert at its threshold."""
+def record_pathe_failure(cfg, st: dict, error: str, now: datetime) -> Finding | None:
+    """Advance Pathé supervision and return the alert owed at its threshold.
+
+    Delivery belongs to the durable outbox.  Keeping it out of this bookkeeping
+    function ensures the failure alert is persisted before Telegram sees it.
+    """
     previous_partial = str(st.get("last_error", "")).startswith(
         detect.PARTIAL_PATHE_FAILURE
     )
@@ -230,16 +234,8 @@ def record_pathe_failure(cfg, st: dict, error: str, now: datetime, *, dry_run: b
         and not state_mod.is_check_fresh(st, 6.0, now)
         and not st.get("error_alerted")
     ):
-        finding = build_error_finding(cfg, st, error, now)
-        if notify.send_telegram(
-            cfg,
-            notify.render_finding(finding),
-            dry_run=dry_run,
-            silent=notify.is_silent(cfg, finding.kind),
-        ):
-            st["error_alerted"] = True
-            return True
-    return False
+        return build_error_finding(cfg, st, error, now)
+    return None
 
 
 def stale_period(blind: timedelta, stale_hours: int) -> int:

@@ -5,6 +5,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import ClassVar
 
+import httpx
+import pytest
+
 from watcher import notify
 from watcher.detect import TZ_PARIS
 
@@ -38,8 +41,71 @@ def test_silent_kinds_configurable():
 
 
 def test_dry_run_send_accepts_silent_flag():
-    assert notify.send_telegram(Cfg, "hello", dry_run=True, silent=True) is True
-    assert notify.send_telegram(Cfg, "hello", dry_run=True) is True
+    assert notify.send_telegram(Cfg, "hello", dry_run=True, silent=True).status == "confirmed"
+    assert notify.send_telegram(Cfg, "hello", dry_run=True).status == "confirmed"
+
+
+def test_confirmed_send_returns_only_the_message_id_as_a_receipt(monkeypatch):
+    class LiveCfg(Cfg):
+        telegram_token = "token"
+        telegram_chat_id = "chat"
+
+    class Response:
+        status_code = 200
+        text = '{"ok": true}'
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {"ok": True, "result": {"message_id": 123, "chat": {"id": 999}}}
+
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: Response())
+
+    assert notify.send_telegram(LiveCfg, "hello", dry_run=False) == notify.SendResult(
+        "confirmed", 123
+    )
+
+
+def test_read_timeout_is_uncertain_and_is_not_retried(monkeypatch):
+    class LiveCfg(Cfg):
+        telegram_token = "token"
+        telegram_chat_id = "chat"
+
+    calls = []
+
+    def timeout(*args, **kwargs):
+        calls.append(1)
+        request = httpx.Request("POST", "https://api.telegram.org")
+        raise httpx.ReadTimeout("response lost", request=request)
+
+    monkeypatch.setattr(httpx, "post", timeout)
+
+    assert notify.send_telegram(LiveCfg, "hello", dry_run=False).status == "uncertain"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("error_type", [httpx.ReadError, httpx.RemoteProtocolError])
+def test_lost_response_transport_errors_are_uncertain_and_not_retried(
+    monkeypatch, error_type
+):
+    class LiveCfg(Cfg):
+        telegram_token = "token"
+        telegram_chat_id = "chat"
+
+    calls = []
+
+    def lost_response(*args, **kwargs):
+        calls.append(1)
+        request = httpx.Request("POST", "https://api.telegram.org")
+        raise error_type("response lost", request=request)
+
+    monkeypatch.setattr(httpx, "post", lost_response)
+
+    assert notify.send_telegram(LiveCfg, "hello", dry_run=False).status == "uncertain"
+    assert calls == [1]
 
 
 def test_escaping_keeps_apostrophes_literal_but_neutralises_markup():

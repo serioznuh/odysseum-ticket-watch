@@ -299,7 +299,7 @@ def test_dry_run_migrates_only_in_memory_and_leaves_state_bytes_unchanged(tmp_pa
     assert result == 0
     assert state.read_bytes() == before
     assert json.loads(state.read_text())["version"] == 1
-    assert CURRENT_STATE_VERSION == 3
+    assert CURRENT_STATE_VERSION == 4
 
 
 class PatheCheckRunner:
@@ -328,7 +328,7 @@ class PatheCheckRunner:
 
         def fake_send(cfg, text, **kw):
             self.sent.append(text)
-            return delivered
+            return delivered(text) if callable(delivered) else delivered
 
         self.monkeypatch.setattr(notify, "send_telegram", fake_send)
         assert (
@@ -521,23 +521,423 @@ def test_failed_pathe_one_shot_alerts_are_retried_on_the_next_run(
     st = runner.run(snap, delivered=False)
     assert st["shows_seen"] == []
     assert st["formats_seen"] == {}
-    # `sales` used to be recorded here regardless ("sale truth is ungated"),
-    # which armed the reminder ladder one run sooner — at the price of marking
-    # the opening known, so SALE_DATE was never raised again and the single
-    # alert this watcher exists for was lost to one failed send.
+    # The delivered `sales` baseline stays frozen so SALE_DATE remains
+    # eligible, while current observation still arms the independent ladder.
     assert st["sales"] == {}
+    assert st["sale_target"] == sale
     assert st["tickets_available"] is True  # current session truth is still ungated
 
     st = runner.run(snap, delivered=True)
     assert st["shows_seen"] == [show["slug"]]
     assert st["formats_seen"] == {show["slug"]: ["imax70"]}
     assert st["sales"] == {show["slug"]: sale}
-    assert st["sale_target"] == sale  # the ladder is armed, one run later
+    assert st["sale_target"] == sale
     assert set(st["alerts"]) == {
         f"new_show:{show['slug']}",
         f"tickets:{show['slug']}:imax70",
         f"sale:{show['slug']}:{sale}",
     }
+
+
+def test_uncertain_sale_alert_still_arms_and_delivers_the_reminder_ladder(
+    tmp_path, monkeypatch
+):
+    """A lost Telegram response quarantines only that message, not the fresh
+    Pathé observation which drives the independent reminder ladder."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    sale = (datetime.now(TZ_PARIS) + timedelta(minutes=10)).isoformat()
+    show = {
+        "slug": "dune-troisieme-partie",
+        "title": "Dune : Troisième partie",
+        "salesOpeningDatetime": sale,
+        "isMovie": True,
+    }
+    outcomes = iter(
+        (
+            notify.SendResult("uncertain"),
+            notify.SendResult("confirmed", 314),
+        )
+    )
+
+    st = runner.run(
+        Snapshot(matched_shows=[show]), delivered=lambda _text: next(outcomes)
+    )
+
+    assert len(runner.sent) == 2
+    assert st["sales"] == {}
+    assert st["sale_target"] == sale
+    assert "15" in st["reminders_sent"][sale]
+    assert any(
+        record["status"] == "uncertain" and f"sale:{show['slug']}:{sale}" in record["keys"]
+        for record in st["outbox"].values()
+    )
+
+
+def test_fresh_opening_supersedes_pending_alert_before_outbox_recovery(
+    tmp_path, monkeypatch
+):
+    """A failed old alert must not be replayed before polling discovers that
+    Pathé moved the opening and enqueues the corrected message."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    slug = "dune-troisieme-partie"
+    old = "2026-10-01T09:00:00+02:00"
+    moved = "2026-10-02T09:00:00+02:00"
+
+    def snapshot(sale):
+        return Snapshot(
+            matched_shows=[
+                    {
+                        "slug": slug,
+                        "title": "Dune : Troisième partie",
+                        "salesOpeningDatetime": sale,
+                        "isMovie": True,
+                }
+            ]
+        )
+
+    first = runner.run(snapshot(old), delivered=False)
+    assert first["outbox"]
+    assert first["alerts"] == {}
+
+    second = runner.run(snapshot(moved), delivered=True)
+
+    assert len(runner.sent) == 1
+    assert f"sale:{slug}:{old}" not in second["alerts"]
+    assert f"sale:{slug}:{moved}" in second["alerts"]
+    assert second["outbox"] == {}
+
+
+def test_pending_reminder_waits_for_polling_and_is_retired_when_opening_moves(
+    tmp_path, monkeypatch
+):
+    """Newly due reminders still lead the run, but a prior failed attempt
+    must wait for Pathé to confirm that its target is still current."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(NOW, NOW))
+    old = (NOW + timedelta(minutes=10)).isoformat()
+    moved = (NOW + timedelta(days=2)).isoformat()
+
+    def snapshot(sale):
+        return Snapshot(
+            matched_shows=[
+                {
+                    "slug": "dune-troisieme-partie",
+                    "title": "Dune : Troisième partie",
+                    "salesOpeningDatetime": sale,
+                    "isMovie": True,
+                }
+            ]
+        )
+
+    outcomes = iter((notify.SendResult("confirmed", 10), notify.SendResult("failed")))
+    first = runner.run(snapshot(old), delivered=lambda _text: next(outcomes))
+    pending = list(first["outbox"].values())
+    assert len(pending) == 1
+    assert pending[0]["ack"]["type"] == "reminder"
+    assert pending[0]["ack"]["target"] == old
+
+    second = runner.run(snapshot(moved), delivered=True)
+
+    assert len(runner.sent) == 1
+    assert "Sale time CHANGED" in runner.sent[0]
+    assert second["sale_target"] == moved
+    assert all(
+        record["ack"].get("target") != old
+        for record in second["outbox"].values()
+        if record["ack"]["type"] == "reminder"
+    )
+
+
+def test_failed_open_ping_survives_healthy_poll_for_local_and_cloud_retry(
+    tmp_path, monkeypatch
+):
+    """A reported opening stays live through the six-hour ping window after a
+    failed send, both for the next local check and the cloud failover."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    now = NOW
+    target = (now - timedelta(minutes=30)).isoformat()
+    slug = "dune-troisieme-partie"
+    show = {
+        "slug": slug,
+        "title": "Dune : Troisième partie",
+        "salesOpeningDatetime": target,
+        "isMovie": True,
+    }
+    snapshot = Snapshot(
+        matched_shows=[show],
+        listing_results={
+            slug: {
+                "detail": detect.FetchResult.authoritative(show),
+                "showtimes": detect.FetchResult.authoritative({}),
+            }
+        },
+    )
+    state = json.loads(runner.state.read_text(encoding="utf-8"))
+    state["sale_target"] = target
+    state["sales"] = {slug: target}
+    state["shows_seen"] = [slug]
+    runner.state.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(now))
+
+    failed = runner.run(snapshot, delivered=False)
+    assert failed["sale_target"] == target
+    assert len(failed["outbox"]) == 1
+    pending = runner.state.read_bytes()
+
+    local = runner.run(snapshot, delivered=True)
+    assert len(runner.sent) == 1
+    assert "Scheduled sale time reached" in runner.sent[0]
+    assert "open" in local["reminders_sent"][target]
+
+    runner.state.write_bytes(pending)
+    cloud_sent = []
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda cfg, text, **kw: cloud_sent.append(text) or True,
+    )
+    assert cli.run(
+        [
+            "--config",
+            str(runner.config),
+            "--state",
+            str(runner.state),
+            "--mode",
+            "remind",
+            "--reminder-grace-minutes",
+            "25",
+        ]
+    ) == 0
+    assert len(cloud_sent) == 1
+    assert "Scheduled sale time reached" in cloud_sent[0]
+    cloud = json.loads(runner.state.read_text(encoding="utf-8"))
+    assert "open" in cloud["reminders_sent"][target]
+
+
+def test_passed_open_ping_retries_while_new_future_ladder_arms(
+    tmp_path, monkeypatch
+):
+    """Two nearby openings are separate obligations: the old open ping stays
+    queued while the newer opening immediately owns the countdown ladder."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    now = NOW
+    passed = (now - timedelta(minutes=30)).isoformat()
+    future = (now + timedelta(hours=23)).isoformat()
+    old_slug = "dune-troisieme-partie-imax-70mm-old"
+    new_slug = "dune-troisieme-partie-imax-70mm-new"
+    old_show = {
+        "slug": old_slug,
+        "title": "Dune : Troisième partie IMAX 70mm",
+        "salesOpeningDatetime": passed,
+        "isMovie": True,
+    }
+    new_show = {
+        "slug": new_slug,
+        "title": "Dune : Troisième partie IMAX 70mm",
+        "salesOpeningDatetime": future,
+        "isMovie": True,
+    }
+    snapshot = Snapshot(
+        matched_shows=[old_show, new_show],
+        listing_results={
+            old_slug: {
+                "detail": detect.FetchResult.authoritative(old_show),
+                "showtimes": detect.FetchResult.authoritative({}),
+            },
+            new_slug: {
+                "detail": detect.FetchResult.authoritative(new_show),
+                "showtimes": detect.FetchResult.authoritative({}),
+            },
+        },
+    )
+    state = json.loads(runner.state.read_text(encoding="utf-8"))
+    state["sale_target"] = passed
+    state["sales"] = {old_slug: passed, new_slug: future}
+    state["shows_seen"] = [old_slug, new_slug]
+    runner.state.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(now))
+    outcomes = iter((False, True))
+
+    first = runner.run(snapshot, delivered=lambda _text: next(outcomes))
+
+    assert first["sale_target"] == future
+    assert "1440" in first["reminders_sent"][future]
+    assert "open" not in first["reminders_sent"].get(passed, [])
+    pending = list(first["outbox"].values())
+    assert len(pending) == 1
+    assert pending[0]["ack"] == {
+        "type": "reminder",
+        "target": passed,
+        "offset": "open",
+        "offsets": ["1440", "120", "15"],
+    }
+
+    second = runner.run(snapshot, delivered=True)
+
+    assert second["sale_target"] == future
+    assert "open" in second["reminders_sent"][passed]
+    assert "1440" in second["reminders_sent"][future]
+    assert len(runner.sent) == 1
+    assert "Scheduled sale time reached" in runner.sent[0]
+
+
+def test_bookable_confirmation_retires_open_ping_locally_and_in_cloud(
+    tmp_path, monkeypatch
+):
+    """BOOK NOW and the unconfirmed-availability ping must never arrive in
+    that order, including when cloud recovery sees only the delivered key."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    now = NOW
+    target = (now - timedelta(minutes=30)).isoformat()
+    slug = "dune-troisieme-partie-imax-70mm"
+    show = {
+        "slug": slug,
+        "title": "Dune : Troisième partie IMAX 70mm",
+        "salesOpeningDatetime": target,
+        "isMovie": True,
+    }
+    quiet = Snapshot(
+        matched_shows=[show],
+        listing_results={
+            slug: {
+                "detail": detect.FetchResult.authoritative(show),
+                "showtimes": detect.FetchResult.authoritative({}),
+            }
+        },
+    )
+    sessions = {
+        "2026-07-19": [
+            {"tags": ["IMAX 70mm"], "refCmd": "https://booking.invalid"}
+        ]
+    }
+    bookable = Snapshot(
+        matched_shows=[show],
+        showtimes={slug: sessions},
+        listing_results={
+            slug: {
+                "detail": detect.FetchResult.authoritative(show),
+                "showtimes": detect.FetchResult.authoritative(sessions),
+            }
+        },
+    )
+    state = json.loads(runner.state.read_text(encoding="utf-8"))
+    state["sale_target"] = target
+    state["sales"] = {slug: target}
+    state["shows_seen"] = [slug]
+    runner.state.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(now))
+
+    failed = runner.run(quiet, delivered=False)
+    assert len(failed["outbox"]) == 1
+    pending = runner.state.read_bytes()
+
+    local = runner.run(bookable, delivered=True)
+    assert len(runner.sent) == 1
+    assert "BOOK NOW" in runner.sent[0]
+    assert "Scheduled sale time reached" not in runner.sent[0]
+    assert local["outbox"] == {}
+
+    cloud_state = json.loads(pending)
+    cloud_state["alerts"][f"tickets:{slug}:imax70"] = now.isoformat()
+    runner.state.write_text(json.dumps(cloud_state), encoding="utf-8")
+    cloud_sent = []
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda cfg, text, **kw: cloud_sent.append(text) or True,
+    )
+    assert cli.run(
+        [
+            "--config",
+            str(runner.config),
+            "--state",
+            str(runner.state),
+            "--mode",
+            "remind",
+            "--reminder-grace-minutes",
+            "25",
+        ]
+    ) == 0
+    assert cloud_sent == []
+    assert json.loads(runner.state.read_text(encoding="utf-8"))["outbox"] == {}
+
+
+def test_healthy_poll_retires_failed_blind_alert_before_recovery(
+    tmp_path, monkeypatch
+):
+    """A definite failure leaves the BLIND alert pending, but a later healthy
+    observation makes it obsolete before outbox recovery can send it."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(NOW, NOW))
+    state = json.loads(runner.state.read_text(encoding="utf-8"))
+    stale = (NOW - timedelta(days=1)).isoformat()
+    state.update(
+        failure_streak=2,
+        last_check_ok=stale,
+        last_catalogue_ok=stale,
+    )
+    runner.state.write_text(json.dumps(state), encoding="utf-8")
+
+    failed = runner.run(RuntimeError("HTTP 500"), delivered=False)
+    assert len(failed["outbox"]) == 1
+    blind = next(iter(failed["outbox"].values()))
+    assert blind["kinds"] == ["WATCHER_ERROR"]
+    assert blind["topics"] == ["condition:pathe-health=blind"]
+
+    healthy = Snapshot(
+        matched_shows=[
+            {
+                "slug": "dune-troisieme-partie",
+                "title": "Dune : Troisième partie",
+                "isMovie": True,
+            }
+        ]
+    )
+    recovered = runner.run(healthy, delivered=True)
+
+    assert runner.sent == []
+    assert recovered["outbox"] == {}
+
+
+def test_renewed_failure_retires_pending_recovered_alert_before_recovery(
+    tmp_path, monkeypatch
+):
+    """Health supersession is symmetric: a failed RECOVERED notification must
+    not be replayed after the source becomes unhealthy again."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(NOW, NOW))
+    state = json.loads(runner.state.read_text(encoding="utf-8"))
+    stale = (NOW - timedelta(days=1)).isoformat()
+    state.update(
+        error_alerted=True,
+        failure_streak=3,
+        last_error="HTTP 500",
+        last_check_ok=stale,
+        last_catalogue_ok=stale,
+    )
+    runner.state.write_text(json.dumps(state), encoding="utf-8")
+    healthy = Snapshot(
+        matched_shows=[
+            {
+                "slug": "dune-troisieme-partie",
+                "title": "Dune : Troisième partie",
+                "isMovie": True,
+            }
+        ]
+    )
+
+    recovered = runner.run(healthy, delivered=False)
+    pending = next(iter(recovered["outbox"].values()))
+    assert pending["kinds"] == ["RECOVERED"]
+    assert pending["topics"] == ["condition:pathe-health=healthy"]
+
+    failed_again = runner.run(RuntimeError("temporary failure"), delivered=True)
+
+    assert runner.sent == []
+    assert failed_again["failure_streak"] == 1
+    assert failed_again["outbox"] == {}
 
 
 def test_stale_period_fires_once_at_the_threshold_then_daily():

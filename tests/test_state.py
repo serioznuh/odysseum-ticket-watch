@@ -167,6 +167,21 @@ def test_v2_migration_seeds_catalogue_liveness_from_last_full_check():
     assert migrated["last_catalogue_ok"] == state["last_check_ok"]
 
 
+def test_v3_migration_adds_empty_delivery_boundary_without_losing_history():
+    state = fresh_state()
+    state["version"] = 3
+    state.pop("outbox")
+    state.pop("delivery_receipts")
+    state["alerts"]["sale:dune:x"] = NOW.isoformat()
+
+    migrated = migrate_state(state)
+
+    assert migrated["version"] == CURRENT_STATE_VERSION
+    assert migrated["outbox"] == {}
+    assert migrated["delivery_receipts"] == {}
+    assert migrated["alerts"] == state["alerts"]
+
+
 def test_current_schema_missing_delivery_fields_is_not_treated_as_empty_state(tmp_path):
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"version": CURRENT_STATE_VERSION}), encoding="utf-8")
@@ -243,6 +258,76 @@ def test_update_from_snapshot_does_not_record_a_format_when_showtimes_failed():
 
     assert st["tickets_available"] is False
     assert st["formats_seen"] == {}
+
+
+def test_degraded_earlier_listing_cannot_move_sale_target_later():
+    st = fresh_state()
+    earlier = iso_in(timedelta(days=10))
+    later = iso_in(timedelta(days=20))
+    st["sale_target"] = earlier
+    snap = Snapshot(
+        matched_shows=[
+            {"slug": "early-imax", "title": "early-imax"},
+            {
+                "slug": "later-imax",
+                "title": "Later IMAX 70mm",
+                "salesOpeningDatetime": later,
+            },
+        ],
+        listing_results={
+            "early-imax": {
+                "detail": detect.FetchResult.failed("detail request failed")
+            }
+        },
+    )
+
+    update_from_snapshot(st, snap, None, NOW)
+
+    assert st["sale_target"] == earlier
+
+
+def test_reported_passed_opening_stays_target_through_open_ping_window():
+    st = fresh_state()
+    target = iso_in(timedelta(minutes=-30))
+    st["sale_target"] = target
+    snap = Snapshot(
+        matched_shows=[
+            {
+                "slug": "dune",
+                "title": "Dune",
+                "salesOpeningDatetime": target,
+            }
+        ]
+    )
+
+    update_from_snapshot(st, snap, None, NOW)
+
+    assert st["sale_target"] == target
+
+
+def test_passed_opening_does_not_shadow_a_new_future_target():
+    st = fresh_state()
+    passed = iso_in(timedelta(minutes=-30))
+    future = iso_in(timedelta(hours=23))
+    st["sale_target"] = passed
+    snap = Snapshot(
+        matched_shows=[
+            {
+                "slug": "dune-old",
+                "title": "Dune IMAX 70mm",
+                "salesOpeningDatetime": passed,
+            },
+            {
+                "slug": "dune-new",
+                "title": "Dune IMAX 70mm",
+                "salesOpeningDatetime": future,
+            },
+        ]
+    )
+
+    update_from_snapshot(st, snap, None, NOW)
+
+    assert st["sale_target"] == future
 
 
 def test_undelivered_one_shot_alerts_leave_their_baselines_alone():
@@ -572,6 +657,16 @@ def test_adaptive_staleness_tiers():
 
     st["sale_target"] = iso_in(timedelta(hours=2))
     assert state_mod.adaptive_staleness_hours(st, CadenceCfg, NOW) == 0.25  # proximity wins
+
+
+def test_passed_reported_opening_keeps_war_room_with_later_future_target():
+    st = fresh_state()
+    passed = iso_in(timedelta(minutes=-30))
+    future = iso_in(timedelta(hours=23))
+    st["sales"] = {"dune-old": passed, "dune-new": future}
+    st["sale_target"] = future
+
+    assert state_mod.adaptive_staleness_hours(st, CadenceCfg, NOW) == 0.25
 
 
 def test_is_check_fresh():

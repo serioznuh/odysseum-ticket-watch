@@ -12,12 +12,14 @@ The order *is* the contract (OTW-19):
    Pathé, news and Cinesa polling jobs. Each polling job runs under an
    aggregate time budget, and each job here is guarded, so a job that is
    skipped, disabled or outright broken cannot take the rest of the pass with it.
-3. **Delivery** of this pass's findings (dedup, coalescing, sending), then the
-   baselines those alerts gate.
+3. **Delivery** of this pass's findings (dedup, coalescing, durable outbox,
+   sending and immediate receipt persistence), then the baselines they gate.
+   Fresh findings get the first chance to supersede stale pending work before
+   safe pending records from an earlier run are recovered.
 4. **Due reminders again**, recomputed against a fresh clock and the
    observations that just landed. `reminders_sent` is the dedup record, so a
    rung sent in step 1 cannot be sent twice.
-5. **Supervision**, then exactly one state save.
+5. **Supervision**, then a final state save for non-delivery bookkeeping.
 
 Everything runs in this process, one job after another. There is exactly one
 writer to `ctx.state` per run — the guarantee the monolithic `run()` had
@@ -30,16 +32,16 @@ import logging
 from datetime import datetime
 from typing import Callable
 
-from . import jobs, pathe
+from . import delivery, jobs, pathe
 from . import state as state_mod
 from .budget import Budget
-from .detect import Finding
+from .detect import Finding, Snapshot
 from .jobs import RunContext
 
 log = logging.getLogger("watcher.runner")
 
 
-def _guard(failed: list[str], name: str, fn: Callable, *args):
+def _guard(failed: list[str], name: str, fn: Callable, *args, **kwargs):
     """Run a job; an unexpected failure is recorded, never propagated.
 
     A crash inside one job must not cost the run its reminders, its supervision
@@ -48,7 +50,7 @@ def _guard(failed: list[str], name: str, fn: Callable, *args):
     in launchd's log and in Actions rather than passing for a healthy pass.
     """
     try:
-        return fn(*args)
+        return fn(*args, **kwargs)
     except Exception:
         log.exception("%s job failed unexpectedly", name)
         failed.append(name)
@@ -56,8 +58,11 @@ def _guard(failed: list[str], name: str, fn: Callable, *args):
 
 
 def _run_source_jobs(
-    ctx: RunContext, now: datetime, polling: Budget, failed: list[str]
-) -> None:
+    ctx: RunContext,
+    now: datetime,
+    polling: Budget,
+    failed: list[str],
+) -> tuple[bool, Snapshot | None]:
     """The check half: poll the sources, deliver what they found, move the
     baselines those alerts gate."""
     try:
@@ -65,12 +70,12 @@ def _run_source_jobs(
         if not due and not ctx.cfg.cinesa_enabled:
             # Nothing to poll. The original zero-network no-op, and it still
             # falls through to the ladder, which the local half owns (OTW-15).
-            return
+            return False, None
         client = pathe.make_client()
     except Exception:
         log.exception("source setup failed")
         failed.append("sources")
-        return
+        return False, None
 
     findings: list[Finding] = []
     pathe_out = jobs.PatheOutcome()
@@ -118,14 +123,28 @@ def _run_source_jobs(
             # owner, and every later mint will trip over the profile lock.
             failed.append("cinesa-cleanup")
 
-    sent_any = pathe_out.sent
-    delivered = _guard(failed, "delivery", jobs.deliver, ctx, findings, now)
-    sent_any = bool(delivered) or sent_any
+    force_keys = {pathe_out.error_key} if pathe_out.error_key else set()
+    delivered = _guard(
+        failed, "delivery", jobs.deliver, ctx, findings, now, force_keys
+    )
+    sent_any = bool(delivered)
 
     _guard(
         failed, "baselines", jobs.advance_baselines, ctx, pathe_out, cinesa_out, findings, now
     )
-    _guard(failed, "heartbeat", jobs.run_heartbeat_job, ctx, pathe_out.snapshot, now, sent_any)
+    _guard(
+        failed,
+        "observation-reconciliation",
+        delivery.reconcile_source_observations,
+        ctx,
+        now=now,
+        pathe_snapshot=pathe_out.snapshot,
+        pathe_health=pathe_out.health,
+        cinesa_snapshot=cinesa_out.snapshot,
+        cinesa_health=cinesa_out.health,
+        cinesa_token_stuck=cinesa_out.token_profile_stuck,
+    )
+    return sent_any, pathe_out.snapshot
 
 
 def execute(ctx: RunContext, state_path: str) -> int:
@@ -135,9 +154,19 @@ def execute(ctx: RunContext, state_path: str) -> int:
     # *when this batch ran*, and a single run has to agree with itself.
     now = ctx.clock()
     failed: list[str] = []
+    ctx.state_path = state_path
 
-    # Reminders first, before a single request. See this module's docstring.
-    _guard(failed, "reminder", jobs.run_reminder_job, ctx, now)
+    # Reminders first, before a single request. On check runs, newly due work
+    # still sends here, but a failed record from an earlier pass waits until
+    # polling confirms that its opening has not moved.
+    _guard(
+        failed,
+        "reminder",
+        jobs.run_reminder_job,
+        ctx,
+        now,
+        retry_existing=ctx.mode != "check",
+    )
 
     # A failed pre-run rebase leaves a durable marker and then deliberately
     # lets this pass continue. Surface it before polling, but never ahead of a
@@ -146,7 +175,25 @@ def execute(ctx: RunContext, state_path: str) -> int:
 
     if ctx.mode == "check":
         polling = ctx.budget(jobs.POLLING_BUDGET_SECONDS, "polling")
-        _run_source_jobs(ctx, now, polling, failed)
+        sent_now, pathe_snapshot = _run_source_jobs(ctx, now, polling, failed)
+        # Polling and delivery of the current observations deliberately happen
+        # before recovery. Their topic policy can retire a failed message whose
+        # opening or availability changed while it was pending; replaying first
+        # would send stale advice and then its correction back-to-back.
+        recovered = _guard(failed, "outbox-recovery", delivery.recover, ctx, now)
+        _guard(
+            failed,
+            "heartbeat",
+            jobs.run_heartbeat_job,
+            ctx,
+            pathe_snapshot,
+            now,
+            sent_now or bool(recovered),
+        )
+    else:
+        # Remind-only runs have no source observations that could supersede the
+        # queue, so safe pending work can be recovered immediately.
+        _guard(failed, "outbox-recovery", delivery.recover, ctx, now)
 
     # Read the clock AGAIN. Polling is budgeted but still not free, and a run
     # that started at T-16 and reaches this line at T+5 must send the "sale is

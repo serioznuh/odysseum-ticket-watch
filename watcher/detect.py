@@ -227,6 +227,42 @@ class Snapshot:
         result = self.listing_results.get(slug, {}).get(endpoint)
         return result is None or result.healthy
 
+    def listing_metadata_authoritative(
+        self, slug: str, show: dict | None
+    ) -> bool:
+        """Whether this listing can contradict previously observed metadata.
+
+        A retained cinema-feed placeholder has no detail payload, even when
+        the detail endpoint returned an authoritative empty/refusal response.
+        It is useful for continued polling but cannot prove that metadata such
+        as a sale opening was withdrawn.
+        """
+        detail = self.listing_results.get(slug, {}).get("detail")
+        if detail is None:
+            return True
+        if not detail.healthy:
+            return False
+        return show is None or bool(detail.data)
+
+    def sale_observations_complete(self) -> bool:
+        """Whether absent sale metadata can retire reminder delivery work.
+
+        A reminder is time-critical enough that any degraded per-listing call,
+        including showtimes, makes absence unknown. Positive sale metadata is
+        still usable independently by callers.
+        """
+        if any(
+            not result.healthy
+            for endpoints in self.listing_results.values()
+            for result in endpoints.values()
+        ):
+            return False
+        return all(
+            show.get("slug")
+            and self.listing_metadata_authoritative(show["slug"], show)
+            for show in self.matched_shows
+        )
+
     def degradation_summary(self) -> str | None:
         if not self.degraded_results:
             return None
@@ -359,8 +395,8 @@ def reminders_cover(
 ) -> bool:
     """Whether the reminder ladder will actually fire for this opening.
 
-    `due_reminders` tracks a single `sale_target` — the earliest *future*
-    opening across selected listings — and stops once that format is
+    `due_reminders` tracks the current observed `sale_target` — the earliest
+    *future* opening across selected listings — and stops once that format is
     known to be bookable. Announcing "reminders set" for anything else was a
     promise the watcher does not keep.
     """
@@ -529,7 +565,11 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                         merge_item=best,
                     )
                 )
-        elif entry and selected_listing(show, cfg):
+        elif (
+            entry
+            and selected_listing(show, cfg)
+            and snap.endpoint_healthy(slug, "showtimes")
+        ):
             # 4. Listed on the cinema's programme but nothing bookable yet.
             findings.append(
                 Finding(

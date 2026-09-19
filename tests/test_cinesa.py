@@ -1024,6 +1024,7 @@ def test_first_leak_alert_is_loud_even_when_episode_crossed_midnight(monkeypatch
     jobs.track_profile_leak(ctx, first, first_now, None)
 
     assert len(first.findings) == 1
+    assert first.token_profile_stuck is True
     assert first.findings[0].kind == "WATCHER_ERROR"
     assert first.findings[0].title == "Cinesa token step needs you"
 
@@ -1079,9 +1080,11 @@ def test_two_leak_episodes_on_the_same_day_have_distinct_loud_keys(monkeypatch):
     state_mod.mark_sent(state, first_key, first_since + timedelta(minutes=15))
 
     status[0] = False
+    cleared = jobs.CinesaOutcome()
     jobs.track_profile_leak(
-        ctx, jobs.CinesaOutcome(), first_since + timedelta(minutes=20), None
+        ctx, cleared, first_since + timedelta(minutes=20), None
     )
+    assert cleared.token_profile_stuck is False
     assert "leak_since" not in state["cinesa"]
 
     status[0] = True

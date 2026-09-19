@@ -20,7 +20,8 @@ log = logging.getLogger(__name__)
 # bigger number would mean nothing, but it would keep the state file changing
 # on every firing (see update_from_cinesa).
 IMAX_ABSENT_CONFIRM = 2
-CURRENT_STATE_VERSION = 3
+OPEN_PING_VALIDITY = timedelta(hours=6)
+CURRENT_STATE_VERSION = 4
 
 DEFAULT_STATE: dict = {
     "version": CURRENT_STATE_VERSION,
@@ -29,7 +30,13 @@ DEFAULT_STATE: dict = {
     "formats_seen": {},    # show slug -> [format classes with sessions already alerted]
     "shows_seen": [],      # matched show slugs already known
     "reminders_sent": {},  # sale target ISO -> ["1440", "120", "15", "open"]
-    "sale_target": None,   # earliest upcoming salesOpeningDatetime (ISO)
+    # Durable notification work and sanitised Telegram receipts.  Credentials,
+    # chat ids and raw API responses never belong in either collection.
+    "outbox": {},
+    "delivery_receipts": {},
+    # Current observed opening used by the reminder ladder.  Unlike `sales`,
+    # this is not a delivery acknowledgement baseline.
+    "sale_target": None,
     "tickets_available": False,
     "failure_streak": 0,
     "error_alerted": False,
@@ -73,7 +80,7 @@ _CORE_FIELDS = {
     "last_check_ok",
     "last_heartbeat",
 }
-_CURRENT_ONLY_FIELDS = {"last_catalogue_ok"}
+_CURRENT_ONLY_FIELDS = {"last_catalogue_ok", "outbox", "delivery_receipts"}
 _TOP_LEVEL_FIELDS = _CORE_FIELDS | _CURRENT_ONLY_FIELDS | {
     "version",
     "last_error",
@@ -184,6 +191,126 @@ def _validate_reminders(value: Any) -> None:
                 )
 
 
+def _validate_ack(value: Any, field: str) -> None:
+    ack = _require_mapping(value, field)
+    ack_type = _require_string(ack.get("type"), f"{field}.type")
+    if ack_type == "alerts":
+        if set(ack) != {"type", "keys"}:
+            raise StateError(f"{field}: invalid alert acknowledgement fields")
+        _validate_string_list(ack.get("keys"), f"{field}.keys")
+    elif ack_type == "reminder":
+        if set(ack) != {"type", "target", "offset", "offsets"}:
+            raise StateError(f"{field}: invalid reminder acknowledgement fields")
+        _parse_timestamp(ack.get("target"), f"{field}.target")
+        _require_string(ack.get("offset"), f"{field}.offset")
+        _validate_string_list(ack.get("offsets"), f"{field}.offsets")
+    elif ack_type == "heartbeat":
+        if set(ack) != {"type", "at"}:
+            raise StateError(f"{field}: invalid heartbeat acknowledgement fields")
+        _parse_timestamp(ack.get("at"), f"{field}.at")
+    else:
+        raise StateError(f"{field}.type: unsupported acknowledgement {ack_type!r}")
+
+
+def _validate_outbox(value: Any) -> None:
+    outbox = _require_mapping(value, "outbox")
+    allowed = {
+        "keys", "kinds", "text", "silent", "created_at", "expires_at",
+        "topics", "status", "claim", "ack", "force", "members",
+    }
+    for delivery_id, record_value in outbox.items():
+        _require_string(delivery_id, "outbox key")
+        record = _require_mapping(record_value, f"outbox[{delivery_id!r}]")
+        unknown = set(record) - allowed
+        if unknown:
+            raise StateError(
+                f"outbox[{delivery_id!r}]: unknown field(s): {', '.join(sorted(unknown))}"
+            )
+        required = allowed - {"expires_at", "claim", "members"}
+        missing = required - set(record)
+        if missing:
+            raise StateError(
+                f"outbox[{delivery_id!r}]: missing field(s): {', '.join(sorted(missing))}"
+            )
+        _validate_string_list(record["keys"], f"outbox[{delivery_id!r}].keys")
+        if not record["keys"]:
+            raise StateError(f"outbox[{delivery_id!r}].keys: expected a non-empty array")
+        _validate_string_list(record["kinds"], f"outbox[{delivery_id!r}].kinds")
+        _require_string(record["text"], f"outbox[{delivery_id!r}].text")
+        _require_bool(record["silent"], f"outbox[{delivery_id!r}].silent")
+        _require_bool(record["force"], f"outbox[{delivery_id!r}].force")
+        _parse_timestamp(record["created_at"], f"outbox[{delivery_id!r}].created_at")
+        if "expires_at" in record:
+            _parse_timestamp(record["expires_at"], f"outbox[{delivery_id!r}].expires_at")
+        _validate_string_list(record["topics"], f"outbox[{delivery_id!r}].topics")
+        if "members" in record:
+            members = record["members"]
+            if not isinstance(members, list) or not members:
+                raise StateError(
+                    f"outbox[{delivery_id!r}].members: expected a non-empty array"
+                )
+            member_allowed = {
+                "key", "kind", "text", "silent", "topics", "expires_at",
+            }
+            for index, member_value in enumerate(members):
+                field = f"outbox[{delivery_id!r}].members[{index}]"
+                member = _require_mapping(member_value, field)
+                unknown_member = set(member) - member_allowed
+                required_member = member_allowed - {"expires_at"}
+                if unknown_member or not required_member.issubset(member):
+                    raise StateError(f"{field}: invalid fields")
+                _require_string(member["key"], f"{field}.key")
+                _require_string(member["kind"], f"{field}.kind")
+                _require_string(member["text"], f"{field}.text")
+                _require_bool(member["silent"], f"{field}.silent")
+                _validate_string_list(member["topics"], f"{field}.topics")
+                if "expires_at" in member:
+                    _parse_timestamp(member["expires_at"], f"{field}.expires_at")
+            if [member["key"] for member in members] != record["keys"]:
+                raise StateError(
+                    f"outbox[{delivery_id!r}].members: keys do not match record"
+                )
+        status = _require_string(record["status"], f"outbox[{delivery_id!r}].status")
+        if status not in {"pending", "sending", "uncertain"}:
+            raise StateError(f"outbox[{delivery_id!r}].status: invalid value {status!r}")
+        if "claim" in record:
+            claim = _require_mapping(record["claim"], f"outbox[{delivery_id!r}].claim")
+            if set(claim) != {"owner", "token", "at"}:
+                raise StateError(f"outbox[{delivery_id!r}].claim: invalid fields")
+            _require_string(claim["owner"], f"outbox[{delivery_id!r}].claim.owner")
+            _require_string(claim["token"], f"outbox[{delivery_id!r}].claim.token")
+            _parse_timestamp(claim["at"], f"outbox[{delivery_id!r}].claim.at")
+        _validate_ack(record["ack"], f"outbox[{delivery_id!r}].ack")
+
+
+def _validate_delivery_receipts(value: Any) -> None:
+    receipts = _require_mapping(value, "delivery_receipts")
+    allowed = {"delivery_id", "keys", "delivered_at", "telegram_message_id"}
+    for receipt_id, receipt_value in receipts.items():
+        _require_string(receipt_id, "delivery_receipts key")
+        receipt = _require_mapping(
+            receipt_value, f"delivery_receipts[{receipt_id!r}]"
+        )
+        unknown = set(receipt) - allowed
+        required = allowed - {"telegram_message_id"}
+        if unknown or not required.issubset(receipt):
+            raise StateError(f"delivery_receipts[{receipt_id!r}]: invalid fields")
+        _require_string(
+            receipt["delivery_id"], f"delivery_receipts[{receipt_id!r}].delivery_id"
+        )
+        _validate_string_list(
+            receipt["keys"], f"delivery_receipts[{receipt_id!r}].keys"
+        )
+        _parse_timestamp(
+            receipt["delivered_at"], f"delivery_receipts[{receipt_id!r}].delivered_at"
+        )
+        if "telegram_message_id" in receipt:
+            _require_nonnegative_int(
+                receipt["telegram_message_id"],
+                f"delivery_receipts[{receipt_id!r}].telegram_message_id",
+            )
+
+
 def _validate_cinesa(value: Any, *, require_all: bool) -> None:
     cin = _require_mapping(value, "cinesa")
     unknown = set(cin) - _CINESA_FIELDS
@@ -229,6 +356,10 @@ def _validate_fields(state: dict, *, require_all: bool) -> None:
     _validate_formats_seen(state["formats_seen"])
     _validate_string_list(state["shows_seen"], "shows_seen")
     _validate_reminders(state["reminders_sent"])
+    if "outbox" in state:
+        _validate_outbox(state["outbox"])
+    if "delivery_receipts" in state:
+        _validate_delivery_receipts(state["delivery_receipts"])
     _parse_optional_timestamp(state["sale_target"], "sale_target")
     _require_bool(state["tickets_available"], "tickets_available")
     _require_nonnegative_int(state["failure_streak"], "failure_streak")
@@ -267,10 +398,19 @@ def _migrate_v2_to_v3(state: dict) -> dict:
     return migrated
 
 
+def _migrate_v3_to_v4(state: dict) -> dict:
+    migrated = deepcopy(state)
+    migrated["outbox"] = {}
+    migrated["delivery_receipts"] = {}
+    migrated["version"] = 4
+    return migrated
+
+
 _MIGRATIONS = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
+    3: _migrate_v3_to_v4,
 }
 
 
@@ -418,9 +558,9 @@ def update_from_snapshot(
     `advance_sales=False` does the same for `sales`, which is the baseline
     behind SALE_DATE: recording an opening is what makes it "known", so doing
     that after a failed send retired the sale alert — the watcher's whole
-    point — permanently. It is a separate flag because the two baselines fail
-    independently, and holding `sales` back also holds back `sale_target` and
-    the reminder ladder until the next run.
+    point — permanently. `sale_target` is separate current-observation state:
+    it still follows the snapshot so an uncertain sale alert cannot disable
+    the reminder ladder.
     """
     if not advance_one_shot:
         log.info(
@@ -455,20 +595,56 @@ def update_from_snapshot(
                 state["formats_seen"][slug] = sorted(fmts)
             state["tickets_available"] = True
 
-    future = []
-    shows = {s.get("slug"): s for s in snap.matched_shows}
-    selected_sales = {
-        slug: iso for slug, iso in state["sales"].items()
-        if detect.selected_listing(shows.get(slug, {"slug": slug}), cfg)
+    # The ladder follows what Pathé currently says, independently of whether
+    # the SALE_DATE notification was confirmed.  `sales` above remains the
+    # delivered baseline used by analyze_pathe, so the alert stays eligible.
+    observed_sales = {
+        show["slug"]: show["salesOpeningDatetime"]
+        for show in snap.matched_shows
+        if show.get("slug")
+        and show.get("salesOpeningDatetime")
+        and detect.selected_listing(show, cfg)
+        and snap.listing_metadata_authoritative(show["slug"], show)
     }
-    if state.get("sale_target") not in selected_sales.values():
-        state["sale_target"] = None
-    for iso in selected_sales.values():
+    future = []
+    for iso in observed_sales.values():
         dt = detect.parse_iso(iso)
         if dt and detect.as_aware(dt) > now:
             future.append((detect.as_aware(dt), iso))
-    if future:
-        state["sale_target"] = min(future)[1]
+    observed_target = min(future)[1] if future else None
+    current_target = state.get("sale_target")
+    current_dt = detect.parse_iso(current_target)
+    current_aware = detect.as_aware(current_dt) if current_dt is not None else None
+    observed_dt = detect.parse_iso(observed_target)
+    observations_complete = snap.sale_observations_complete()
+    reported_targets = set(observed_sales.values())
+
+    # With no later opening to arm, a reported opening remains the ladder
+    # target through the open ping's validity window. A failed ping is already
+    # durable outbox work, however, so it must not pin `sale_target` when a new
+    # future opening needs the 24 h / 2 h / 15 min ladder. If the snapshot is
+    # degraded, absence is likewise unknown until complete evidence arrives.
+    current_open_valid = (
+        current_aware is not None
+        and current_aware <= now < current_aware + OPEN_PING_VALIDITY
+    )
+    if observed_dt is None and current_open_valid and (
+        current_target in reported_targets or not observations_complete
+    ):
+        return
+
+    # Positive evidence may always move the ladder earlier. Moving it later or
+    # clearing it requires a complete view: any failed per-listing fetch leaves
+    # reminder retirement unknown.
+    if observed_dt is not None and (
+        current_dt is None
+        or detect.as_aware(observed_dt) <= detect.as_aware(current_dt)
+        or (current_aware is not None and current_aware <= now)
+        or observations_complete
+    ):
+        state["sale_target"] = observed_target
+    elif observed_target is None and observations_complete:
+        state["sale_target"] = None
 
 
 def update_from_cinesa(
@@ -595,7 +771,7 @@ def due_reminders(
         # The 'open' ping has no window to be squeezed out of — only the 6h
         # cutoff below — so the grace applies to it whole.
         opens_at = dt + timedelta(minutes=grace_minutes)
-        if "open" not in sent and now >= opens_at and (now - dt) <= timedelta(hours=6):
+        if "open" not in sent and now >= opens_at and (now - dt) <= OPEN_PING_VALIDITY:
             return [{"offset": "open", "target": iso}]
         return []
 
@@ -625,15 +801,36 @@ def adaptive_staleness_hours(state: dict, cfg: Any, now: datetime) -> float:
         for day in getattr(cfg, "pathe_target_dates", [])
     ):
         return 0.0  # every existing launchd firing, even if its interval drifts slightly
-    target = detect.parse_iso(state.get("sale_target"))
-    if target is not None:
+    target_isos = {state.get("sale_target")}
+    target_isos.update(state.get("sales", {}).values())
+    target_isos.update(
+        record.get("ack", {}).get("target")
+        for record in state.get("outbox", {}).values()
+        if record.get("ack", {}).get("type") == "reminder"
+        and record.get("ack", {}).get("offset") == "open"
+    )
+    candidate_hours = []
+    sale_target = state.get("sale_target")
+    for iso in target_isos:
+        target = detect.parse_iso(iso)
+        if target is None:
+            continue
         hours_to_target = (detect.as_aware(target) - now).total_seconds() / 3600
+        # Future cadence belongs to `sale_target`; historical `sales` and
+        # durable open work contribute only the still-valid post-opening window.
+        if iso == sale_target or -6 <= hours_to_target <= 0:
+            candidate_hours.append(hours_to_target)
+
+    cadences = []
+    for hours_to_target in candidate_hours:
         if -6 <= hours_to_target <= 4:
-            return cfg.cadence_opening_window_minutes / 60
-        if 0 < hours_to_target <= 48:
-            return cfg.cadence_final_48h_hours
-        if 0 < hours_to_target <= 7 * 24:
-            return cfg.cadence_within_week_hours
+            cadences.append(cfg.cadence_opening_window_minutes / 60)
+        elif 0 < hours_to_target <= 48:
+            cadences.append(cfg.cadence_final_48h_hours)
+        elif 0 < hours_to_target <= 7 * 24:
+            cadences.append(cfg.cadence_within_week_hours)
+    if cadences:
+        return min(cadences)
     if detect.target_format_available(state, cfg):
         return cfg.cadence_after_tickets_hours
     return cfg.cadence_baseline_hours

@@ -78,16 +78,16 @@ A single-user Telegram watcher covering **two independent targets**:
   `state/state.json` is only the first-run seed. Both halves call
   `watcher/state_sync.py` before and after a pass; Git plumbing commits the state
   ref without checking it out, so state never dirties the code worktree.
-  OTW-14's three-way merge remains the sole reconciliation rule: confirmed alert
-  and reminder receipts and acknowledged baselines are preserved, while unsafe
-  concurrent owner/health changes fail closed. Every remote, base and local
-  snapshot passes the numbered schema/migration check before replacing live state.
-  A rejected push preserves the local receipt; transient Git transport must fail
-  three times before marking, while schema/merge failures mark immediately. One process lock spans a
-  whole local firing. Merging is recovery, not a delivery claim: the local-owner/
-  cloud-grace ordering remains the cross-host guard; OTW-20 must add explicit
-  claims/outcomes and cannot promise exactly-once delivery. Baselines still move
-  only after delivery, health counters stay capped, and Cinesa writes on change.
+  Reconciliation unions receipts/baselines; conflicts fail closed and pushes retain receipts.
+- **Delivery boundary** — every alert, reminder and heartbeat is saved to an
+  outbox before Telegram is called. Confirmation stores member keys and Telegram's message ID.
+  Definite failures remain pending; a failed pre-send claim save rolls back to pending. A
+  post-send timeout is `uncertain` and is not replayed automatically. Current observations
+  stay independent: an uncertain sale alert cannot freeze its opening or reminder ladder.
+  Only complete, positive contradictory evidence retires a member. Per-member conditions and
+  expiries preserve unaffected merged siblings across supersession, acknowledgement and expiry.
+  The next opening owns the ladder; booking retires old pings while recent openings keep war-room cadence.
+  Overlapping hosts can still both send: this is not exactly-once or cross-host exclusion.
 - **Pathé failure model** — catalogue failures still blind the check, while
   every best-effort detail/showtimes result explicitly distinguishes data,
   authoritative emptiness, expected refusal and unexpected failure. One bad

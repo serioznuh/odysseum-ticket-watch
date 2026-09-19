@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -47,6 +48,22 @@ DEFAULT_SILENT_KINDS = [
     # after it must not — it is the same known problem, once a day.
     "WATCHER_STILL_BLIND",
 ]
+
+
+@dataclass(frozen=True)
+class SendResult:
+    """Sanitised outcome of one Telegram request.
+
+    ``uncertain`` means the request may have reached Telegram but no response
+    was received.  Callers must not silently turn that into a definite failure:
+    retrying it can duplicate a message that was actually delivered.
+    """
+
+    status: str  # confirmed / failed / uncertain
+    message_id: int | None = None
+
+    def __bool__(self) -> bool:
+        return self.status == "confirmed"
 
 
 def is_silent(cfg: Any, kind: str) -> bool:
@@ -193,8 +210,10 @@ def render_reminder(
     )
 
 
-def send_telegram(cfg: Any, text: str, *, dry_run: bool, silent: bool = False) -> bool:
-    """Send one message. Returns True on success (always True in dry-run)."""
+def send_telegram(
+    cfg: Any, text: str, *, dry_run: bool, silent: bool = False
+) -> SendResult:
+    """Send one message and return a sanitised, receipt-ready outcome."""
     if dry_run:
         log.info(
             "[dry-run] would send Telegram message%s:\n%s\n%s\n%s",
@@ -203,10 +222,10 @@ def send_telegram(cfg: Any, text: str, *, dry_run: bool, silent: bool = False) -
             text,
             "-" * 60,
         )
-        return True
+        return SendResult("confirmed")
     if not (cfg.telegram_token and cfg.telegram_chat_id):
         log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — cannot send")
-        return False
+        return SendResult("failed")
 
     url = f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage"
     payload = {
@@ -225,14 +244,40 @@ def send_telegram(cfg: Any, text: str, *, dry_run: bool, silent: bool = False) -
                 time.sleep(retry_after)
                 continue
             r.raise_for_status()
-            if r.json().get("ok"):
+            body = r.json()
+            if body.get("ok"):
+                raw_message_id = (body.get("result") or {}).get("message_id")
+                message_id = (
+                    raw_message_id
+                    if isinstance(raw_message_id, int) and not isinstance(raw_message_id, bool)
+                    else None
+                )
                 log.info("telegram message sent")
-                return True
+                return SendResult("confirmed", message_id)
             log.error("telegram API returned not-ok: %s", r.text[:300])
-            return False
+            return SendResult("failed")
+        except httpx.TimeoutException as e:
+            msg = str(e).replace(cfg.telegram_token, "***")
+            if isinstance(e, httpx.ConnectTimeout):
+                log.error("telegram connection timed out (attempt %d/2): %s", attempt + 1, msg)
+                if attempt == 0:
+                    time.sleep(2)
+                    continue
+                return SendResult("failed")
+            # A write/read/pool timeout can happen after Telegram accepted the
+            # request.  Retrying automatically would risk a duplicate.
+            log.error("telegram send outcome is uncertain: %s", msg)
+            return SendResult("uncertain")
+        except (httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError) as e:
+            # The connection was established and may have carried the POST;
+            # losing the response (or failing mid-write) cannot prove Telegram
+            # rejected it.  An automatic retry could create an immediate copy.
+            msg = str(e).replace(cfg.telegram_token, "***")
+            log.error("telegram send outcome is uncertain: %s", msg)
+            return SendResult("uncertain")
         except httpx.HTTPError as e:
             # httpx exception messages include the URL — redact the token.
             msg = str(e).replace(cfg.telegram_token, "***")
             log.error("telegram send failed (attempt %d/2): %s", attempt + 1, msg)
             time.sleep(2)
-    return False
+    return SendResult("failed")

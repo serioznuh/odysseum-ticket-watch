@@ -50,6 +50,9 @@ class Alert:
     finding: Finding
     keys: list[str]
     kinds: list[str] = field(default_factory=list)
+    # Original findings are retained for outbox expiry/supersession policy;
+    # their keys and rendered merged message remain exactly as before.
+    members: list[Finding] = field(default_factory=list)
 
     @property
     def merged(self) -> bool:
@@ -96,13 +99,14 @@ def merge(findings: list[Finding], cfg: Any) -> list[Alert]:
     for members in buckets.values():
         if len(members) == 1:
             f = members[0]
-            alerts.append(Alert(finding=f, keys=[f.key], kinds=[f.kind]))
+            alerts.append(Alert(finding=f, keys=[f.key], kinds=[f.kind], members=[f]))
         else:
             alerts.append(
                 Alert(
                     finding=_merge_findings(members, cfg),
                     keys=[m.key for m in members],
                     kinds=[m.kind for m in members],
+                    members=list(members),
                 )
             )
     return alerts

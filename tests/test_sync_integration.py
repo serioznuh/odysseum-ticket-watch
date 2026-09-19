@@ -107,6 +107,12 @@ def test_two_workers_merge_receipts_with_local_owner_health_update(two_clones):
 
     def update_local(state):
         state["alerts"]["local-delivery"] = STAMP
+        state["delivery_receipts"]["local-attempt"] = {
+            "delivery_id": "telegram:local",
+            "keys": ["local-delivery"],
+            "delivered_at": STAMP,
+            "telegram_message_id": 101,
+        }
         state["reminders_sent"][TARGET] = ["15"]
         state["last_check_ok"] = STAMP
         state["last_catalogue_ok"] = STAMP
@@ -114,6 +120,12 @@ def test_two_workers_merge_receipts_with_local_owner_health_update(two_clones):
 
     def update_cloud(state):
         state["alerts"]["cloud-delivery"] = STAMP
+        state["delivery_receipts"]["cloud-attempt"] = {
+            "delivery_id": "telegram:cloud",
+            "keys": ["cloud-delivery"],
+            "delivered_at": STAMP,
+            "telegram_message_id": 102,
+        }
         state["reminders_sent"][TARGET] = ["120"]
 
     change_state(local, update_local)
@@ -124,6 +136,7 @@ def test_two_workers_merge_receipts_with_local_owner_health_update(two_clones):
 
     merged = load_state(live_path(local))
     assert set(merged["alerts"]) == {"local-delivery", "cloud-delivery"}
+    assert set(merged["delivery_receipts"]) == {"local-attempt", "cloud-attempt"}
     assert merged["reminders_sent"][TARGET] == ["120", "15"]
     assert merged["last_check_ok"] == STAMP
     assert merged["last_catalogue_ok"] == STAMP
