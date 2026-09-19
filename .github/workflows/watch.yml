@@ -73,6 +73,15 @@ jobs:
         continue-on-error: true
         run: python -m watcher.state_sync sync
 
+      # A quiet watcher pass may make no Telegram call. This read-only probe
+      # makes "successful scheduled run" cover the bot token and target chat,
+      # without sending a liveness message every 15 minutes (OTW-09).
+      - name: Validate Telegram credentials (no message)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m watcher --state .cache/state-sync/state.json --check-telegram
+
       - name: Run watcher (${{ steps.mode.outputs.mode }})
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

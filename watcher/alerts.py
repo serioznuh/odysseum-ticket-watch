@@ -292,6 +292,27 @@ def build_stale_finding(cfg, st: dict, blind: timedelta, key: str, day: int) -> 
     )
 
 
+def build_cloud_stale_finding(cfg, last_success: datetime, now: datetime) -> Finding:
+    """Local-side supervision for a cloud cron that stopped succeeding."""
+    last_success = detect.as_aware(last_success)
+    blind = detect.as_aware(now) - last_success
+    repository = cfg.cloud_repository
+    workflow = cfg.cloud_workflow
+    return Finding(
+        kind="WATCHER_ERROR",
+        key=f"cloud_stale:{last_success.isoformat()}",
+        confidence="high",
+        title=f"Cloud checks have stopped — {fmt_duration(blind)}",
+        lines=[
+            watch_label(cfg),
+            f"Last successful scheduled cloud run: {short_dt(last_success)}.",
+            "GitHub Actions may be disabled, stuck, or failing (including Telegram).",
+            "Local checks and reminders still run; cloud failover and supervision are dark.",
+        ],
+        url=f"https://github.com/{repository}/actions/workflows/{workflow}",
+    )
+
+
 def _cinesa_error_status(error: str | Exception) -> int | None:
     status = getattr(error, "status_code", None)
     if status is None:

@@ -1,7 +1,6 @@
 # odysseum-ticket-watch
 
-A small Telegram watcher that tells you **in advance** when *Dune : Troisième partie* tickets go
-on sale at **Pathé Odysseum** (Montpellier), then counts down. It never auto-buys; edit [config.toml](config.toml) for another watch.
+A small Telegram watcher that tells you **in advance** when *Dune : Troisième partie* tickets go on sale at **Pathé Odysseum** (Montpellier), then counts down. It never auto-buys; edit [config.toml](config.toml) for another watch.
 
 ## What it sends you
 
@@ -11,7 +10,7 @@ on sale at **Pathé Odysseum** (Montpellier), then counts down. It never auto-bu
 - 🎫 **Your wanted Pathé date opened** — IMAX 70mm on December 19 or 20; one alert per date, combined if both open together
 - 📍 **Listed at your cinema** (not bookable yet); without wanted dates configured, 🚨 **Tickets bookable NOW** reports new formats
 - 📰 **News lead** — early press hint via Google News (low/medium confidence, strictly filtered — see configuration)
-- 🔴 watcher blind or persistently degraded, then a silent daily repeat until it recovers / ✅ recovery / 💤 weekly heartbeat
+- 🔴 either watcher half stopped (or Pathé degraded), with bounded repeats / ✅ recovery / 💤 weekly heartbeat
 
 From the second watch target (*La odisea* in IMAX at **Cinesa Diagonal Mar**,
 Barcelona — see [Cinesa target](#cinesa-target)):
@@ -49,10 +48,7 @@ event listings (the 70 mm ones) always answer `"No movie allowed !"`, and their
 bookability is read off the cinema programme. Unexpected detail/showtimes failures
 degrade health without discarding the rest of the snapshot.
 
-Safety nets: 🔴 after 3 consecutive Pathé failures (including partial listing failures once full coverage has been absent for 6 h),
-🔴 if the local catalogue liveness pulse stops for 18 h — **then every 24 h**, so
-a long outage cannot fall out of mind — and 💤 a weekly heartbeat. Each names
-the cause it can prove (IP block, CI range, origin refusal, or a silent Mac).
+Safety nets: 🔴 after 3 consecutive Pathé failures (including partial failures after 6 h), if the local catalogue pulse stops for 18 h (then every 24 h), or if no scheduled cloud run has succeeded for 18 h. The local check reads the public Actions API; each cloud run first validates its bot token and target chat without sending. An API blip stays quiet, and no liveness timestamp churns shared state. If **both halves die**, only the absence of the 7-day heartbeat remains.
 
 ### Cinesa target
 
@@ -186,6 +182,7 @@ deployment on `main` is independent of that state history.
 | `news.max_alerts_per_run` | `3` | Cap on news alerts per check. |
 | `news.google_news_queries` | *(see file)* | Google News RSS search URLs to scan. |
 | `news.extra_pages`, `news.cloud_extra_pages` | `[]`, `[]` | Extra URLs scanned locally, and the separate explicit allow-list scanned from the cloud. Cloud mode otherwise reads only `news.google.com` RSS and always refuses `pathe.fr`/`cinesa.es` hosts. |
+| `cloud.repository`, `cloud.workflow`, `cloud.stale_hours` | `""`, `"watch.yml"`, `0` | Public GitHub repository/workflow and maximum age of its latest successful scheduled run. `0` disables reverse supervision; shipped config uses 18 h. Successful runs include a read-only Telegram bot/chat check. |
 | `alerts.heartbeat_days` | `7` | 💤 "alive" summary when nothing was alerted for N days. `0` = off. |
 | `alerts.failure_streak_threshold` | `3` | ⚠️ after N consecutive failed Pathé checks. |
 | `alerts.stale_check_hours` | `18` | Cloud pass ⚠️ when the last successful check is older than this (local job died, or the Mac stayed shut). `0` = off. Sized from measured gaps: 4 h median, 12.9 h worst ordinary overnight — below ~16 h, normal nights trip it. |

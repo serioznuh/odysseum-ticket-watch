@@ -60,6 +60,13 @@ extra_pages = []
 # added to cloud news runs; pathe.fr and cinesa.es hosts are always refused.
 cloud_extra_pages = []
 
+[cloud]
+# Read-only reverse supervision: the local half checks the public Actions API.
+# Only successful scheduled runs count; watch.yml validates Telegram first.
+repository = "serioznuh/odysseum-ticket-watch"
+workflow = "watch.yml"
+stale_hours = 18
+
 [alerts]
 # Send a "watcher alive" summary if nothing was alerted for N days (0 = off).
 heartbeat_days = 7

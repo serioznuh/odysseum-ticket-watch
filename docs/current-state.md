@@ -45,8 +45,8 @@ A single-user Telegram watcher covering **two independent targets**:
   still pauses checks. It gates neither the **Cinesa check** — one small call,
   not bot-gated — nor the **reminder ladder**, both of which run on every
   firing. This half *owns* the ladder: 5-min firings give three chances inside
-  a 15-min warning. Runs from a residential IP: Akamai blocks Pathé from
-  datacenter IPs, and Cloudflare challenges Cinesa from them.
+  a 15-min warning. It also queries the public Actions API and buzzes once per
+  stale cloud episode; an unreachable API is not outage evidence and stays quiet.
 - **Cloud half** — `.github/workflows/watch.yml` cron `*/15`: cloud-safe news,
   supervision, and reminders as a **failover** rather than their owner. It passes
   `--reminder-grace-minutes 25` (> the local 5-min interval), so it only sends
@@ -60,7 +60,7 @@ A single-user Telegram watcher covering **two independent targets**:
   2026-09-03 this cron fired 10.9% of its schedule (median gap 58 min, max 11.5
   h), which is why the ladder is no longer cloud-owned (OTW-15). Scheduled
   `remind --with-news` passes read Google News plus opted-in `cloud_extra_pages`;
-  they never call Pathé/Cinesa; failures cannot block reminders/supervision; plain `remind` is request-free.
+  they never call Pathé/Cinesa. Every run validates its bot and chat read-only first, so a successful run proves credentials; failures cannot block state sync.
 - **Format-specific reminders** — standard tickets no longer cancel the IMAX
   ladder. Existing `formats_seen` provides the format evidence without manual
   state edits. The opening-time message says availability is unconfirmed and
@@ -163,7 +163,7 @@ A single-user Telegram watcher covering **two independent targets**:
 ## User workflow
 
 - Passive: alerts arrive on Telegram; quiet kinds (news leads, heartbeat,
-  recovery) are silent, time-critical ones buzz.
+  recovery) are silent, time-critical and first local/cloud outage alerts buzz.
 - Manual production-state runs: first `source .env && .venv/bin/python -m
   watcher.state_sync sync`; then run `.venv/bin/python -m watcher --state .cache/state-sync/state.json --mode check [--dry-run]` (`--test-telegram` smokes).
 - Deploying = pushing to `main`: the `~/.ticket-watch` clone pulls on its next

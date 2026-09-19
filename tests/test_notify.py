@@ -69,6 +69,46 @@ def test_confirmed_send_returns_only_the_message_id_as_a_receipt(monkeypatch):
     )
 
 
+def test_credential_check_validates_bot_and_chat_without_sending(monkeypatch):
+    class LiveCfg(Cfg):
+        telegram_token = "token"
+        telegram_chat_id = "chat"
+
+    calls = []
+
+    class Response:
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {"ok": True, "result": {}}
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs.get("json")))
+        return Response()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    assert notify.check_telegram_credentials(LiveCfg) is True
+    assert [url.rsplit("/", 1)[-1] for url, _ in calls] == ["getMe", "getChat"]
+    assert calls[1][1] == {"chat_id": "chat"}
+    assert all("sendMessage" not in url for url, _ in calls)
+
+
+def test_bad_telegram_token_fails_the_read_only_credential_check(monkeypatch):
+    class LiveCfg(Cfg):
+        telegram_token = "secret-token"
+        telegram_chat_id = "chat"
+
+    request = httpx.Request("POST", "https://api.telegram.org/botsecret-token/getMe")
+    response = httpx.Response(401, request=request)
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: response)
+
+    assert notify.check_telegram_credentials(LiveCfg) is False
+
+
 def test_read_timeout_is_uncertain_and_is_not_retried(monkeypatch):
     class LiveCfg(Cfg):
         telegram_token = "token"
