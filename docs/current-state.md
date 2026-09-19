@@ -46,7 +46,7 @@ A single-user Telegram watcher covering **two independent targets**:
   not bot-gated — nor the **reminder ladder**, both of which run on every
   firing. This half *owns* the ladder: 5-min firings give three chances inside
   a 15-min warning. It queries the public Actions API before outbox replay and
-  heartbeat; an unreachable API raises no outage alert but withholds “healthy”.
+  heartbeat; failures withhold “healthy”. Runs from a residential IP: Akamai blocks Pathé from datacenter IPs, and Cloudflare challenges Cinesa from them.
 - **Cloud half** — `.github/workflows/watch.yml` cron `*/15`: cloud-safe news,
   supervision, and reminders as a **failover** rather than their owner. It passes
   `--reminder-grace-minutes 25` (> the local 5-min interval), so it only sends
@@ -60,7 +60,7 @@ A single-user Telegram watcher covering **two independent targets**:
   2026-09-03 this cron fired 10.9% of its schedule (median gap 58 min, max 11.5
   h), which is why the ladder is no longer cloud-owned (OTW-15). Scheduled
   `remind --with-news` passes read Google News plus opted-in `cloud_extra_pages`;
-  they never call Pathé/Cinesa. Every run validates its bot and chat read-only first, so a successful run proves credentials; failures cannot block state sync.
+  they never call Pathé/Cinesa. Every run validates its bot/chat read-only after failover work, so a failed probe cannot cost a reminder and success proves credentials.
 - **Format-specific reminders** — standard tickets no longer cancel the IMAX
   ladder. Existing `formats_seen` provides the format evidence without manual
   state edits. The opening-time message says availability is unconfirmed and
@@ -84,8 +84,8 @@ A single-user Telegram watcher covering **two independent targets**:
   Definite failures remain pending; a failed pre-send claim save rolls back to pending. A
   post-send timeout is `uncertain` and is not replayed automatically. Current observations
   stay independent: an uncertain sale alert cannot freeze its opening or reminder ladder.
-  Only complete, positive contradictory evidence retires a member. Cloud-health
-  conditions retire recovered outage alerts and stale “healthy” heartbeats before replay.
+  Only complete, positive contradictory evidence retires a member. Cloud passes defer
+  cloud-health work; local proof retires recovered outage alerts and stale heartbeats.
   The next opening owns the ladder; booking retires old pings while recent openings keep war-room cadence.
   Overlapping local/cloud hosts can still send the same news finding: claims are not distributed locks.
 - **Pathé failure model** — catalogue failures still blind the check, while

@@ -111,6 +111,43 @@ def test_github_api_blip_fails_quietly(monkeypatch):
     assert ctx.state == before
 
 
+def test_api_blip_binds_and_defers_a_legacy_pending_heartbeat(tmp_path, monkeypatch):
+    ctx = _durable_context(tmp_path)
+    attempts = []
+    heartbeat = Finding(
+        kind="HEARTBEAT",
+        key="heartbeat:2026-09-20",
+        confidence="high",
+        title="All quiet — nothing new",
+        lines=["Dune : Troisième partie · Pathé Odysseum", "All checks healthy."],
+        url=None,
+    )
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda cfg, text, **kwargs: attempts.append(text)
+        or notify.SendResult("failed"),
+    )
+    assert delivery.deliver_heartbeat(ctx, heartbeat, NOW) is False
+    pending = next(iter(ctx.state["outbox"].values()))
+    pending["topics"] = []  # pre-round-2 record
+    ctx.delivery_attempts.clear()
+
+    monkeypatch.setattr(
+        cloud,
+        "latest_successful_scheduled_run",
+        lambda *args: (_ for _ in ()).throw(cloud.CloudStatusError("API blip")),
+    )
+    assert jobs.run_cloud_supervision_job(ctx, NOW + timedelta(minutes=5)) == "unknown"
+    assert pending["topics"] == ["condition:cloud-health=healthy"]
+    assert delivery.recover(
+        ctx,
+        NOW + timedelta(minutes=5),
+        blocked_condition_domains={"cloud-health"},
+    ) is False
+    assert len(attempts) == 1
+
+
 def test_cloud_alert_dedups_per_outage_and_rearms_after_a_later_success(monkeypatch):
     ctx = _context()
     delivered = _capture_delivery(monkeypatch, ctx)
@@ -229,6 +266,37 @@ def test_pending_healthy_heartbeat_is_retired_when_cloud_turns_stale(
     assert sum("All checks healthy" in text for text in attempts) == 1
 
 
+def test_cloud_recovery_binds_but_never_replays_pending_cloud_health_work(
+    tmp_path, monkeypatch
+):
+    ctx = _durable_context(tmp_path)
+    attempts = []
+    monkeypatch.setattr(
+        cloud,
+        "latest_successful_scheduled_run",
+        lambda *args: NOW - timedelta(days=2),
+    )
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda cfg, text, **kwargs: attempts.append(text)
+        or notify.SendResult("failed"),
+    )
+    assert jobs.run_cloud_supervision_job(ctx, NOW) == "stale"
+    pending = next(iter(ctx.state["outbox"].values()))
+    pending["topics"] = []
+    for member in pending["members"]:
+        member["topics"] = []
+    ctx.delivery_attempts.clear()
+
+    assert delivery.recover_cloud(ctx, NOW + timedelta(minutes=5)) is False
+    assert pending["topics"] == ["condition:cloud-health=stale"]
+    assert pending["members"][0]["topics"] == [
+        "condition:cloud-health=stale"
+    ]
+    assert len(attempts) == 1
+
+
 def test_runner_probes_cloud_before_recovery_and_heartbeat(monkeypatch, tmp_path):
     ctx = _context()
     ctx.dry_run = True
@@ -257,6 +325,37 @@ def test_runner_probes_cloud_before_recovery_and_heartbeat(monkeypatch, tmp_path
 
     assert runner.execute(ctx, str(tmp_path / "state.json")) == 0
     assert trace == ["cloud", "recover", ("heartbeat", "stale")]
+
+
+def test_both_cloud_runner_branches_use_condition_aware_recovery(
+    monkeypatch, tmp_path
+):
+    trace = []
+    monkeypatch.setattr(jobs, "run_reminder_job", lambda *args, **kwargs: False)
+    monkeypatch.setattr(jobs, "run_state_sync_failure_job", lambda *args: False)
+    monkeypatch.setattr(jobs, "run_supervision_job", lambda *args: None)
+    monkeypatch.setattr(runner, "_run_cloud_news_job", lambda *args: False)
+    monkeypatch.setattr(
+        delivery,
+        "recover_cloud",
+        lambda *args: trace.append("cloud-recovery") or False,
+    )
+    monkeypatch.setattr(
+        delivery,
+        "recover",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("cloud mode used unguarded recovery")
+        ),
+    )
+
+    for with_news in (False, True):
+        ctx = _context()
+        ctx.mode = "remind"
+        ctx.with_news = with_news
+        ctx.dry_run = True
+        assert runner.execute(ctx, str(tmp_path / f"state-{with_news}.json")) == 0
+
+    assert trace == ["cloud-recovery", "cloud-recovery"]
 
 
 def test_actions_api_requests_only_the_latest_scheduled_success(monkeypatch):
@@ -310,12 +409,13 @@ def test_actions_api_transport_error_is_not_liveness_evidence(monkeypatch):
         raise AssertionError("API failure must not look like a stale success")
 
 
-def test_scheduled_workflow_probes_telegram_before_the_watcher_pass():
+def test_scheduled_workflow_probes_telegram_after_failover_without_gating_it():
     root = Path(__file__).resolve().parent.parent
     workflow = (root / ".github" / "workflows" / "watch.yml").read_text(
         encoding="utf-8"
     )
 
-    probe = workflow.index("--check-telegram")
-    watcher_pass = workflow.index("Run watcher (", probe)
-    assert probe < watcher_pass
+    watcher_pass = workflow.index("Run watcher (")
+    probe = workflow.index("--check-telegram", watcher_pass)
+    assert watcher_pass < probe
+    assert "if: ${{ always() }}" in workflow[watcher_pass:probe]

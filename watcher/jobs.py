@@ -516,6 +516,9 @@ def run_cloud_supervision_job(ctx: RunContext, now: datetime) -> str:
         or alerts.running_in_ci()
     ):
         return "disabled"
+    # This must happen even when the API call below fails: otherwise a pending
+    # pre-upgrade heartbeat has no condition for unknown-health recovery to block.
+    delivery.bind_cloud_health_conditions(ctx)
     try:
         last_success = cloud.latest_successful_scheduled_run(repository, workflow)
     except cloud.CloudStatusError as exc:

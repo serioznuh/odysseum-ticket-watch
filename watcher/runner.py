@@ -249,11 +249,11 @@ def execute(ctx: RunContext, state_path: str) -> int:
         _run_cloud_news_job(ctx, now, polling, failed)
         # As in check mode, current findings get the first chance to establish
         # their receipt before older safe pending work is replayed.
-        _guard(failed, "outbox-recovery", delivery.recover, ctx, now)
+        _guard(failed, "outbox-recovery", delivery.recover_cloud, ctx, now)
     else:
         # Remind-only runs have no source observations that could supersede the
         # queue, so safe pending work can be recovered immediately.
-        _guard(failed, "outbox-recovery", delivery.recover, ctx, now)
+        _guard(failed, "outbox-recovery", delivery.recover_cloud, ctx, now)
 
     # Read the clock AGAIN. Polling is budgeted but still not free, and a run
     # that started at T-16 and reaches this line at T+5 must send the "sale is

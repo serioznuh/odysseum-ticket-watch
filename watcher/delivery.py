@@ -804,14 +804,8 @@ def reconcile_observations(
         _persist(ctx)
 
 
-def reconcile_cloud_health(ctx: Any, health: str) -> None:
-    """Publish an authoritative Actions result before outbox recovery.
-
-    Older pending heartbeats predate their cloud-health topic. Bind it here so
-    upgrading during an outage cannot replay an unqualified "healthy" message.
-    """
-    if health not in {"healthy", "stale"}:
-        raise ValueError(f"unsupported cloud health {health!r}")
+def bind_cloud_health_conditions(ctx: Any) -> None:
+    """Attach cloud-health conditions to work created before OTW-09 round 2."""
     healthy_topic = _condition_topic("cloud-health", "healthy")
     stale_topic = _condition_topic("cloud-health", "stale")
     changed = False
@@ -835,11 +829,29 @@ def reconcile_cloud_health(ctx: Any, health: str) -> None:
                     changed = True
     if changed:
         _persist(ctx)
+
+
+def reconcile_cloud_health(ctx: Any, health: str) -> None:
+    """Publish an authoritative Actions result before local outbox recovery."""
+    if health not in {"healthy", "stale"}:
+        raise ValueError(f"unsupported cloud health {health!r}")
+    bind_cloud_health_conditions(ctx)
     reconcile_observations(
         ctx,
         observed_domains={"cloud-health"},
         active_conditions={_condition_topic("cloud-health", health)},
     )
+
+
+def recover_cloud(ctx: Any, now: datetime) -> bool:
+    """Recover cloud-safe work without letting the cloud judge its own health.
+
+    The running process proves execution but not that the workflow will finish
+    or its final credential check will pass. The next local API observation is
+    the authority that retires or retries cloud-health-conditioned messages.
+    """
+    bind_cloud_health_conditions(ctx)
+    return recover(ctx, now, blocked_condition_domains={"cloud-health"})
 
 
 def reconcile_source_observations(
