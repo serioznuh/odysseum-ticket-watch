@@ -54,8 +54,11 @@ google_news_queries = [
     "https://news.google.com/rss/search?q=%22dune%3A+part+three%22+(tickets+OR+%22on+sale%22+OR+%2270mm%22+OR+imax)&hl=en-US&gl=US&ceid=US:en",
 ]
 # Optional additional pages scanned with the same phrase detector
-# (plain-HTTP fetch; note that some sites, e.g. imax.com, block bots).
+# by the local check (plain HTTP; some sites, e.g. imax.com, block bots).
 extra_pages = []
+# Pages explicitly known to work from GitHub datacenter IPs. Only these are
+# added to cloud news runs; pathe.fr hosts are always refused.
+cloud_extra_pages = []
 
 [alerts]
 # Send a "watcher alive" summary if nothing was alerted for N days (0 = off).

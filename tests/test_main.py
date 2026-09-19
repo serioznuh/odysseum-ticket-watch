@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+from copy import deepcopy
 from datetime import datetime, timedelta
 
+import pytest
+
 from watcher import __main__ as cli
-from watcher import cinesa, detect, news, notify, pathe
+from watcher import cinesa, detect, jobs, news, notify, pathe
+from watcher import state as state_mod
+from watcher.config import load_config
 from watcher.detect import TZ_PARIS, Snapshot
 from watcher.state import CURRENT_STATE_VERSION, DEFAULT_STATE
+from watcher.state_merge import merge_states
 
 NOW = datetime(2026, 7, 18, 14, 53, tzinfo=TZ_PARIS)
 
@@ -22,6 +29,20 @@ class Cfg:
 
 
 BLIND_STATE = {"last_check_ok": "2026-07-18T07:11:00+02:00"}
+
+
+def test_with_news_flag_parses_for_remind_mode_and_defaults_off():
+    args = cli.build_parser().parse_args(["--mode", "remind", "--with-news"])
+    default = cli.build_parser().parse_args(["--mode", "remind"])
+
+    assert args.mode == "remind"
+    assert args.with_news is True
+    assert default.with_news is False
+
+
+def test_with_news_flag_rejects_check_mode():
+    with pytest.raises(SystemExit):
+        cli.run(["--mode", "check", "--with-news"])
 
 
 def test_error_finding_names_the_watch_and_the_ip_block():
@@ -1364,6 +1385,7 @@ def test_default_remind_mode_makes_no_source_requests(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pathe, "make_client", lambda: touched.append("pathe client"))
     monkeypatch.setattr(pathe, "fetch_snapshot", lambda *a, **k: touched.append("pathe"))
+    monkeypatch.setattr(news, "make_client", lambda: touched.append("news client"))
     monkeypatch.setattr(news, "fetch_news_items", lambda *a, **k: touched.append("news"))
     monkeypatch.setattr(cinesa, "fetch_snapshot", lambda *a, **k: touched.append("cinesa"))
 
@@ -1374,6 +1396,246 @@ def test_default_remind_mode_makes_no_source_requests(tmp_path, monkeypatch):
     assert touched == []
     assert len(sent) == 1
     assert "Sale opens in 10 minutes" in sent[0]
+
+
+CLOUD_NEWS_CONFIG_TOML = """
+[film]
+primary_slug = "dune-troisieme-partie"
+title = "Dune : Troisième partie"
+release_date = "2026-12-16"
+match_patterns = ['dune.{0,8}3']
+
+[cinema]
+slug = "montpellier-multiplexe-odysseum"
+name = "Pathé Odysseum"
+city = "Montpellier"
+
+[news]
+enabled = true
+min_confidence = "low"
+google_news_queries = ["https://news.google.com/rss/search?q=dune"]
+extra_pages = ["https://local-only.example/dune"]
+cloud_extra_pages = []
+
+[alerts]
+heartbeat_days = 0
+failure_streak_threshold = 3
+stale_check_hours = 0
+
+[cinesa]
+enabled = true
+film_id = "HO00003228"
+site_id = "032"
+"""
+
+CLOUD_NEWS_ITEM = {
+    "title": "Dune 3 tickets go on sale 5 November 2026",
+    "url": "https://press.example/dune-sale",
+    "summary": "",
+    "source": "Example Press",
+    "published": NOW - timedelta(days=1),
+}
+
+
+class _NewsClient:
+    def close(self):
+        pass
+
+
+def _cloud_news_fixture(tmp_path, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat")
+    config = tmp_path / "config.toml"
+    config.write_text(CLOUD_NEWS_CONFIG_TOML, encoding="utf-8")
+    state = tmp_path / "state.json"
+    initial = deepcopy(DEFAULT_STATE)
+    initial["last_check_ok"] = "2026-07-18T07:11:00+02:00"
+    initial["last_catalogue_ok"] = "2026-07-18T07:11:00+02:00"
+    state_mod.save_state(state, initial)
+    sent = []
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda cfg, text, **kw: sent.append(text) or True
+    )
+    monkeypatch.setattr(news, "make_client", _NewsClient)
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(NOW, NOW))
+    return config, state, sent, initial
+
+
+def test_cloud_news_runs_only_news_and_local_replay_is_suppressed(
+    tmp_path, monkeypatch
+):
+    config, state, sent, base = _cloud_news_fixture(tmp_path, monkeypatch)
+    calls = []
+
+    def forbidden(name):
+        def fail(*args, **kwargs):
+            raise AssertionError(f"cloud touched {name}")
+
+        return fail
+
+    def fake_news(client, cfg, **kwargs):
+        calls.append(kwargs.get("cloud"))
+        return [dict(CLOUD_NEWS_ITEM)]
+
+    monkeypatch.setattr(news, "fetch_news_items", fake_news)
+    monkeypatch.setattr(pathe, "make_client", forbidden("Pathé client"))
+    monkeypatch.setattr(pathe, "fetch_snapshot", forbidden("Pathé"))
+    monkeypatch.setattr(cinesa, "fetch_snapshot", forbidden("Cinesa"))
+
+    assert cli.run(
+        [
+            "--config", str(config), "--state", str(state),
+            "--mode", "remind", "--with-news",
+        ]
+    ) == 0
+
+    expected_key = "news:" + hashlib.sha1(
+        CLOUD_NEWS_ITEM["url"].encode()
+    ).hexdigest()[:16]
+    cloud_state = state_mod.load_state(state)
+    assert calls == [True]
+    assert len(sent) == 1
+    assert expected_key in cloud_state["alerts"]
+    assert cloud_state["last_check_ok"] == base["last_check_ok"]
+    assert cloud_state["last_catalogue_ok"] == base["last_catalogue_ok"]
+
+    # An overlapping local process may have analysed the feed from its stale
+    # pre-sync snapshot. Once runtime-state reconciliation brings in the cloud
+    # receipt, replaying that finding is harmless and makes no second send.
+    cfg = load_config(config)
+    stale_findings = detect.analyze_news(
+        [dict(CLOUD_NEWS_ITEM)], cfg, deepcopy(base), NOW
+    )
+    assert [finding.key for finding in stale_findings] == [expected_key]
+    merged = merge_states(base, cloud_state, deepcopy(base), now=NOW)
+    replay_ctx = jobs.RunContext(cfg=cfg, state=merged, clock=lambda: NOW)
+    assert jobs.deliver(replay_ctx, stale_findings, NOW) is False
+    assert len(sent) == 1
+
+    # The next real local check sees that same receipt and suppresses the same
+    # unchanged key, while retaining its normal Pathé + local-news selection.
+    state_mod.save_state(state, merged)
+    config.write_text(
+        CLOUD_NEWS_CONFIG_TOML.replace(
+            '[cinesa]\nenabled = true\nfilm_id = "HO00003228"\nsite_id = "032"',
+            "[cinesa]\nenabled = false",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(NOW, NOW))
+    monkeypatch.setattr(pathe, "make_client", _NewsClient)
+    monkeypatch.setattr(
+        pathe, "fetch_snapshot", lambda client, cfg, **kwargs: Snapshot()
+    )
+
+    assert cli.run(
+        ["--config", str(config), "--state", str(state), "--mode", "check"]
+    ) == 0
+
+    assert calls == [True, False]
+    assert len(sent) == 1
+
+
+def test_news_sent_locally_is_suppressed_by_the_next_cloud_pass(
+    tmp_path, monkeypatch
+):
+    config, state, sent, _initial = _cloud_news_fixture(tmp_path, monkeypatch)
+    config.write_text(
+        CLOUD_NEWS_CONFIG_TOML.replace(
+            '[cinesa]\nenabled = true\nfilm_id = "HO00003228"\nsite_id = "032"',
+            "[cinesa]\nenabled = false",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        news,
+        "fetch_news_items",
+        lambda client, cfg, **kwargs: [dict(CLOUD_NEWS_ITEM)],
+    )
+    monkeypatch.setattr(pathe, "make_client", _NewsClient)
+    monkeypatch.setattr(
+        pathe, "fetch_snapshot", lambda client, cfg, **kwargs: Snapshot()
+    )
+
+    assert cli.run(
+        ["--config", str(config), "--state", str(state), "--mode", "check"]
+    ) == 0
+    assert len(sent) == 1
+
+    config.write_text(CLOUD_NEWS_CONFIG_TOML, encoding="utf-8")
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(NOW, NOW))
+    monkeypatch.setattr(
+        pathe,
+        "make_client",
+        lambda: (_ for _ in ()).throw(AssertionError("cloud made a Pathé client")),
+    )
+    monkeypatch.setattr(
+        cinesa,
+        "fetch_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("cloud touched Cinesa")
+        ),
+    )
+
+    assert cli.run(
+        [
+            "--config", str(config), "--state", str(state),
+            "--mode", "remind", "--with-news",
+        ]
+    ) == 0
+    assert len(sent) == 1
+
+
+def test_quiet_cloud_news_pass_does_not_dirty_state(tmp_path, monkeypatch):
+    config, state, sent, _initial = _cloud_news_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(news, "fetch_news_items", lambda *args, **kwargs: [])
+    before = state.read_bytes()
+
+    assert cli.run(
+        [
+            "--config", str(config), "--state", str(state),
+            "--mode", "remind", "--with-news",
+        ]
+    ) == 0
+
+    assert sent == []
+    assert state.read_bytes() == before
+
+
+def test_cloud_news_failure_is_nonfatal_and_reminders_still_go_first(
+    tmp_path, monkeypatch
+):
+    sent: list[str] = []
+    trace: list[str] = []
+    config, state, _target = _reminder_fixture(tmp_path, monkeypatch, sent)
+    config.write_text(
+        REMINDER_CONFIG_TOML.replace(
+            "enabled = false", "enabled = true", 1
+        ),
+        encoding="utf-8",
+    )
+
+    def traced_send(cfg, text, **kwargs):
+        trace.append("telegram")
+        sent.append(text)
+        return True
+
+    def broken_client():
+        trace.append("news")
+        raise RuntimeError("temporary feed client failure")
+
+    monkeypatch.setattr(notify, "send_telegram", traced_send)
+    monkeypatch.setattr(news, "make_client", broken_client)
+
+    assert cli.run(
+        [
+            "--config", str(config), "--state", str(state),
+            "--mode", "remind", "--with-news",
+        ]
+    ) == 0
+
+    assert trace[:2] == ["telegram", "news"]
+    assert len(sent) == 1
 
 
 def test_a_newly_published_opening_is_alerted_in_the_run_that_polls_it(

@@ -37,6 +37,7 @@ class Config:
     news_max_alerts_per_run: int
     google_news_queries: list[str]
     extra_pages: list[str]
+    cloud_extra_pages: list[str]
     # [alerts]
     heartbeat_days: int
     failure_streak_threshold: int
@@ -146,6 +147,7 @@ def load_config(path: str | Path) -> Config:
         news_max_alerts_per_run=int(news.get("max_alerts_per_run", 3)),
         google_news_queries=list(news.get("google_news_queries", [])),
         extra_pages=list(news.get("extra_pages", [])),
+        cloud_extra_pages=list(news.get("cloud_extra_pages", [])),
         heartbeat_days=int(alerts.get("heartbeat_days", 7)),
         failure_streak_threshold=int(alerts.get("failure_streak_threshold", 3)),
         stale_check_hours=int(alerts.get("stale_check_hours", 72)),

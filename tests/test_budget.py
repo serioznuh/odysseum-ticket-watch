@@ -237,6 +237,7 @@ def test_a_catalogue_call_that_runs_out_of_budget_still_fails_the_check():
 class NewsCfg:
     google_news_queries: ClassVar[list[str]] = ["https://feed/1", "https://feed/2"]
     extra_pages: ClassVar[list[str]] = ["https://page/1"]
+    cloud_extra_pages: ClassVar[list[str]] = ["https://cloud-page/1"]
 
 
 def test_news_stops_fetching_once_the_budget_is_gone():
@@ -261,6 +262,60 @@ def test_news_stops_fetching_once_the_budget_is_gone():
 
     assert fetched == ["https://feed/1"]  # the second feed and the page are dropped
     assert [i["title"] for i in items] == ["Dune"]
+
+
+def test_cloud_news_uses_google_and_opted_in_pages_but_never_pathe():
+    class CloudCfg:
+        google_news_queries: ClassVar[list[str]] = [
+            "https://news.google.com/rss/search?q=dune",
+            "https://feeds.example/rss",
+            "https://www.pathe.fr/news/rss",
+        ]
+        extra_pages: ClassVar[list[str]] = ["https://local-only.example/dune"]
+        cloud_extra_pages: ClassVar[list[str]] = [
+            "https://cloud-safe.example/dune",
+            "https://pathe.fr/announcements",
+        ]
+
+    fetched = []
+
+    def handler(request):
+        fetched.append(str(request.url))
+        if request.url.host == "news.google.com":
+            return httpx.Response(200, text="<rss><channel /></rss>")
+        return httpx.Response(200, text="<html>Dune tickets on sale</html>")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    news.fetch_news_items(client, CloudCfg, cloud=True)
+
+    assert fetched == [
+        "https://news.google.com/rss/search?q=dune",
+        "https://cloud-safe.example/dune",
+    ]
+    assert not any("pathe.fr" in url for url in fetched)
+
+
+def test_local_news_source_selection_is_unchanged():
+    class LocalCfg:
+        google_news_queries: ClassVar[list[str]] = ["https://feeds.example/rss"]
+        extra_pages: ClassVar[list[str]] = ["https://local.example/dune"]
+        cloud_extra_pages: ClassVar[list[str]] = ["https://cloud.example/dune"]
+
+    fetched = []
+
+    def handler(request):
+        fetched.append(str(request.url))
+        return httpx.Response(200, text="<rss><channel /></rss>")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    news.fetch_news_items(client, LocalCfg)
+
+    assert fetched == [
+        "https://feeds.example/rss",
+        "https://local.example/dune",
+    ]
 
 
 # ---------------------------------------------- the Cinesa token step (round 1)

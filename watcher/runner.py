@@ -7,9 +7,9 @@ The order *is* the contract (OTW-19):
    polling and retries. Re-reading the clock afterwards fixed the *wording* of a
    late reminder but could not give back a warning window a slow source had
    already eaten.
-2. **Local-sync supervision** (no network, no budget), then the adaptive-cadence
-   guard, still in front of everything the Pathé + news half fetches, then the
-   Pathé, news and Cinesa polling jobs. Each polling job runs under an
+2. **Local-sync supervision** (no network, no budget), then either the local
+   adaptive-cadence guard and Pathé/news/Cinesa jobs, or the explicit cloud-safe
+   news job. Each polling job runs under an
    aggregate time budget, and each job here is guarded, so a job that is
    skipped, disabled or outright broken cannot take the rest of the pass with it.
 3. **Delivery** of this pass's findings (dedup, coalescing, durable outbox,
@@ -32,7 +32,7 @@ import logging
 from datetime import datetime
 from typing import Callable
 
-from . import delivery, jobs, pathe
+from . import delivery, jobs, news, pathe
 from . import state as state_mod
 from .budget import Budget
 from .detect import Finding, Snapshot
@@ -147,6 +147,41 @@ def _run_source_jobs(
     return sent_any, pathe_out.snapshot
 
 
+def _run_cloud_news_job(
+    ctx: RunContext,
+    now: datetime,
+    polling: Budget,
+    failed: list[str],
+) -> bool:
+    """Run only cloud-safe news sources and deliver their findings.
+
+    Source failures are intentionally non-fatal: reminders and supervision are
+    the cloud pass's safety duties. Delivery failures still use the normal
+    guarded path because losing durable notification work is not a feed outage.
+    """
+    client = None
+    try:
+        client = news.make_client()
+        findings = jobs.run_news_job(
+            ctx,
+            client,
+            now,
+            polling.child(jobs.NEWS_BUDGET_SECONDS, "cloud news check"),
+            cloud=True,
+        )
+    except Exception:
+        log.exception("cloud news check failed (non-fatal)")
+        findings = []
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                log.exception("cloud news client cleanup failed (non-fatal)")
+    delivered = _guard(failed, "delivery", jobs.deliver, ctx, findings, now)
+    return bool(delivered)
+
+
 def execute(ctx: RunContext, state_path: str) -> int:
     """Run one pass and persist its state. Returns the process exit code."""
     # The run-start reading. Every piece of bookkeeping uses it on purpose —
@@ -190,6 +225,12 @@ def execute(ctx: RunContext, state_path: str) -> int:
             now,
             sent_now or bool(recovered),
         )
+    elif ctx.with_news:
+        polling = ctx.budget(jobs.NEWS_BUDGET_SECONDS, "cloud news polling")
+        _run_cloud_news_job(ctx, now, polling, failed)
+        # As in check mode, current findings get the first chance to establish
+        # their receipt before older safe pending work is replayed.
+        _guard(failed, "outbox-recovery", delivery.recover, ctx, now)
     else:
         # Remind-only runs have no source observations that could supersede the
         # queue, so safe pending work can be recovered immediately.
