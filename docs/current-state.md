@@ -47,8 +47,8 @@ A single-user Telegram watcher covering **two independent targets**:
   firing. This half *owns* the ladder: 5-min firings give three chances inside
   a 15-min warning. Runs from a residential IP: Akamai blocks Pathé from
   datacenter IPs, and Cloudflare challenges Cinesa from them.
-- **Cloud half** — `.github/workflows/watch.yml` cron `*/15`: supervision, plus
-  reminders as a **failover** rather than as their owner. It passes
+- **Cloud half** — `.github/workflows/watch.yml` cron `*/15`: cloud-safe news,
+  supervision, and reminders as a **failover** rather than their owner. It passes
   `--reminder-grace-minutes 25` (> the local 5-min interval), so it only sends
   a reminder the Mac demonstrably missed; that wait is floored at the local
   firing interval, so the failover can never reach a rung before the owner's
@@ -58,9 +58,9 @@ A single-user Telegram watcher covering **two independent targets**:
   that ordering *and* because `local-check.sh` pulls before it runs — a Mac
   waking from sleep sees what the cloud sent before deciding. Measured to
   2026-09-03 this cron fired 10.9% of its schedule (median gap 58 min, max 11.5
-  h), which is why the ladder is no longer cloud-owned (OTW-15). The scheduled
-  pass never calls Pathé (a manual `check` dispatch would, but is 403'd from
-  datacenter IPs). It never calls Cinesa either.
+  h), which is why the ladder is no longer cloud-owned (OTW-15). Scheduled
+  `remind --with-news` passes read Google News plus opted-in `cloud_extra_pages`;
+  they never call Pathé/Cinesa; failures cannot block reminders/supervision; plain `remind` is request-free.
 - **Format-specific reminders** — standard tickets no longer cancel the IMAX
   ladder. Existing `formats_seen` provides the format evidence without manual
   state edits. The opening-time message says availability is unconfirmed and
@@ -87,7 +87,7 @@ A single-user Telegram watcher covering **two independent targets**:
   Only complete, positive contradictory evidence retires a member. Per-member conditions and
   expiries preserve unaffected merged siblings across supersession, acknowledgement and expiry.
   The next opening owns the ladder; booking retires old pings while recent openings keep war-room cadence.
-  Overlapping hosts can still both send: this is not exactly-once or cross-host exclusion.
+  Overlapping local/cloud hosts can still send the same news finding: claims are not distributed locks.
 - **Pathé failure model** — catalogue failures still blind the check, while
   every best-effort detail/showtimes result explicitly distinguishes data,
   authoritative emptiness, expected refusal and unexpected failure. One bad

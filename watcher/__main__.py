@@ -4,10 +4,12 @@ Modes:
   check  — full pass: Pathé API + news feeds, alerts, reminders, heartbeat.
   remind — state-only pass (no Pathé/news/Cinesa requests): send due sale
            reminders and run supervision.
+  remind --with-news — add cloud-safe news feeds; still no Pathé or Cinesa.
 
 Usage:
   python -m watcher --mode check [--dry-run] [--verbose]
   python -m watcher --mode remind
+  python -m watcher --mode remind --with-news
   python -m watcher --test-telegram
 """
 
@@ -58,6 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="config.toml")
     parser.add_argument("--state", default=None, help="override state file path")
     parser.add_argument("--mode", choices=["check", "remind"], default="check")
+    parser.add_argument(
+        "--with-news",
+        action="store_true",
+        help="remind mode: also scan cloud-safe news sources; never Pathé or Cinesa",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print alerts instead of sending; do not save state")
     parser.add_argument(
         "--bootstrap-state",
@@ -100,6 +107,8 @@ def run(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.bootstrap_state and args.dry_run:
         parser.error("--bootstrap-state cannot be combined with --dry-run")
+    if args.with_news and args.mode != "remind":
+        parser.error("--with-news requires --mode remind")
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -144,6 +153,7 @@ def run(argv: list[str] | None = None) -> int:
         # place that decides what "now" means for a pass.
         clock=lambda: datetime.now(TZ_PARIS),
         mode=args.mode,
+        with_news=args.with_news,
         dry_run=args.dry_run,
         adaptive_cadence=args.adaptive_cadence,
         skip_if_checked_within=args.skip_if_checked_within,

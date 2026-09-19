@@ -1,8 +1,7 @@
 # odysseum-ticket-watch
 
-A small Telegram watcher that tells you **in advance** when tickets for *Dune :
-Troisième partie* go on sale at **Pathé Odysseum** (Montpellier), then counts down
-to the opening. It never auto-buys; edit [config.toml](config.toml) for another watch.
+A small Telegram watcher that tells you **in advance** when *Dune : Troisième partie* tickets go
+on sale at **Pathé Odysseum** (Montpellier), then counts down. It never auto-buys; edit [config.toml](config.toml) for another watch.
 
 ## What it sends you
 
@@ -43,7 +42,7 @@ datacenter IPs (verified: 403 from Actions, 200 from a home IP, same code):
 | Where | What | Why |
 |---|---|---|
 | your Mac — launchd, every 5 min | Pathé + news check (adaptive cadence); **owns the reminder ladder**; syncs the `runtime-state` ref | needs a residential IP |
-| GitHub Actions — cron `*/15`, ~11% reliable | supervision + reminder **failover** (25 min grace), reading the shared state | covers a sleeping Mac; no Pathé access required |
+| GitHub Actions — cron `*/15`, ~11% reliable | cloud-safe news + supervision + reminder **failover** (25 min grace), sharing dedup state | covers a sleeping Mac; never calls Pathé or Cinesa |
 
 Not every 403 is a block: the showtimes endpoint serves only `isMovie` films, so
 event listings (the 70 mm ones) always answer `"No movie allowed !"`, and their
@@ -101,6 +100,7 @@ source .env
 .venv/bin/python -m watcher --test-telegram          # sends a hello message
 .venv/bin/python -m watcher --mode check --dry-run   # full check; logs alerts, sends nothing, state untouched
 .venv/bin/python -m watcher --mode check             # real run: alerts sent, state saved
+.venv/bin/python -m watcher --mode remind --with-news --dry-run  # cloud-safe news; plain remind stays request-free
 ```
 
 ### State bootstrap and recovery
@@ -132,7 +132,7 @@ the watcher stopped rather than risk duplicate historical notifications.
 
 ## Deploy
 
-**Cloud half** (reminders + supervision):
+**Cloud half** (cloud-safe news + reminder failover + supervision):
 
 ```bash
 gh repo create odysseum-ticket-watch --public --source . --push
@@ -185,7 +185,7 @@ deployment on `main` is independent of that state history.
 | `news.max_age_days` | `10` | Ignore news older than this. |
 | `news.max_alerts_per_run` | `3` | Cap on news alerts per check. |
 | `news.google_news_queries` | *(see file)* | Google News RSS search URLs to scan. |
-| `news.extra_pages` | `[]` | Extra URLs scanned with the same phrase rules. |
+| `news.extra_pages`, `news.cloud_extra_pages` | `[]`, `[]` | Extra URLs scanned locally, and the separate explicit allow-list scanned from the cloud. Cloud mode otherwise reads only `news.google.com` RSS and always refuses `pathe.fr`/`cinesa.es` hosts. |
 | `alerts.heartbeat_days` | `7` | 💤 "alive" summary when nothing was alerted for N days. `0` = off. |
 | `alerts.failure_streak_threshold` | `3` | ⚠️ after N consecutive failed Pathé checks. |
 | `alerts.stale_check_hours` | `18` | Cloud pass ⚠️ when the last successful check is older than this (local job died, or the Mac stayed shut). `0` = off. Sized from measured gaps: 4 h median, 12.9 h worst ordinary overnight — below ~16 h, normal nights trip it. |

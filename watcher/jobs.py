@@ -57,6 +57,7 @@ class RunContext:
     state: dict
     clock: Callable[[], datetime]
     mode: str = "check"
+    with_news: bool = False
     dry_run: bool = False
     adaptive_cadence: bool = False
     skip_if_checked_within: float = 0.0
@@ -198,17 +199,22 @@ def run_pathe_job(
 
 
 def run_news_job(
-    ctx: RunContext, client: Any, now: datetime, budget: Budget | None
+    ctx: RunContext,
+    client: Any,
+    now: datetime,
+    budget: Budget | None,
+    *,
+    cloud: bool = False,
 ) -> list[Finding]:
     """News leads. Non-fatal by design: a dead feed must not blind the watch.
 
-    Selection still follows the Pathé cadence exactly as before — decoupling it
-    for cloud news coverage is OTW-08's job, not this one's.
+    Local selection still follows the Pathé cadence. Cloud selection is
+    explicit and filters sources in ``news.fetch_news_items``.
     """
     if not ctx.cfg.news_enabled:
         return []
     try:
-        items = news.fetch_news_items(client, ctx.cfg, budget=budget)
+        items = news.fetch_news_items(client, ctx.cfg, budget=budget, cloud=cloud)
         return detect.analyze_news(items, ctx.cfg, ctx.state, now)
     except Exception:
         log.exception("news check failed (non-fatal)")

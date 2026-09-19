@@ -1,12 +1,13 @@
-# Cloud half of the watcher: reminder passes + supervision.
+# Cloud half of the watcher: cloud-safe news + reminder failover + supervision.
 #
 # The daily Pathé check runs on a home machine via scripts/local-check.sh
 # (launchd), NOT here: Akamai blocks www.pathe.fr/api from GitHub's
 # datacenter IPs (verified 2026-07-06 — 403 on every request that succeeds
 # from a residential IP). The local check pushes live JSON through the
-# dedicated runtime-state ref; this workflow reads it to alert if the local check stops running
-# (stale state), and to stand in as the *failover* for the 24h/2h/15min
-# pre-sale reminders — the local half owns those, because this cron is far too
+# dedicated runtime-state ref; this workflow reads Google News (plus explicitly
+# opted-in cloud pages), alerts if the local check stops, and stands in as the
+# *failover* for the 24h/2h/15min pre-sale reminders — the local half owns those,
+# because this cron is far too
 # unreliable to own them: measured over the 9.6 days to 2026-09-03 it ran 100
 # times of the 920 that "*/15" implies (10.9%), median gap 58 min, max 11.5 h
 # (OTW-15).
@@ -18,7 +19,7 @@ name: ticket-watch
 
 on:
   schedule:
-    - cron: "*/15 * * * *"  # reminder + supervision pass (exits fast when nothing is due)
+    - cron: "*/15 * * * *"  # cloud-safe news + reminder failover + supervision
   workflow_dispatch:
     inputs:
       mode:
@@ -60,10 +61,13 @@ jobs:
         id: mode
         run: |
           MODE=remind
+          WITH_NEWS=--with-news
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             MODE="${{ inputs.mode }}"
+            WITH_NEWS=
           fi
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "with_news=$WITH_NEWS" >> "$GITHUB_OUTPUT"
 
       - name: Synchronize runtime state (before)
         continue-on-error: true
@@ -89,7 +93,9 @@ jobs:
             # a test against config.toml's offsets and the launchd plist.
             # It applies to check mode too — reminders are computed in both
             # modes, and a manual dispatch from here is still the cloud.
-            python -m watcher --state .cache/state-sync/state.json --mode "${{ steps.mode.outputs.mode }}" --reminder-grace-minutes 25 ${{ inputs.dry_run == true && '--dry-run' || '' }}
+            # Scheduled remind passes add --with-news; manual modes stay as
+            # selected, so a manual check keeps its existing full-check path.
+            python -m watcher --state .cache/state-sync/state.json --mode "${{ steps.mode.outputs.mode }}" --reminder-grace-minutes 25 ${{ steps.mode.outputs.with_news }} ${{ inputs.dry_run == true && '--dry-run' || '' }}
           fi
 
       - name: Synchronize runtime state (after)

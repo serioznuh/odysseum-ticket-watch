@@ -8,6 +8,7 @@ import re
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -18,6 +19,50 @@ log = logging.getLogger(__name__)
 REQUEST_TIMEOUT = 20.0
 
 TAG_RE = re.compile(r"<[^>]+>")
+
+
+def make_client() -> httpx.Client:
+    """Return the cloud-safe client used when news runs without Pathé.
+
+    Redirects stay disabled so an allowed feed or explicitly opted-in page
+    cannot bounce a cloud request onto a Pathé host after the URL guard.
+    """
+    return httpx.Client(timeout=REQUEST_TIMEOUT, follow_redirects=False)
+
+
+def _hostname(url: str) -> str:
+    return (urlsplit(url).hostname or "").rstrip(".").lower()
+
+
+def _is_forbidden_cloud_url(url: str) -> bool:
+    host = _hostname(url)
+    return any(
+        host == domain or host.endswith(f".{domain}")
+        for domain in ("pathe.fr", "cinesa.es")
+    )
+
+
+def _cloud_feed_allowed(url: str) -> bool:
+    host = _hostname(url)
+    return host == "news.google.com" or host.endswith(".news.google.com")
+
+
+def _cloud_urls(cfg: Any) -> tuple[list[str], list[str]]:
+    feeds: list[str] = []
+    pages: list[str] = []
+    for url in cfg.google_news_queries:
+        if _is_forbidden_cloud_url(url):
+            log.error("cloud news refused cinema-source URL: %s", url)
+        elif not _cloud_feed_allowed(url):
+            log.warning("cloud news skipped non-Google feed: %s", url)
+        else:
+            feeds.append(url)
+    for url in getattr(cfg, "cloud_extra_pages", []):
+        if _is_forbidden_cloud_url(url):
+            log.error("cloud news refused cinema-source URL: %s", url)
+        else:
+            pages.append(url)
+    return feeds, pages
 
 
 def strip_tags(markup: str) -> str:
@@ -52,7 +97,11 @@ def parse_rss(xml_text: str) -> list[dict]:
 
 
 def fetch_news_items(
-    client: httpx.Client, cfg: Any, budget: Budget | None = None
+    client: httpx.Client,
+    cfg: Any,
+    budget: Budget | None = None,
+    *,
+    cloud: bool = False,
 ) -> list[dict]:
     """Fetch all configured feeds and extra pages. Failures are logged, not fatal.
 
@@ -62,7 +111,10 @@ def fetch_news_items(
     still analysed.
     """
     items: list[dict] = []
-    for feed_url in cfg.google_news_queries:
+    feed_urls, page_urls = (
+        _cloud_urls(cfg) if cloud else (cfg.google_news_queries, cfg.extra_pages)
+    )
+    for feed_url in feed_urls:
         if out_of_time(budget):
             log.warning("news feeds cut short: %s", budget.exhausted_message())
             return items
@@ -75,7 +127,7 @@ def fetch_news_items(
         except httpx.HTTPError as e:
             log.warning("news feed failed %s: %s", feed_url, e)
 
-    for page_url in cfg.extra_pages:
+    for page_url in page_urls:
         if out_of_time(budget):
             log.warning("watched pages cut short: %s", budget.exhausted_message())
             return items
