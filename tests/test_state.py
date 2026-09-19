@@ -286,6 +286,25 @@ def test_degraded_earlier_listing_cannot_move_sale_target_later():
     assert st["sale_target"] == earlier
 
 
+def test_reported_passed_opening_stays_target_through_open_ping_window():
+    st = fresh_state()
+    target = iso_in(timedelta(minutes=-30))
+    st["sale_target"] = target
+    snap = Snapshot(
+        matched_shows=[
+            {
+                "slug": "dune",
+                "title": "Dune",
+                "salesOpeningDatetime": target,
+            }
+        ]
+    )
+
+    update_from_snapshot(st, snap, None, NOW)
+
+    assert st["sale_target"] == target
+
+
 def test_undelivered_one_shot_alerts_leave_their_baselines_alone():
     """Failed NEW_LISTING/TICKETS_AVAILABLE sends must retry, while current
     sale and ticket facts still move forward."""

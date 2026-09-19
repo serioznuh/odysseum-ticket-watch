@@ -128,7 +128,7 @@ def _alert_identity(kinds: list[str], topics: list[str]) -> str | None:
     """
     if "WATCHER_ERROR" not in kinds:
         return None
-    conditions = sorted(topic for topic in topics if _condition(topic) is not None)
+    conditions = sorted({topic for topic in topics if _condition(topic) is not None})
     return json.dumps(["WATCHER_ERROR", conditions], separators=(",", ":"))
 
 
@@ -623,7 +623,7 @@ def deliver_reminder(
     offset = str(reminder["offset"])
     target_dt = as_aware(parse_iso(target))
     if offset == "open":
-        expiry = target_dt + timedelta(hours=6)
+        expiry = target_dt + state_mod.OPEN_PING_VALIDITY
     else:
         offsets = sorted(ctx.cfg.reminder_offsets_minutes, reverse=True)
         index = offsets.index(int(offset))
@@ -814,11 +814,22 @@ def reconcile_source_observations(
                 if day in open_days:
                     active.add(_condition_topic(domain, "open"))
 
-        target = ctx.state.get("sale_target")
-        if target is not None or pathe_snapshot.sale_observations_complete():
+        reported_targets = {
+            show["salesOpeningDatetime"]
+            for show in pathe_snapshot.matched_shows
+            if show.get("slug")
+            and show.get("salesOpeningDatetime")
+            and detect.selected_listing(show, ctx.cfg)
+            and _listing_metadata_authoritative(
+                pathe_snapshot, show["slug"], show
+            )
+        }
+        if pathe_snapshot.sale_observations_complete():
             observed.add("pathe-sale-target")
-        if target is not None:
-            active.add(_condition_topic("pathe-sale-target", target))
+            active.update(
+                _condition_topic("pathe-sale-target", target)
+                for target in reported_targets
+            )
 
     if cinesa_snapshot is not None and cinesa_snapshot.days:
         known = {day["date"] for day in cinesa_snapshot.days}

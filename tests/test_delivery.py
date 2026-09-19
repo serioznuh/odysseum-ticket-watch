@@ -956,6 +956,7 @@ def test_authoritative_sale_withdrawal_retires_failed_open_ping(
     state_path = tmp_path / "state.json"
     target = (NOW + timedelta(hours=2)).isoformat()
     ctx = context(state_path)
+    ctx.state["sale_target"] = target
     calls = []
     monkeypatch.setattr(
         notify,
@@ -966,17 +967,104 @@ def test_authoritative_sale_withdrawal_retires_failed_open_ping(
     assert delivery.deliver_reminder(
         ctx, {"target": target, "offset": 120}, NOW
     ) is False
-    ctx.state["sale_target"] = None
+    snapshot = Snapshot()
+    state_mod.update_from_snapshot(ctx.state, snapshot, Cfg, NOW)
+    assert ctx.state["sale_target"] is None
     delivery.reconcile_source_observations(
         ctx,
         now=NOW,
-        pathe_snapshot=Snapshot(),
+        pathe_snapshot=snapshot,
         pathe_health="healthy",
     )
 
     assert ctx.state["outbox"] == {}
     assert delivery.recover(ctx, NOW + timedelta(minutes=1)) is False
     assert calls == ["attempt"]
+
+
+def test_showtimes_degradation_cannot_retire_failed_open_ping(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    target = (NOW - timedelta(minutes=30)).isoformat()
+    ctx = context(state_path)
+    ctx.state["sale_target"] = target
+    calls = []
+    outcomes = iter((notify.SendResult("failed"), notify.SendResult("confirmed")))
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda *args, **kwargs: calls.append("attempt") or next(outcomes),
+    )
+    degraded = Snapshot(
+        matched_shows=[{"slug": "dune", "title": "Dune"}],
+        listing_results={
+            "dune": {"showtimes": FetchResult.failed("showtimes unavailable")}
+        },
+    )
+
+    assert delivery.deliver_reminder(
+        ctx, {"target": target, "offset": "open"}, NOW
+    ) is False
+    state_mod.update_from_snapshot(ctx.state, degraded, Cfg, NOW)
+    assert ctx.state["sale_target"] == target
+    delivery.reconcile_source_observations(
+        ctx,
+        now=NOW,
+        pathe_snapshot=degraded,
+        pathe_health="degraded",
+    )
+
+    assert len(ctx.state["outbox"]) == 1
+    restarted = context(state_path, state=load_state(state_path))
+    assert delivery.recover(restarted, NOW + timedelta(minutes=1)) is True
+    assert calls == ["attempt", "attempt"]
+
+
+def test_new_state_target_cannot_retire_still_reported_open_ping(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    old = (NOW - timedelta(minutes=30)).isoformat()
+    new = (NOW + timedelta(days=1)).isoformat()
+    ctx = context(state_path)
+    calls = []
+    outcomes = iter((notify.SendResult("failed"), notify.SendResult("confirmed")))
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda *args, **kwargs: calls.append("attempt") or next(outcomes),
+    )
+
+    assert delivery.deliver_reminder(
+        ctx, {"target": old, "offset": "open"}, NOW
+    ) is False
+    ctx.state["sale_target"] = new
+    snapshot = Snapshot(
+        matched_shows=[
+            {
+                "slug": "dune",
+                "title": "Dune IMAX 70mm",
+                "salesOpeningDatetime": old,
+            },
+            {
+                "slug": "dune-next",
+                "title": "Dune IMAX 70mm",
+                "salesOpeningDatetime": new,
+            },
+        ]
+    )
+    delivery.reconcile_source_observations(
+        ctx,
+        now=NOW,
+        pathe_snapshot=snapshot,
+        pathe_health="healthy",
+    )
+
+    assert len(ctx.state["outbox"]) == 1
+    restarted = context(state_path, state=load_state(state_path))
+    assert delivery.recover(restarted, NOW + timedelta(minutes=1)) is True
+    assert calls == ["attempt", "attempt"]
 
 
 def test_unknown_sale_withdrawal_preserves_failed_open_ping(tmp_path, monkeypatch):

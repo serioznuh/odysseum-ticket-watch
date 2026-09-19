@@ -648,6 +648,73 @@ def test_pending_reminder_waits_for_polling_and_is_retired_when_opening_moves(
     )
 
 
+def test_failed_open_ping_survives_healthy_poll_for_local_and_cloud_retry(
+    tmp_path, monkeypatch
+):
+    """A reported opening stays live through the six-hour ping window after a
+    failed send, both for the next local check and the cloud failover."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    now = NOW
+    target = (now - timedelta(minutes=30)).isoformat()
+    slug = "dune-troisieme-partie"
+    show = {
+        "slug": slug,
+        "title": "Dune : Troisième partie",
+        "salesOpeningDatetime": target,
+        "isMovie": True,
+    }
+    snapshot = Snapshot(
+        matched_shows=[show],
+        listing_results={
+            slug: {
+                "detail": detect.FetchResult.authoritative(show),
+                "showtimes": detect.FetchResult.authoritative({}),
+            }
+        },
+    )
+    state = json.loads(runner.state.read_text(encoding="utf-8"))
+    state["sale_target"] = target
+    state["sales"] = {slug: target}
+    state["shows_seen"] = [slug]
+    runner.state.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(now))
+
+    failed = runner.run(snapshot, delivered=False)
+    assert failed["sale_target"] == target
+    assert len(failed["outbox"]) == 1
+    pending = runner.state.read_bytes()
+
+    local = runner.run(snapshot, delivered=True)
+    assert len(runner.sent) == 1
+    assert "Scheduled sale time reached" in runner.sent[0]
+    assert "open" in local["reminders_sent"][target]
+
+    runner.state.write_bytes(pending)
+    cloud_sent = []
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda cfg, text, **kw: cloud_sent.append(text) or True,
+    )
+    assert cli.run(
+        [
+            "--config",
+            str(runner.config),
+            "--state",
+            str(runner.state),
+            "--mode",
+            "remind",
+            "--reminder-grace-minutes",
+            "25",
+        ]
+    ) == 0
+    assert len(cloud_sent) == 1
+    assert "Scheduled sale time reached" in cloud_sent[0]
+    cloud = json.loads(runner.state.read_text(encoding="utf-8"))
+    assert "open" in cloud["reminders_sent"][target]
+
+
 def test_healthy_poll_retires_failed_blind_alert_before_recovery(
     tmp_path, monkeypatch
 ):

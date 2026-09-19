@@ -245,12 +245,16 @@ class Snapshot:
         return show is None or bool(detail.data)
 
     def sale_observations_complete(self) -> bool:
-        """Whether later/absent sale metadata can replace the current target."""
+        """Whether absent sale metadata can retire reminder delivery work.
+
+        A reminder is time-critical enough that any degraded per-listing call,
+        including showtimes, makes absence unknown. Positive sale metadata is
+        still usable independently by callers.
+        """
         if any(
             not result.healthy
             for endpoints in self.listing_results.values()
-            for endpoint, result in endpoints.items()
-            if endpoint == "detail"
+            for result in endpoints.values()
         ):
             return False
         return all(

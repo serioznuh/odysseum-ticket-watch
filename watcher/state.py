@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 # bigger number would mean nothing, but it would keep the state file changing
 # on every firing (see update_from_cinesa).
 IMAX_ABSENT_CONFIRM = 2
+OPEN_PING_VALIDITY = timedelta(hours=6)
 CURRENT_STATE_VERSION = 4
 
 DEFAULT_STATE: dict = {
@@ -613,18 +614,34 @@ def update_from_snapshot(
     observed_target = min(future)[1] if future else None
     current_target = state.get("sale_target")
     current_dt = detect.parse_iso(current_target)
+    current_aware = detect.as_aware(current_dt) if current_dt is not None else None
     observed_dt = detect.parse_iso(observed_target)
+    observations_complete = snap.sale_observations_complete()
+    reported_targets = set(observed_sales.values())
+
+    # A reported opening remains the ladder target through the open ping's
+    # validity window. Filtering it out merely because it is no longer future
+    # used to erase a failed flagship ping before its retry. If the snapshot is
+    # degraded, absence is likewise unknown until complete evidence arrives.
+    current_open_valid = (
+        current_aware is not None
+        and current_aware <= now < current_aware + OPEN_PING_VALIDITY
+    )
+    if current_open_valid and (
+        current_target in reported_targets or not observations_complete
+    ):
+        return
 
     # Positive evidence may always move the ladder earlier. Moving it later or
-    # clearing it requires a complete view: a failed detail fetch can hide an
-    # earlier opening behind the cinema-feed placeholder.
+    # clearing it requires a complete view: any failed per-listing fetch leaves
+    # reminder retirement unknown.
     if observed_dt is not None and (
         current_dt is None
         or detect.as_aware(observed_dt) <= detect.as_aware(current_dt)
-        or snap.sale_observations_complete()
+        or observations_complete
     ):
         state["sale_target"] = observed_target
-    elif observed_target is None and snap.sale_observations_complete():
+    elif observed_target is None and observations_complete:
         state["sale_target"] = None
 
 
@@ -752,7 +769,7 @@ def due_reminders(
         # The 'open' ping has no window to be squeezed out of — only the 6h
         # cutoff below — so the grace applies to it whole.
         opens_at = dt + timedelta(minutes=grace_minutes)
-        if "open" not in sent and now >= opens_at and (now - dt) <= timedelta(hours=6):
+        if "open" not in sent and now >= opens_at and (now - dt) <= OPEN_PING_VALIDITY:
             return [{"offset": "open", "target": iso}]
         return []
 
