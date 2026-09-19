@@ -31,8 +31,8 @@ Core facts agents need before editing:
   can't run from `~/Documents` (macOS TCC). Changes reach production via
   `git pull` there; pushing to `main` is deploying.
 - Pathé's API is **blocked from GitHub datacenter IPs** (Akamai 403). Anything
-  touching `www.pathe.fr` runs locally; the scheduled cloud pass is remind-only
-  and never calls Pathé (a manual `check` dispatch would, and gets 403'd).
+  touching `www.pathe.fr` runs locally; the scheduled cloud pass is `remind
+  --with-news` (cloud-safe news only) and never calls Pathé or Cinesa.
 - Both halves sync validated JSON on **`refs/heads/runtime-state`**, never `main`.
   OTW-14's merge preserves receipts; never rewrite either pushed history.
 - The adaptive-cadence guard governs the **Pathé + news half only** and must

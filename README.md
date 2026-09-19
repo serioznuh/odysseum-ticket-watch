@@ -185,7 +185,7 @@ deployment on `main` is independent of that state history.
 | `news.max_age_days` | `10` | Ignore news older than this. |
 | `news.max_alerts_per_run` | `3` | Cap on news alerts per check. |
 | `news.google_news_queries` | *(see file)* | Google News RSS search URLs to scan. |
-| `news.extra_pages`, `news.cloud_extra_pages` | `[]`, `[]` | Extra URLs scanned locally, and the separate explicit allow-list scanned from the cloud. Cloud mode otherwise reads only `news.google.com` RSS and always refuses `pathe.fr` hosts. |
+| `news.extra_pages`, `news.cloud_extra_pages` | `[]`, `[]` | Extra URLs scanned locally, and the separate explicit allow-list scanned from the cloud. Cloud mode otherwise reads only `news.google.com` RSS and always refuses `pathe.fr`/`cinesa.es` hosts. |
 | `alerts.heartbeat_days` | `7` | 💤 "alive" summary when nothing was alerted for N days. `0` = off. |
 | `alerts.failure_streak_threshold` | `3` | ⚠️ after N consecutive failed Pathé checks. |
 | `alerts.stale_check_hours` | `18` | Cloud pass ⚠️ when the last successful check is older than this (local job died, or the Mac stayed shut). `0` = off. Sized from measured gaps: 4 h median, 12.9 h worst ordinary overnight — below ~16 h, normal nights trip it. |

@@ -57,7 +57,7 @@ google_news_queries = [
 # by the local check (plain HTTP; some sites, e.g. imax.com, block bots).
 extra_pages = []
 # Pages explicitly known to work from GitHub datacenter IPs. Only these are
-# added to cloud news runs; pathe.fr hosts are always refused.
+# added to cloud news runs; pathe.fr and cinesa.es hosts are always refused.
 cloud_extra_pages = []
 
 [alerts]

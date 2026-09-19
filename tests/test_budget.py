@@ -264,7 +264,7 @@ def test_news_stops_fetching_once_the_budget_is_gone():
     assert [i["title"] for i in items] == ["Dune"]
 
 
-def test_cloud_news_uses_google_and_opted_in_pages_but_never_pathe():
+def test_cloud_news_uses_google_and_opted_in_pages_but_never_cinema_hosts():
     class CloudCfg:
         google_news_queries: ClassVar[list[str]] = [
             "https://news.google.com/rss/search?q=dune",
@@ -275,6 +275,9 @@ def test_cloud_news_uses_google_and_opted_in_pages_but_never_pathe():
         cloud_extra_pages: ClassVar[list[str]] = [
             "https://cloud-safe.example/dune",
             "https://pathe.fr/announcements",
+            "https://www.cinesa.es/peliculas/dune/",
+            "https://vwc.cinesa.es/WSVistaWebClient/ocapi/v1/films",
+            "https://cinesa.es/cines/",
         ]
 
     fetched = []
@@ -294,6 +297,7 @@ def test_cloud_news_uses_google_and_opted_in_pages_but_never_pathe():
         "https://cloud-safe.example/dune",
     ]
     assert not any("pathe.fr" in url for url in fetched)
+    assert not any("cinesa.es" in url for url in fetched)
 
 
 def test_local_news_source_selection_is_unchanged():

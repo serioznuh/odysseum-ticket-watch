@@ -34,9 +34,12 @@ def _hostname(url: str) -> str:
     return (urlsplit(url).hostname or "").rstrip(".").lower()
 
 
-def _is_pathe_url(url: str) -> bool:
+def _is_forbidden_cloud_url(url: str) -> bool:
     host = _hostname(url)
-    return host == "pathe.fr" or host.endswith(".pathe.fr")
+    return any(
+        host == domain or host.endswith(f".{domain}")
+        for domain in ("pathe.fr", "cinesa.es")
+    )
 
 
 def _cloud_feed_allowed(url: str) -> bool:
@@ -48,15 +51,15 @@ def _cloud_urls(cfg: Any) -> tuple[list[str], list[str]]:
     feeds: list[str] = []
     pages: list[str] = []
     for url in cfg.google_news_queries:
-        if _is_pathe_url(url):
-            log.error("cloud news refused Pathé URL: %s", url)
+        if _is_forbidden_cloud_url(url):
+            log.error("cloud news refused cinema-source URL: %s", url)
         elif not _cloud_feed_allowed(url):
             log.warning("cloud news skipped non-Google feed: %s", url)
         else:
             feeds.append(url)
     for url in getattr(cfg, "cloud_extra_pages", []):
-        if _is_pathe_url(url):
-            log.error("cloud news refused Pathé URL: %s", url)
+        if _is_forbidden_cloud_url(url):
+            log.error("cloud news refused cinema-source URL: %s", url)
         else:
             pages.append(url)
     return feeds, pages

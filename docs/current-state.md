@@ -87,7 +87,7 @@ A single-user Telegram watcher covering **two independent targets**:
   Only complete, positive contradictory evidence retires a member. Per-member conditions and
   expiries preserve unaffected merged siblings across supersession, acknowledgement and expiry.
   The next opening owns the ladder; booking retires old pings while recent openings keep war-room cadence.
-  Overlapping hosts can still both send: this is not exactly-once or cross-host exclusion.
+  Overlapping local/cloud hosts can still send the same news finding: claims are not distributed locks.
 - **Pathé failure model** — catalogue failures still blind the check, while
   every best-effort detail/showtimes result explicitly distinguishes data,
   authoritative emptiness, expected refusal and unexpected failure. One bad
