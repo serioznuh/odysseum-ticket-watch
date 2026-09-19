@@ -619,15 +619,16 @@ def update_from_snapshot(
     observations_complete = snap.sale_observations_complete()
     reported_targets = set(observed_sales.values())
 
-    # A reported opening remains the ladder target through the open ping's
-    # validity window. Filtering it out merely because it is no longer future
-    # used to erase a failed flagship ping before its retry. If the snapshot is
+    # With no later opening to arm, a reported opening remains the ladder
+    # target through the open ping's validity window. A failed ping is already
+    # durable outbox work, however, so it must not pin `sale_target` when a new
+    # future opening needs the 24 h / 2 h / 15 min ladder. If the snapshot is
     # degraded, absence is likewise unknown until complete evidence arrives.
     current_open_valid = (
         current_aware is not None
         and current_aware <= now < current_aware + OPEN_PING_VALIDITY
     )
-    if current_open_valid and (
+    if observed_dt is None and current_open_valid and (
         current_target in reported_targets or not observations_complete
     ):
         return
@@ -638,6 +639,7 @@ def update_from_snapshot(
     if observed_dt is not None and (
         current_dt is None
         or detect.as_aware(observed_dt) <= detect.as_aware(current_dt)
+        or (current_aware is not None and current_aware <= now)
         or observations_complete
     ):
         state["sale_target"] = observed_target

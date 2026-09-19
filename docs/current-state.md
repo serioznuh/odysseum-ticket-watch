@@ -86,7 +86,7 @@ A single-user Telegram watcher covering **two independent targets**:
   stay independent: an uncertain sale alert cannot freeze its opening or reminder ladder.
   Only complete, positive contradictory evidence retires a member. Per-member conditions and
   expiries preserve unaffected merged siblings across supersession, acknowledgement and expiry.
-  Reported openings stay armed through the six-hour ping window; only complete evidence retires them.
+  `sale_target` arms the next opening; older failed open pings retry independently from the outbox.
   Overlapping hosts can still both send: this is not exactly-once or cross-host exclusion.
 - **Pathé failure model** — catalogue failures still blind the check, while
   every best-effort detail/showtimes result explicitly distinguishes data,

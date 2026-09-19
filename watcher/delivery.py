@@ -108,6 +108,15 @@ def _member_expired(member: dict, now: datetime) -> bool:
     return expiry is not None and now >= as_aware(expiry)
 
 
+def _valid_open_ping(record: dict, now: datetime) -> bool:
+    ack = record.get("ack", {})
+    return (
+        ack.get("type") == "reminder"
+        and ack.get("offset") == "open"
+        and not _expired(record, now)
+    )
+
+
 def _condition_topic(domain: str, value: str) -> str:
     return f"{_CONDITION_PREFIX}{domain}={value}"
 
@@ -323,9 +332,12 @@ def _retire_obsolete(
             for parsed in [_condition(topic)]
             if parsed is not None
         )
+        # A passed opening's valid open ping and the next future opening's
+        # ladder are separate obligations. A different sale-target topic must
+        # not retire the ping; expiry or authoritative reconciliation will.
         superseded = (
             bool(wanted_topics & record_topics) and not same_work
-        ) or conflicting_condition
+        ) or (conflicting_condition and not _valid_open_ping(record, now))
         if _expired(record, now) or superseded:
             reason = "expired" if _expired(record, now) else "superseded"
             log.info("retired %s outbox work %s", reason, delivery_id)

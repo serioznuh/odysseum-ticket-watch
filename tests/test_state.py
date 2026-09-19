@@ -305,6 +305,31 @@ def test_reported_passed_opening_stays_target_through_open_ping_window():
     assert st["sale_target"] == target
 
 
+def test_passed_opening_does_not_shadow_a_new_future_target():
+    st = fresh_state()
+    passed = iso_in(timedelta(minutes=-30))
+    future = iso_in(timedelta(hours=23))
+    st["sale_target"] = passed
+    snap = Snapshot(
+        matched_shows=[
+            {
+                "slug": "dune-old",
+                "title": "Dune IMAX 70mm",
+                "salesOpeningDatetime": passed,
+            },
+            {
+                "slug": "dune-new",
+                "title": "Dune IMAX 70mm",
+                "salesOpeningDatetime": future,
+            },
+        ]
+    )
+
+    update_from_snapshot(st, snap, None, NOW)
+
+    assert st["sale_target"] == future
+
+
 def test_undelivered_one_shot_alerts_leave_their_baselines_alone():
     """Failed NEW_LISTING/TICKETS_AVAILABLE sends must retry, while current
     sale and ticket facts still move forward."""

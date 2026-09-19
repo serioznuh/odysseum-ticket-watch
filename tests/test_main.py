@@ -715,6 +715,73 @@ def test_failed_open_ping_survives_healthy_poll_for_local_and_cloud_retry(
     assert "open" in cloud["reminders_sent"][target]
 
 
+def test_passed_open_ping_retries_while_new_future_ladder_arms(
+    tmp_path, monkeypatch
+):
+    """Two nearby openings are separate obligations: the old open ping stays
+    queued while the newer opening immediately owns the countdown ladder."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    now = NOW
+    passed = (now - timedelta(minutes=30)).isoformat()
+    future = (now + timedelta(hours=23)).isoformat()
+    old_slug = "dune-troisieme-partie-imax-70mm-old"
+    new_slug = "dune-troisieme-partie-imax-70mm-new"
+    old_show = {
+        "slug": old_slug,
+        "title": "Dune : Troisième partie IMAX 70mm",
+        "salesOpeningDatetime": passed,
+        "isMovie": True,
+    }
+    new_show = {
+        "slug": new_slug,
+        "title": "Dune : Troisième partie IMAX 70mm",
+        "salesOpeningDatetime": future,
+        "isMovie": True,
+    }
+    snapshot = Snapshot(
+        matched_shows=[old_show, new_show],
+        listing_results={
+            old_slug: {
+                "detail": detect.FetchResult.authoritative(old_show),
+                "showtimes": detect.FetchResult.authoritative({}),
+            },
+            new_slug: {
+                "detail": detect.FetchResult.authoritative(new_show),
+                "showtimes": detect.FetchResult.authoritative({}),
+            },
+        },
+    )
+    state = json.loads(runner.state.read_text(encoding="utf-8"))
+    state["sale_target"] = passed
+    state["sales"] = {old_slug: passed, new_slug: future}
+    state["shows_seen"] = [old_slug, new_slug]
+    runner.state.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(now))
+    outcomes = iter((False, True))
+
+    first = runner.run(snapshot, delivered=lambda _text: next(outcomes))
+
+    assert first["sale_target"] == future
+    assert "1440" in first["reminders_sent"][future]
+    assert "open" not in first["reminders_sent"].get(passed, [])
+    pending = list(first["outbox"].values())
+    assert len(pending) == 1
+    assert pending[0]["ack"] == {
+        "type": "reminder",
+        "target": passed,
+        "offset": "open",
+        "offsets": ["1440", "120", "15"],
+    }
+
+    second = runner.run(snapshot, delivered=True)
+
+    assert second["sale_target"] == future
+    assert "open" in second["reminders_sent"][passed]
+    assert "1440" in second["reminders_sent"][future]
+    assert len(runner.sent) == 1
+    assert "Scheduled sale time reached" in runner.sent[0]
+
+
 def test_healthy_poll_retires_failed_blind_alert_before_recovery(
     tmp_path, monkeypatch
 ):
