@@ -260,6 +260,32 @@ def test_update_from_snapshot_does_not_record_a_format_when_showtimes_failed():
     assert st["formats_seen"] == {}
 
 
+def test_degraded_earlier_listing_cannot_move_sale_target_later():
+    st = fresh_state()
+    earlier = iso_in(timedelta(days=10))
+    later = iso_in(timedelta(days=20))
+    st["sale_target"] = earlier
+    snap = Snapshot(
+        matched_shows=[
+            {"slug": "early-imax", "title": "early-imax"},
+            {
+                "slug": "later-imax",
+                "title": "Later IMAX 70mm",
+                "salesOpeningDatetime": later,
+            },
+        ],
+        listing_results={
+            "early-imax": {
+                "detail": detect.FetchResult.failed("detail request failed")
+            }
+        },
+    )
+
+    update_from_snapshot(st, snap, None, NOW)
+
+    assert st["sale_target"] == earlier
+
+
 def test_undelivered_one_shot_alerts_leave_their_baselines_alone():
     """Failed NEW_LISTING/TICKETS_AVAILABLE sends must retry, while current
     sale and ticket facts still move forward."""

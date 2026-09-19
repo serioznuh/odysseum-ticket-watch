@@ -668,7 +668,7 @@ def test_healthy_poll_retires_failed_blind_alert_before_recovery(
     assert len(failed["outbox"]) == 1
     blind = next(iter(failed["outbox"].values()))
     assert blind["kinds"] == ["WATCHER_ERROR"]
-    assert blind["topics"] == ["condition:pathe-health=unhealthy"]
+    assert blind["topics"] == ["condition:pathe-health=blind"]
 
     healthy = Snapshot(
         matched_shows=[

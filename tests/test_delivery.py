@@ -584,6 +584,212 @@ def test_complete_contradicting_sale_evidence_retires_pending_sale(
     assert ctx.state["outbox"] == {}
 
 
+def test_partial_regeneration_supersedes_only_its_merged_member(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    sale = (NOW + timedelta(days=10)).isoformat()
+    member_a = finding(
+        f"sale:a-imax:{sale}", kind="SALE_DATE", sale_datetime=sale
+    )
+    member_b = finding(
+        f"sale:b-imax:{sale}", kind="SALE_DATE", sale_datetime=sale
+    )
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda *args, **kwargs: notify.SendResult("failed")
+    )
+
+    assert delivery.deliver_alert(ctx, alert(member_a, member_b), NOW) is False
+    assert delivery.deliver_alert(
+        ctx, alert(member_a), NOW + timedelta(minutes=5)
+    ) is False
+
+    assert {tuple(record["keys"]) for record in ctx.state["outbox"].values()} == {
+        (member_a.key,),
+        (member_b.key,),
+    }
+
+
+def test_confirmed_blind_alert_supersedes_failed_degraded_alert(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    key = "error:2026-09-17"
+    degraded = finding(key, kind="WATCHER_ERROR", title="Pathé watch is DEGRADED")
+    blind = finding(key, kind="WATCHER_ERROR", title="Pathé watch is BLIND")
+    calls = []
+    outcomes = iter(
+        (notify.SendResult("failed"), notify.SendResult("confirmed"))
+    )
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda _cfg, text, **kwargs: calls.append(text) or next(outcomes),
+    )
+
+    assert delivery.deliver_alert(ctx, alert(degraded), NOW, force=True) is False
+    assert delivery.deliver_alert(
+        ctx, alert(blind), NOW + timedelta(minutes=5), force=True
+    ) is True
+    assert delivery.recover(ctx, NOW + timedelta(minutes=6)) is False
+
+    assert len(calls) == 2
+    assert "DEGRADED" in calls[0]
+    assert "BLIND" in calls[1]
+    assert ctx.state["outbox"] == {}
+
+
+def test_book_now_supersedes_failed_cinema_listed_alert(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    listed = finding("cinema_listed:dune-imax", kind="CINEMA_LISTED")
+    tickets = finding("tickets:dune-imax:imax70", kind="TICKETS_AVAILABLE")
+    calls = []
+    outcomes = iter(
+        (notify.SendResult("failed"), notify.SendResult("confirmed"))
+    )
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda _cfg, text, **kwargs: calls.append(text) or next(outcomes),
+    )
+
+    assert delivery.deliver_alert(ctx, alert(listed), NOW) is False
+    assert delivery.deliver_alert(
+        ctx, alert(tickets), NOW + timedelta(minutes=5)
+    ) is True
+    assert delivery.recover(ctx, NOW + timedelta(minutes=6)) is False
+
+    assert len(calls) == 2
+    assert ctx.state["outbox"] == {}
+
+
+def test_merged_expiry_retires_only_the_elapsed_member(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    first_day = "2026-09-20"
+    later_day = "2026-09-22"
+    first = finding(
+        f"pathe_target:{Cfg.cinema_slug}:{Cfg.primary_slug}:imax70:{first_day}",
+        kind="PATHE_TARGET_DATE",
+    )
+    later = finding(
+        f"pathe_target:{Cfg.cinema_slug}:{Cfg.primary_slug}:imax70:{later_day}",
+        kind="PATHE_TARGET_DATE",
+    )
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda *args, **kwargs: notify.SendResult("failed")
+    )
+
+    assert delivery.deliver_alert(ctx, alert(first, later), NOW) is False
+    delivery.recover(
+        ctx, datetime(2026, 9, 21, 12, 0, tzinfo=TZ_PARIS)
+    )
+
+    assert [record["keys"] for record in ctx.state["outbox"].values()] == [
+        [later.key]
+    ]
+
+
+def test_merged_observation_contradiction_retires_only_its_member(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    first_day = "2026-09-20"
+    later_day = "2026-09-22"
+    first = finding(
+        f"pathe_target:{Cfg.cinema_slug}:{Cfg.primary_slug}:imax70:{first_day}",
+        kind="PATHE_TARGET_DATE",
+    )
+    later = finding(
+        f"pathe_target:{Cfg.cinema_slug}:{Cfg.primary_slug}:imax70:{later_day}",
+        kind="PATHE_TARGET_DATE",
+    )
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda *args, **kwargs: notify.SendResult("failed")
+    )
+
+    assert delivery.deliver_alert(ctx, alert(first, later), NOW) is False
+    delivery.reconcile_observations(
+        ctx,
+        observed_domains={f"pathe-availability:{first_day}"},
+        active_conditions=set(),
+    )
+
+    assert [record["keys"] for record in ctx.state["outbox"].values()] == [
+        [later.key]
+    ]
+
+
+POLICY_CASES = [
+    (
+        "SALE_DATE",
+        "sale:dune:2026-10-01T09:00:00+02:00",
+        "Sale",
+        "2026-10-01T09:00:00+02:00",
+    ),
+    (
+        "SALE_DATE_CHANGED",
+        "sale:dune:2026-10-02T09:00:00+02:00",
+        "Sale moved",
+        "2026-10-02T09:00:00+02:00",
+    ),
+    ("TICKETS_AVAILABLE", "tickets:dune:imax70", "Book now", None),
+    (
+        "PATHE_TARGET_DATE",
+        "pathe_target:odysseum:dune:imax70:2026-09-20",
+        "Open",
+        None,
+    ),
+    ("NEW_LISTING", "new_show:dune-imax", "New listing", None),
+    ("CINEMA_LISTED", "cinema_listed:dune", "Listed", None),
+    ("NEWS_LEAD", "news:abc", "News", None),
+    ("RECOVERED", "recovered:2026-09-17T1200", "Pathé watch is back", None),
+    ("HEARTBEAT", "heartbeat:2026-09-17", "All quiet", None),
+    (
+        "CINESA_TARGET_DATE",
+        "cinesa_target:032:HO00003228:2026-09-20",
+        "Open",
+        None,
+    ),
+    (
+        "CINESA_TARGET_NO_IMAX",
+        "cinesa_target_noimax:032:HO00003228:2026-09-20",
+        "No IMAX",
+        None,
+    ),
+    ("CINESA_IMAX_GONE", "cinesa_imax_gone:2026-09-17", "Gone", None),
+    ("CINESA_IMAX_BACK", "cinesa_imax_back:2026-09-17", "Back", None),
+]
+
+
+@pytest.mark.parametrize(
+    ("kind", "key", "title", "sale_datetime"), POLICY_CASES
+)
+def test_every_non_error_alert_kind_has_supersession_or_expiry(
+    kind, key, title, sale_datetime
+):
+    item = finding(
+        key, kind=kind, title=title, sale_datetime=sale_datetime
+    )
+
+    topics, expiry = delivery._finding_policy(item, NOW)
+
+    assert topics or expiry is not None, kind
+
+
+def test_policy_matrix_covers_every_non_error_alert_kind():
+    assert {case[0] for case in POLICY_CASES} == set(notify.ICONS) - {
+        "WATCHER_ERROR",
+        "WATCHER_STILL_BLIND",
+    }
+
+
 def test_missing_sale_target_does_not_disprove_pending_open_ping(
     tmp_path, monkeypatch
 ):

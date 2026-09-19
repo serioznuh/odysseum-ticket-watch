@@ -215,7 +215,7 @@ def _validate_outbox(value: Any) -> None:
     outbox = _require_mapping(value, "outbox")
     allowed = {
         "keys", "kinds", "text", "silent", "created_at", "expires_at",
-        "topics", "status", "claim", "ack", "force",
+        "topics", "status", "claim", "ack", "force", "members",
     }
     for delivery_id, record_value in outbox.items():
         _require_string(delivery_id, "outbox key")
@@ -225,7 +225,7 @@ def _validate_outbox(value: Any) -> None:
             raise StateError(
                 f"outbox[{delivery_id!r}]: unknown field(s): {', '.join(sorted(unknown))}"
             )
-        required = allowed - {"expires_at", "claim"}
+        required = allowed - {"expires_at", "claim", "members"}
         missing = required - set(record)
         if missing:
             raise StateError(
@@ -242,6 +242,33 @@ def _validate_outbox(value: Any) -> None:
         if "expires_at" in record:
             _parse_timestamp(record["expires_at"], f"outbox[{delivery_id!r}].expires_at")
         _validate_string_list(record["topics"], f"outbox[{delivery_id!r}].topics")
+        if "members" in record:
+            members = record["members"]
+            if not isinstance(members, list) or not members:
+                raise StateError(
+                    f"outbox[{delivery_id!r}].members: expected a non-empty array"
+                )
+            member_allowed = {
+                "key", "kind", "text", "silent", "topics", "expires_at",
+            }
+            for index, member_value in enumerate(members):
+                field = f"outbox[{delivery_id!r}].members[{index}]"
+                member = _require_mapping(member_value, field)
+                unknown_member = set(member) - member_allowed
+                required_member = member_allowed - {"expires_at"}
+                if unknown_member or not required_member.issubset(member):
+                    raise StateError(f"{field}: invalid fields")
+                _require_string(member["key"], f"{field}.key")
+                _require_string(member["kind"], f"{field}.kind")
+                _require_string(member["text"], f"{field}.text")
+                _require_bool(member["silent"], f"{field}.silent")
+                _validate_string_list(member["topics"], f"{field}.topics")
+                if "expires_at" in member:
+                    _parse_timestamp(member["expires_at"], f"{field}.expires_at")
+            if [member["key"] for member in members] != record["keys"]:
+                raise StateError(
+                    f"outbox[{delivery_id!r}].members: keys do not match record"
+                )
         status = _require_string(record["status"], f"outbox[{delivery_id!r}].status")
         if status not in {"pending", "sending", "uncertain"}:
             raise StateError(f"outbox[{delivery_id!r}].status: invalid value {status!r}")
@@ -576,16 +603,29 @@ def update_from_snapshot(
         if show.get("slug")
         and show.get("salesOpeningDatetime")
         and detect.selected_listing(show, cfg)
+        and snap.listing_metadata_authoritative(show["slug"], show)
     }
-    if state.get("sale_target") not in observed_sales.values():
-        state["sale_target"] = None
     future = []
     for iso in observed_sales.values():
         dt = detect.parse_iso(iso)
         if dt and detect.as_aware(dt) > now:
             future.append((detect.as_aware(dt), iso))
-    if future:
-        state["sale_target"] = min(future)[1]
+    observed_target = min(future)[1] if future else None
+    current_target = state.get("sale_target")
+    current_dt = detect.parse_iso(current_target)
+    observed_dt = detect.parse_iso(observed_target)
+
+    # Positive evidence may always move the ladder earlier. Moving it later or
+    # clearing it requires a complete view: a failed detail fetch can hide an
+    # earlier opening behind the cinema-feed placeholder.
+    if observed_dt is not None and (
+        current_dt is None
+        or detect.as_aware(observed_dt) <= detect.as_aware(current_dt)
+        or snap.sale_observations_complete()
+    ):
+        state["sale_target"] = observed_target
+    elif observed_target is None and snap.sale_observations_complete():
+        state["sale_target"] = None
 
 
 def update_from_cinesa(

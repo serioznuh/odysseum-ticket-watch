@@ -213,7 +213,7 @@ def test_failed_showtimes_cannot_invent_a_format_from_a_bookable_entry():
 
     findings = detect.analyze_pathe(snap, st, Cfg, NOW)
 
-    assert "TICKETS_AVAILABLE" not in [finding.kind for finding in findings]
+    assert findings == []
 
 
 def test_expected_showtimes_refusal_still_uses_the_programme_entry():

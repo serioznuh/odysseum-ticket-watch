@@ -18,7 +18,7 @@ from copy import deepcopy
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
-from . import detect, notify
+from . import coalesce, detect, notify
 from . import state as state_mod
 from .coalesce import Alert
 from .detect import TZ_PARIS, Finding, as_aware, parse_iso
@@ -103,6 +103,11 @@ def _expired(record: dict, now: datetime) -> bool:
     return expiry is not None and now >= as_aware(expiry)
 
 
+def _member_expired(member: dict, now: datetime) -> bool:
+    expiry = parse_iso(member.get("expires_at"))
+    return expiry is not None and now >= as_aware(expiry)
+
+
 def _condition_topic(domain: str, value: str) -> str:
     return f"{_CONDITION_PREFIX}{domain}={value}"
 
@@ -127,20 +132,7 @@ def _pending_condition_domains(ctx: Any, prefix: str) -> set[str]:
 def _listing_metadata_authoritative(
     snapshot: Any, slug: str, show: dict | None
 ) -> bool:
-    """Whether a listing's absence or metadata can contradict queued work.
-
-    Production snapshots attach a detail result when the catalogue could not
-    supply a full listing.  A failed result is unknown; a retained show with
-    an empty result is the cinema-feed placeholder and is partial evidence.
-    Hand-built snapshots without result metadata retain their documented
-    authoritative behaviour.
-    """
-    detail = snapshot.listing_results.get(slug, {}).get("detail")
-    if detail is None:
-        return True
-    if not detail.healthy:
-        return False
-    return show is None or bool(detail.data)
+    return snapshot.listing_metadata_authoritative(slug, show)
 
 
 def _pathe_dates_authoritative(snapshot: Any) -> bool:
@@ -165,7 +157,99 @@ def _pathe_dates_authoritative(snapshot: Any) -> bool:
     )
 
 
-def _retire_obsolete(ctx: Any, now: datetime, topics: list[str], keys: list[str]) -> None:
+def _standalone_record(record: dict, member: dict) -> dict:
+    status = record["status"]
+    if status == "sending":
+        status = "uncertain"
+    result = {
+        "keys": [member["key"]],
+        "kinds": [member["kind"]],
+        "text": member["text"],
+        "silent": member["silent"],
+        "created_at": record["created_at"],
+        "topics": list(member["topics"]),
+        "status": status,
+        "ack": {"type": "alerts", "keys": [member["key"]]},
+        "force": record["force"],
+        "members": [deepcopy(member)],
+    }
+    if "expires_at" in member:
+        result["expires_at"] = member["expires_at"]
+    if status == "uncertain" and "claim" in record:
+        result["claim"] = deepcopy(record["claim"])
+    return result
+
+
+def _retain_members(
+    ctx: Any,
+    delivery_id: str,
+    record: dict,
+    survivors: list[dict],
+    reason: str,
+) -> bool:
+    """Remove selected merged members without discarding unrelated work."""
+    members = record.get("members")
+    if members is None or len(survivors) == len(members):
+        return False
+
+    ctx.state["outbox"].pop(delivery_id, None)
+    replacement_ids = []
+    for member in survivors:
+        replacement_id = _delivery_id([member["key"]])
+        replacement_ids.append(replacement_id)
+        replacement = _standalone_record(record, member)
+        existing = ctx.state["outbox"].get(replacement_id)
+        if existing is None:
+            ctx.state["outbox"][replacement_id] = replacement
+        elif replacement["status"] == "uncertain":
+            existing["status"] = "uncertain"
+            if "claim" in replacement:
+                existing["claim"] = replacement["claim"]
+
+    if delivery_id in ctx.delivery_attempts:
+        ctx.delivery_attempts.update(replacement_ids)
+    log.info(
+        "retired %s member(s) from outbox work %s; retained %d",
+        reason,
+        delivery_id,
+        len(survivors),
+    )
+    return True
+
+
+def _member_superseded(member: dict, incoming: list[dict]) -> bool:
+    incoming_keys = {candidate["key"] for candidate in incoming}
+    incoming_topics = {
+        topic for candidate in incoming for topic in candidate.get("topics", [])
+    }
+    incoming_conditions = {
+        parsed[0]: parsed[1]
+        for topic in incoming_topics
+        for parsed in [_condition(topic)]
+        if parsed is not None
+    }
+    if member["key"] in incoming_keys:
+        return True
+    for topic in member.get("topics", []):
+        if topic in incoming_topics:
+            return True
+        parsed = _condition(topic)
+        if (
+            parsed is not None
+            and parsed[0] in incoming_conditions
+            and incoming_conditions[parsed[0]] != parsed[1]
+        ):
+            return True
+    return False
+
+
+def _retire_obsolete(
+    ctx: Any,
+    now: datetime,
+    topics: list[str],
+    keys: list[str],
+    members: list[dict] | None = None,
+) -> None:
     changed = False
     wanted_topics = set(topics)
     wanted_conditions = {
@@ -175,6 +259,36 @@ def _retire_obsolete(ctx: Any, now: datetime, topics: list[str], keys: list[str]
         if parsed is not None
     }
     for delivery_id, record in list(ctx.state.setdefault("outbox", {}).items()):
+        if _has_receipt(ctx.state, delivery_id):
+            ctx.state["outbox"].pop(delivery_id, None)
+            changed = True
+            continue
+
+        record_members = record.get("members")
+        if record_members is not None and members is not None:
+            same_work = (
+                set(record["keys"]) == set(keys)
+                and set(record.get("topics", [])) == set(topics)
+            )
+            survivors = [
+                member
+                for member in record_members
+                if not _member_expired(member, now)
+                and not (
+                    not record["force"]
+                    and state_mod.already_sent(ctx.state, member["key"])
+                )
+                and not (
+                    not same_work and _member_superseded(member, members)
+                )
+            ]
+            reason = "expired, acknowledged or superseded"
+            changed = (
+                _retain_members(ctx, delivery_id, record, survivors, reason)
+                or changed
+            )
+            continue
+
         same_work = set(record["keys"]) == set(keys)
         record_topics = set(record.get("topics", []))
         conflicting_condition = any(
@@ -187,7 +301,7 @@ def _retire_obsolete(ctx: Any, now: datetime, topics: list[str], keys: list[str]
         superseded = (
             bool(wanted_topics & record_topics) and not same_work
         ) or conflicting_condition
-        if _expired(record, now) or superseded or _has_receipt(ctx.state, delivery_id):
+        if _expired(record, now) or superseded:
             reason = "expired" if _expired(record, now) else "superseded"
             log.info("retired %s outbox work %s", reason, delivery_id)
             ctx.state["outbox"].pop(delivery_id, None)
@@ -289,13 +403,14 @@ def enqueue(
     now: datetime,
     topics: list[str] | None = None,
     expires_at: datetime | None = None,
+    members: list[dict] | None = None,
     identity: str | None = None,
     force: bool = False,
     retry_existing: bool = True,
 ) -> bool:
     """Persist one logical message, attempt it, then persist its receipt."""
     topics = topics or []
-    _retire_obsolete(ctx, now, topics, keys)
+    _retire_obsolete(ctx, now, topics, keys, members)
     if expires_at is not None and now >= expires_at:
         log.info("discarded already-obsolete delivery work (keys=%s)", " ".join(keys))
         return False
@@ -321,6 +436,8 @@ def enqueue(
         }
         if expires_at is not None:
             record["expires_at"] = expires_at.isoformat()
+        if members is not None:
+            record["members"] = deepcopy(members)
         outbox[delivery_id] = record
         try:
             _persist(ctx)
@@ -369,9 +486,22 @@ def _finding_policy(finding: Finding, now: datetime) -> tuple[list[str], datetim
     if finding.kind == "TICKETS_AVAILABLE":
         _prefix, slug, formats = finding.key.split(":", 2)
         return [
-            _condition_topic(f"pathe-tickets:{slug}", fmt)
-            for fmt in formats.split(",")
+            _condition_topic(f"pathe-bookability:{slug}", "bookable"),
+            *(
+                _condition_topic(f"pathe-tickets:{slug}", fmt)
+                for fmt in formats.split(",")
+            ),
         ], None
+    if finding.kind == "NEW_LISTING":
+        slug = finding.key.removeprefix("new_show:")
+        return [
+            _condition_topic(f"pathe-listing:{slug}", "present")
+        ], now + timedelta(days=7)
+    if finding.kind == "CINEMA_LISTED":
+        slug = finding.key.removeprefix("cinema_listed:")
+        return [
+            _condition_topic(f"pathe-bookability:{slug}", "not-bookable")
+        ], now + timedelta(days=7)
     if finding.kind in {"CINESA_TARGET_DATE", "CINESA_TARGET_NO_IMAX"}:
         parts = finding.key.split(":")
         if len(parts) >= 4:
@@ -386,26 +516,59 @@ def _finding_policy(finding: Finding, now: datetime) -> tuple[list[str], datetim
     if finding.kind in {"CINESA_IMAX_GONE", "CINESA_IMAX_BACK"}:
         value = "absent" if finding.kind == "CINESA_IMAX_GONE" else "present"
         return [_condition_topic("cinesa-imax-presence", value)], None
-    if finding.key.startswith(("error:", "stale:")):
-        return [_condition_topic("pathe-health", "unhealthy")], None
+    if finding.key.startswith("error:"):
+        level = "degraded" if "DEGRADED" in finding.title else "blind"
+        return [_condition_topic("pathe-health", level)], None
+    if finding.key.startswith("stale:"):
+        return [_condition_topic("pathe-health", "blind")], now + timedelta(days=1)
     if finding.key.startswith("recovered:"):
         return [_condition_topic("pathe-health", "healthy")], None
     if finding.key.startswith("cinesa_error:"):
-        return [_condition_topic("cinesa-health", "unhealthy")], None
+        return [_condition_topic("cinesa-health", "blind")], None
     if finding.key.startswith("cinesa_recovered:"):
         return [_condition_topic("cinesa-health", "healthy")], None
+    if finding.key.startswith("cinesa_leak:"):
+        return [
+            _condition_topic("cinesa-token", "stuck")
+        ], now + timedelta(days=1)
+    if finding.key.startswith("state_sync_error:"):
+        return [], now + timedelta(days=1)
+    if finding.kind == "NEWS_LEAD":
+        return [], now + timedelta(days=7)
+    if finding.kind == "HEARTBEAT":
+        return [], now + timedelta(days=7)
     return [], None
 
 
 def deliver_alert(ctx: Any, alert: Alert, now: datetime, *, force: bool = False) -> bool:
-    topics: list[str] = []
-    expiries: list[datetime] = []
     members = alert.members or [alert.finding]
+    policies = [(*_finding_policy(member, now), member) for member in members]
+    live_members = [
+        member
+        for member_topics, expiry, member in policies
+        if expiry is None or now < expiry
+    ]
+    if not live_members:
+        return False
+    if len(live_members) != len(members):
+        alert = coalesce.merge(live_members, ctx.cfg)[0]
+        members = live_members
+
+    member_records: list[dict] = []
+    topics: list[str] = []
     for member in members:
         member_topics, expiry = _finding_policy(member, now)
         topics.extend(member_topics)
+        member_record = {
+            "key": member.key,
+            "kind": member.kind,
+            "text": notify.render_finding(member),
+            "silent": notify.is_silent(ctx.cfg, member.kind),
+            "topics": list(member_topics),
+        }
         if expiry is not None:
-            expiries.append(expiry)
+            member_record["expires_at"] = expiry.isoformat()
+        member_records.append(member_record)
     return enqueue(
         ctx,
         keys=alert.keys,
@@ -415,7 +578,7 @@ def deliver_alert(ctx: Any, alert: Alert, now: datetime, *, force: bool = False)
         ack={"type": "alerts", "keys": list(alert.keys)},
         now=now,
         topics=list(dict.fromkeys(topics)),
-        expires_at=min(expiries) if expiries else None,
+        members=member_records,
         # Pathé's degraded -> blind escalation deliberately reuses its
         # historical Finding.key on the same day.  Content distinguishes those
         # two owed messages without changing that key format.
@@ -466,6 +629,7 @@ def deliver_reminder(
 
 def deliver_heartbeat(ctx: Any, finding: Finding, now: datetime) -> bool:
     alert = Alert(finding, [finding.key], [finding.kind], [finding])
+    topics, expires_at = _finding_policy(finding, now)
     return enqueue(
         ctx,
         keys=alert.keys,
@@ -474,8 +638,8 @@ def deliver_heartbeat(ctx: Any, finding: Finding, now: datetime) -> bool:
         silent=notify.is_silent(ctx.cfg, finding.kind),
         ack={"type": "heartbeat", "at": now.isoformat()},
         now=now,
-        topics=["heartbeat"],
-        expires_at=now + timedelta(days=7),
+        topics=topics or ["heartbeat"],
+        expires_at=expires_at,
     )
 
 
@@ -487,12 +651,31 @@ def reconcile_observations(
 ) -> None:
     """Retire queued messages contradicted by authoritative observations.
 
-    A merged message is retired if any condition it states is now false; the
-    current analysis has already had a chance to enqueue a corrected message.
-    Domains absent from ``observed_domains`` are unknown, never false.
+    Each merged member is evaluated independently. Domains absent from
+    ``observed_domains`` are unknown, never false.
     """
     changed = False
     for delivery_id, record in list(ctx.state.setdefault("outbox", {}).items()):
+        members = record.get("members")
+        if members is not None:
+            survivors = [
+                member
+                for member in members
+                if not any(
+                    parsed[0] in observed_domains
+                    and topic not in active_conditions
+                    for topic in member.get("topics", [])
+                    for parsed in [_condition(topic)]
+                    if parsed is not None
+                )
+            ]
+            changed = (
+                _retain_members(
+                    ctx, delivery_id, record, survivors, "contradicted"
+                )
+                or changed
+            )
+            continue
         contradicted = any(
             parsed[0] in observed_domains and topic not in active_conditions
             for topic in record.get("topics", [])
@@ -543,6 +726,35 @@ def reconcile_source_observations(
             sale = show.get("salesOpeningDatetime") if show else None
             if show and sale and detect.selected_listing(show, ctx.cfg):
                 active.add(_condition_topic(domain, sale))
+
+        for domain in _pending_condition_domains(ctx, "pathe-listing:"):
+            slug = domain.removeprefix("pathe-listing:")
+            show = shows.get(slug)
+            if not _listing_metadata_authoritative(pathe_snapshot, slug, show):
+                continue
+            observed.add(domain)
+            if show is not None and detect.selected_listing(show, ctx.cfg):
+                active.add(_condition_topic(domain, "present"))
+
+        for domain in _pending_condition_domains(ctx, "pathe-bookability:"):
+            slug = domain.removeprefix("pathe-bookability:")
+            show = shows.get(slug)
+            if not _listing_metadata_authoritative(pathe_snapshot, slug, show):
+                continue
+            if not pathe_snapshot.endpoint_healthy(slug, "showtimes"):
+                continue
+            observed.add(domain)
+            if show is None:
+                continue
+            days = pathe_snapshot.showtimes.get(slug) or {}
+            entry = pathe_snapshot.cinema_entries.get(slug) or {}
+            entry_bookable = bool(
+                entry.get("isBookable") or entry.get("bookable")
+            )
+            if days or entry_bookable:
+                active.add(_condition_topic(domain, "bookable"))
+            elif entry and detect.selected_listing(show, ctx.cfg):
+                active.add(_condition_topic(domain, "not-bookable"))
 
         for domain in _pending_condition_domains(ctx, "pathe-tickets:"):
             slug = domain.removeprefix("pathe-tickets:")
@@ -618,10 +830,35 @@ def recover(ctx: Any, now: datetime) -> bool:
     sent = False
     changed = False
     for delivery_id, record in list(ctx.state.setdefault("outbox", {}).items()):
-        if (
-            _expired(record, now)
-            or _has_receipt(ctx.state, delivery_id)
-            or (not record["force"] and _ack_satisfied(ctx.state, record["ack"]))
+        if _has_receipt(ctx.state, delivery_id):
+            ctx.state["outbox"].pop(delivery_id, None)
+            changed = True
+        elif record.get("members") is not None:
+            survivors = [
+                member
+                for member in record["members"]
+                if not _member_expired(member, now)
+                and not (
+                    not record["force"]
+                    and state_mod.already_sent(ctx.state, member["key"])
+                )
+            ]
+            changed = (
+                _retain_members(
+                    ctx,
+                    delivery_id,
+                    record,
+                    survivors,
+                    "expired or acknowledged",
+                )
+                or changed
+            )
+            current = ctx.state["outbox"].get(delivery_id)
+            if current is not None and current["status"] == "sending":
+                current["status"] = "uncertain"
+                changed = True
+        elif _expired(record, now) or (
+            not record["force"] and _ack_satisfied(ctx.state, record["ack"])
         ):
             ctx.state["outbox"].pop(delivery_id, None)
             changed = True

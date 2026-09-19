@@ -149,7 +149,7 @@ def run_pathe_job(
         snap = pathe.fetch_snapshot(client, ctx.cfg, budget=budget)
     except Exception as e:
         log.exception("Pathé check failed")
-        out.health = "unhealthy"
+        out.health = "blind"
         finding = alerts.record_pathe_failure(ctx.cfg, ctx.state, str(e), now)
         if finding is not None:
             out.findings.append(finding)
@@ -169,7 +169,7 @@ def run_pathe_job(
 
     degradation = snap.degradation_summary()
     if degradation:
-        out.health = "unhealthy"
+        out.health = "degraded"
         state_mod.refresh_catalogue_liveness(ctx.state, now)
         log.warning("%s", degradation)
         finding = alerts.record_pathe_failure(ctx.cfg, ctx.state, degradation, now)
@@ -289,7 +289,7 @@ def run_cinesa_job(
         snap = cinesa.fetch_snapshot(ctx.cfg, budget=budget)
     except Exception as e:
         log.exception("Cinesa check failed")
-        out.health = "unhealthy"
+        out.health = "blind"
         # Capped at the alert threshold: nothing reads a larger value,
         # and a counter that kept growing would rewrite state.json on
         # every firing of a long outage, commit and push included.

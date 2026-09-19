@@ -84,9 +84,9 @@ A single-user Telegram watcher covering **two independent targets**:
   Definite failures remain pending; a failed pre-send claim save rolls back to pending. A
   post-send timeout is `uncertain` and is not replayed automatically. Current observations
   stay independent: an uncertain sale alert cannot freeze its opening or reminder ladder.
-  On checks, new reminders lead but failed ones wait for polling. Only complete, positive
-  contradictory evidence retires pending work; degraded results, metadata-free placeholders
-  and an empty Pathé selection stay unknown. An absent sale target preserves the `open` ping.
+  Only complete, positive contradictory evidence retires a member. Per-member conditions and
+  expiries preserve unaffected merged siblings across supersession, acknowledgement and expiry.
+  BOOK NOW supersedes CINEMA LISTED and BLIND supersedes DEGRADED; partial evidence stays unknown.
   Overlapping hosts can still both send: this is not exactly-once or cross-host exclusion.
 - **Pathé failure model** — catalogue failures still blind the check, while
   every best-effort detail/showtimes result explicitly distinguishes data,
