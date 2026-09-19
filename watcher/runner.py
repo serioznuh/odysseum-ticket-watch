@@ -41,7 +41,7 @@ from .jobs import RunContext
 log = logging.getLogger("watcher.runner")
 
 
-def _guard(failed: list[str], name: str, fn: Callable, *args):
+def _guard(failed: list[str], name: str, fn: Callable, *args, **kwargs):
     """Run a job; an unexpected failure is recorded, never propagated.
 
     A crash inside one job must not cost the run its reminders, its supervision
@@ -50,7 +50,7 @@ def _guard(failed: list[str], name: str, fn: Callable, *args):
     in launchd's log and in Actions rather than passing for a healthy pass.
     """
     try:
-        return fn(*args)
+        return fn(*args, **kwargs)
     except Exception:
         log.exception("%s job failed unexpectedly", name)
         failed.append(name)
@@ -132,6 +132,30 @@ def _run_source_jobs(
     _guard(
         failed, "baselines", jobs.advance_baselines, ctx, pathe_out, cinesa_out, findings, now
     )
+    if pathe_out.snapshot is not None:
+        _guard(
+            failed,
+            "reminder-supersession",
+            delivery.retire_stale_reminders,
+            ctx,
+            ctx.state.get("sale_target"),
+        )
+    if pathe_out.healthy:
+        _guard(
+            failed,
+            "pathe-outage-retirement",
+            delivery.retire_resolved_outages,
+            ctx,
+            "pathe-health",
+        )
+    if cinesa_out.healthy:
+        _guard(
+            failed,
+            "cinesa-outage-retirement",
+            delivery.retire_resolved_outages,
+            ctx,
+            "cinesa-health",
+        )
     return sent_any, pathe_out.snapshot
 
 
@@ -144,8 +168,17 @@ def execute(ctx: RunContext, state_path: str) -> int:
     failed: list[str] = []
     ctx.state_path = state_path
 
-    # Reminders first, before a single request. See this module's docstring.
-    _guard(failed, "reminder", jobs.run_reminder_job, ctx, now)
+    # Reminders first, before a single request. On check runs, newly due work
+    # still sends here, but a failed record from an earlier pass waits until
+    # polling confirms that its opening has not moved.
+    _guard(
+        failed,
+        "reminder",
+        jobs.run_reminder_job,
+        ctx,
+        now,
+        retry_existing=ctx.mode != "check",
+    )
 
     # A failed pre-run rebase leaves a durable marker and then deliberately
     # lets this pass continue. Surface it before polling, but never ahead of a

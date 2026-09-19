@@ -108,6 +108,44 @@ def test_restart_after_enqueue_but_before_send_retries_pending_work(
     ] == 7
 
 
+def test_failed_claim_persistence_stays_pending_and_never_becomes_uncertain(
+    tmp_path, monkeypatch
+):
+    """A failed pre-send save proves Telegram was never called. Same-run
+    recovery must preserve that fact rather than quarantine the work."""
+    state_path = tmp_path / "state.json"
+    writes = 0
+
+    def fail_claim_once(path, state):
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("claim save failed before Telegram")
+        save_state(path, state)
+
+    ctx = context(state_path, writer=fail_claim_once)
+    calls = []
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda *args, **kwargs: calls.append("send") or notify.SendResult("confirmed"),
+    )
+
+    with pytest.raises(OSError, match="before Telegram"):
+        delivery.deliver_alert(ctx, alert(finding()), NOW)
+
+    assert calls == []
+    assert next(iter(ctx.state["outbox"].values()))["status"] == "pending"
+    assert delivery.recover(ctx, NOW) is False
+    durable = load_state(state_path)
+    assert next(iter(durable["outbox"].values()))["status"] == "pending"
+
+    restarted = context(state_path, state=durable)
+    assert delivery.recover(restarted, NOW + timedelta(minutes=1)) is True
+    assert calls == ["send"]
+    assert load_state(state_path)["outbox"] == {}
+
+
 def test_confirmed_receipt_survives_a_later_process_crash(tmp_path, monkeypatch):
     state_path = tmp_path / "state.json"
     ctx = context(state_path)

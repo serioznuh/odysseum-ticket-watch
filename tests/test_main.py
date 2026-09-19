@@ -607,6 +607,84 @@ def test_fresh_opening_supersedes_pending_alert_before_outbox_recovery(
     assert second["outbox"] == {}
 
 
+def test_pending_reminder_waits_for_polling_and_is_retired_when_opening_moves(
+    tmp_path, monkeypatch
+):
+    """Newly due reminders still lead the run, but a prior failed attempt
+    must wait for Pathé to confirm that its target is still current."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(NOW, NOW))
+    old = (NOW + timedelta(minutes=10)).isoformat()
+    moved = (NOW + timedelta(days=2)).isoformat()
+
+    def snapshot(sale):
+        return Snapshot(
+            matched_shows=[
+                {
+                    "slug": "dune-troisieme-partie",
+                    "title": "Dune : Troisième partie",
+                    "salesOpeningDatetime": sale,
+                    "isMovie": True,
+                }
+            ]
+        )
+
+    outcomes = iter((notify.SendResult("confirmed", 10), notify.SendResult("failed")))
+    first = runner.run(snapshot(old), delivered=lambda _text: next(outcomes))
+    pending = list(first["outbox"].values())
+    assert len(pending) == 1
+    assert pending[0]["ack"]["type"] == "reminder"
+    assert pending[0]["ack"]["target"] == old
+
+    second = runner.run(snapshot(moved), delivered=True)
+
+    assert len(runner.sent) == 1
+    assert "Sale time CHANGED" in runner.sent[0]
+    assert second["sale_target"] == moved
+    assert all(
+        record["ack"].get("target") != old
+        for record in second["outbox"].values()
+        if record["ack"]["type"] == "reminder"
+    )
+
+
+def test_healthy_poll_retires_failed_blind_alert_before_recovery(
+    tmp_path, monkeypatch
+):
+    """A definite failure leaves the BLIND alert pending, but a later healthy
+    observation makes it obsolete before outbox recovery can send it."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(NOW, NOW))
+    state = json.loads(runner.state.read_text(encoding="utf-8"))
+    stale = (NOW - timedelta(days=1)).isoformat()
+    state.update(
+        failure_streak=2,
+        last_check_ok=stale,
+        last_catalogue_ok=stale,
+    )
+    runner.state.write_text(json.dumps(state), encoding="utf-8")
+
+    failed = runner.run(RuntimeError("HTTP 500"), delivered=False)
+    assert len(failed["outbox"]) == 1
+    blind = next(iter(failed["outbox"].values()))
+    assert blind["kinds"] == ["WATCHER_ERROR"]
+    assert blind["topics"] == ["pathe-health"]
+
+    healthy = Snapshot(
+        matched_shows=[
+            {
+                "slug": "dune-troisieme-partie",
+                "title": "Dune : Troisième partie",
+                "isMovie": True,
+            }
+        ]
+    )
+    recovered = runner.run(healthy, delivered=True)
+
+    assert runner.sent == []
+    assert recovered["outbox"] == {}
+
+
 def test_stale_period_fires_once_at_the_threshold_then_daily():
     """Regression guard for the gap this feature closes: an outage used to
     alert once and then go quiet for as long as it lasted."""

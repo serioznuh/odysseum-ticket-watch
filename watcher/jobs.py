@@ -80,6 +80,7 @@ class PatheOutcome:
     snapshot: detect.Snapshot | None = None
     findings: list[Finding] = field(default_factory=list)
     error_key: str | None = None
+    healthy: bool = False
 
 
 @dataclass
@@ -87,6 +88,7 @@ class CinesaOutcome:
     snapshot: detect.CinesaSnapshot | None = None
     findings: list[Finding] = field(default_factory=list)
     error_key: str | None = None
+    healthy: bool = False
     # A Chrome that may still hold the watcher profile lock. Unlike an ordinary
     # Cinesa outage, this needs the owner's hands and will break every later
     # mint, so it makes the run exit non-zero as well as feeding the streak.
@@ -185,6 +187,7 @@ def run_pathe_job(
             ctx.state["alerts"].pop(spent, None)
         ctx.state["last_check_ok"] = now.isoformat()
         ctx.state["last_catalogue_ok"] = now.isoformat()
+        out.healthy = True
     out.findings.extend(analyzed)
     return out
 
@@ -310,6 +313,7 @@ def run_cinesa_job(
             )
     else:
         out.snapshot = snap
+        out.healthy = True
         if cin.get("error_alerted"):
             out.findings.append(alerts.build_cinesa_recovered_finding(ctx.cfg, now))
         cin.pop("blind_since", None)
@@ -441,7 +445,9 @@ def run_heartbeat_job(
 
 # --------------------------------------------------- reminders, supervision
 
-def run_reminder_job(ctx: RunContext, now: datetime) -> bool:
+def run_reminder_job(
+    ctx: RunContext, now: datetime, *, retry_existing: bool = True
+) -> bool:
     """Send whatever rung of the ladder is due at `now`.
 
     Called twice per run — once before any polling, once after fresh
@@ -462,7 +468,9 @@ def run_reminder_job(ctx: RunContext, now: datetime) -> bool:
     sent = False
     for r in due:
         log.info("reminder due: %s before %s", r["offset"], r["target"])
-        if delivery.deliver_reminder(ctx, r, now):
+        if delivery.deliver_reminder(
+            ctx, r, now, retry_existing=retry_existing
+        ):
             sent = True
     return sent
 

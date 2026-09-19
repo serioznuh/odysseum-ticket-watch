@@ -123,9 +123,18 @@ def _attempt(ctx: Any, delivery_id: str, now: datetime) -> bool:
     ctx.delivery_attempts.add(delivery_id)
 
     claim_token = uuid.uuid4().hex
+    before_claim = deepcopy(record)
     record["status"] = "sending"
     record["claim"] = {"owner": _owner(), "token": claim_token, "at": now.isoformat()}
-    _persist(ctx)
+    try:
+        _persist(ctx)
+    except Exception:
+        # Telegram has not been called. Restore the known-unsent state so
+        # same-run recovery cannot reinterpret a failed claim save as an
+        # interrupted send and quarantine it permanently.
+        record.clear()
+        record.update(before_claim)
+        raise
 
     try:
         outcome = _result(
@@ -202,6 +211,7 @@ def enqueue(
     expires_at: datetime | None = None,
     identity: str | None = None,
     force: bool = False,
+    retry_existing: bool = True,
 ) -> bool:
     """Persist one logical message, attempt it, then persist its receipt."""
     topics = topics or []
@@ -253,6 +263,9 @@ def enqueue(
             existing["text"] = text
             _persist(ctx)
 
+    if existing is not None and not retry_existing:
+        return False
+
     return _attempt(ctx, delivery_id, now)
 
 
@@ -279,6 +292,10 @@ def _finding_policy(finding: Finding, now: datetime) -> tuple[list[str], datetim
         return [f"pathe-availability:{day}"], _day_expiry(day)
     if finding.kind in {"CINESA_IMAX_GONE", "CINESA_IMAX_BACK"}:
         return ["cinesa-imax-presence"], None
+    if finding.key.startswith(("error:", "recovered:", "stale:")):
+        return ["pathe-health"], None
+    if finding.key.startswith(("cinesa_error:", "cinesa_recovered:")):
+        return ["cinesa-health"], None
     return [], None
 
 
@@ -313,7 +330,13 @@ def deliver_alert(ctx: Any, alert: Alert, now: datetime, *, force: bool = False)
     )
 
 
-def deliver_reminder(ctx: Any, reminder: dict, now: datetime) -> bool:
+def deliver_reminder(
+    ctx: Any,
+    reminder: dict,
+    now: datetime,
+    *,
+    retry_existing: bool = True,
+) -> bool:
     target = reminder["target"]
     offset = str(reminder["offset"])
     target_dt = as_aware(parse_iso(target))
@@ -339,6 +362,7 @@ def deliver_reminder(ctx: Any, reminder: dict, now: datetime) -> bool:
         now=now,
         topics=[f"reminder:{target}"],
         expires_at=expiry,
+        retry_existing=retry_existing,
     )
 
 
@@ -355,6 +379,37 @@ def deliver_heartbeat(ctx: Any, finding: Finding, now: datetime) -> bool:
         topics=["heartbeat"],
         expires_at=now + timedelta(days=7),
     )
+
+
+def retire_stale_reminders(ctx: Any, current_target: str | None) -> None:
+    """Drop reminder work whose observed opening no longer exists or moved."""
+    changed = False
+    for delivery_id, record in list(ctx.state.setdefault("outbox", {}).items()):
+        ack = record["ack"]
+        if ack["type"] == "reminder" and ack["target"] != current_target:
+            ctx.state["outbox"].pop(delivery_id, None)
+            changed = True
+    if changed:
+        _persist(ctx)
+
+
+def retire_resolved_outages(ctx: Any, topic: str) -> None:
+    """Drop queued blind/degraded messages after a healthy observation.
+
+    Pending RECOVERED messages deliberately remain: they describe the current
+    healthy state and still deserve a safe retry after a definite failure.
+    """
+    changed = False
+    for delivery_id, record in list(ctx.state.setdefault("outbox", {}).items()):
+        outage = any(
+            kind in {"WATCHER_ERROR", "WATCHER_STILL_BLIND"}
+            for kind in record["kinds"]
+        )
+        if outage and topic in record.get("topics", []):
+            ctx.state["outbox"].pop(delivery_id, None)
+            changed = True
+    if changed:
+        _persist(ctx)
 
 
 def recover(ctx: Any, now: datetime) -> bool:

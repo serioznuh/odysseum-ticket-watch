@@ -80,13 +80,12 @@ A single-user Telegram watcher covering **two independent targets**:
   ref without checking it out, so state never dirties the code worktree.
   Reconciliation unions receipts/baselines; conflicts fail closed and pushes retain receipts.
 - **Delivery boundary** — every alert, reminder and heartbeat is saved to an
-  outbox before Telegram is called. Confirmation stores every member key plus Telegram's
-  message ID, then advances gated baselines. Definite failures remain pending. A timeout
-  or interrupted attempt is `uncertain` and is not replayed automatically: avoiding a
-  duplicate takes precedence over guessing it failed. Current observations remain
-  independent: an uncertain sale alert cannot freeze the opening or its reminder ladder.
-  On check runs, fresh polling supersedes stale pending advice before safe pending work is
-  recovered. Moved openings, reminder rungs and changed availability retire stale work first.
+  outbox before Telegram is called. Confirmation stores member keys and Telegram's message ID.
+  Definite failures remain pending; a failed pre-send claim save rolls back to pending. A
+  post-send timeout is `uncertain` and is not replayed automatically. Current observations
+  stay independent: an uncertain sale alert cannot freeze its opening or reminder ladder.
+  On checks, new reminders still lead, but failed ones wait for polling. Moved openings and
+  recovered source health retire obsolete reminders/outage alerts before outbox recovery.
   Overlapping hosts can still both send: this is not exactly-once or cross-host exclusion.
 - **Pathé failure model** — catalogue failures still blind the check, while
   every best-effort detail/showtimes result explicitly distinguishes data,
