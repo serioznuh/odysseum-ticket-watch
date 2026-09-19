@@ -18,12 +18,14 @@ from copy import deepcopy
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
-from . import notify
+from . import detect, notify
 from . import state as state_mod
 from .coalesce import Alert
 from .detect import TZ_PARIS, Finding, as_aware, parse_iso
 
 log = logging.getLogger("watcher.delivery")
+
+_CONDITION_PREFIX = "condition:"
 
 
 class DeliveryPersistenceError(state_mod.StateError):
@@ -101,12 +103,49 @@ def _expired(record: dict, now: datetime) -> bool:
     return expiry is not None and now >= as_aware(expiry)
 
 
+def _condition_topic(domain: str, value: str) -> str:
+    return f"{_CONDITION_PREFIX}{domain}={value}"
+
+
+def _condition(topic: str) -> tuple[str, str] | None:
+    if not topic.startswith(_CONDITION_PREFIX):
+        return None
+    domain, separator, value = topic[len(_CONDITION_PREFIX):].partition("=")
+    return (domain, value) if domain and separator and value else None
+
+
+def _pending_condition_domains(ctx: Any, prefix: str) -> set[str]:
+    domains: set[str] = set()
+    for record in ctx.state.setdefault("outbox", {}).values():
+        for topic in record.get("topics", []):
+            parsed = _condition(topic)
+            if parsed is not None and parsed[0].startswith(prefix):
+                domains.add(parsed[0])
+    return domains
+
+
 def _retire_obsolete(ctx: Any, now: datetime, topics: list[str], keys: list[str]) -> None:
     changed = False
     wanted_topics = set(topics)
+    wanted_conditions = {
+        parsed[0]: parsed[1]
+        for topic in topics
+        for parsed in [_condition(topic)]
+        if parsed is not None
+    }
     for delivery_id, record in list(ctx.state.setdefault("outbox", {}).items()):
         same_work = set(record["keys"]) == set(keys)
-        superseded = bool(wanted_topics & set(record.get("topics", []))) and not same_work
+        record_topics = set(record.get("topics", []))
+        conflicting_condition = any(
+            parsed[0] in wanted_conditions
+            and wanted_conditions[parsed[0]] != parsed[1]
+            for topic in record_topics
+            for parsed in [_condition(topic)]
+            if parsed is not None
+        )
+        superseded = (
+            bool(wanted_topics & record_topics) and not same_work
+        ) or conflicting_condition
         if _expired(record, now) or superseded or _has_receipt(ctx.state, delivery_id):
             reason = "expired" if _expired(record, now) else "superseded"
             log.info("retired %s outbox work %s", reason, delivery_id)
@@ -282,20 +321,38 @@ def _finding_policy(finding: Finding, now: datetime) -> tuple[list[str], datetim
         expiry = parse_iso(finding.sale_datetime)
         suffix = f":{finding.sale_datetime}"
         slug = finding.key[len("sale:"):-len(suffix)]
-        return [f"sale:{slug}"], as_aware(expiry) if expiry else None
+        return [
+            f"sale:{slug}",
+            _condition_topic(f"pathe-sale:{slug}", finding.sale_datetime),
+        ], as_aware(expiry) if expiry else None
+    if finding.kind == "TICKETS_AVAILABLE":
+        _prefix, slug, formats = finding.key.split(":", 2)
+        return [
+            _condition_topic(f"pathe-tickets:{slug}", fmt)
+            for fmt in formats.split(",")
+        ], None
     if finding.kind in {"CINESA_TARGET_DATE", "CINESA_TARGET_NO_IMAX"}:
         parts = finding.key.split(":")
         if len(parts) >= 4:
-            return [f"cinesa-availability:{':'.join(parts[-3:])}"], _day_expiry(parts[-1])
+            domain = f"cinesa-availability:{':'.join(parts[-3:])}"
+            value = "imax" if finding.kind == "CINESA_TARGET_DATE" else "no-imax"
+            return [_condition_topic(domain, value)], _day_expiry(parts[-1])
     if finding.kind == "PATHE_TARGET_DATE":
         day = finding.key.rsplit(":", 1)[-1]
-        return [f"pathe-availability:{day}"], _day_expiry(day)
+        return [
+            _condition_topic(f"pathe-availability:{day}", "open")
+        ], _day_expiry(day)
     if finding.kind in {"CINESA_IMAX_GONE", "CINESA_IMAX_BACK"}:
-        return ["cinesa-imax-presence"], None
-    if finding.key.startswith(("error:", "recovered:", "stale:")):
-        return ["pathe-health"], None
-    if finding.key.startswith(("cinesa_error:", "cinesa_recovered:")):
-        return ["cinesa-health"], None
+        value = "absent" if finding.kind == "CINESA_IMAX_GONE" else "present"
+        return [_condition_topic("cinesa-imax-presence", value)], None
+    if finding.key.startswith(("error:", "stale:")):
+        return [_condition_topic("pathe-health", "unhealthy")], None
+    if finding.key.startswith("recovered:"):
+        return [_condition_topic("pathe-health", "healthy")], None
+    if finding.key.startswith("cinesa_error:"):
+        return [_condition_topic("cinesa-health", "unhealthy")], None
+    if finding.key.startswith("cinesa_recovered:"):
+        return [_condition_topic("cinesa-health", "healthy")], None
     return [], None
 
 
@@ -360,7 +417,7 @@ def deliver_reminder(
             "offsets": [str(value) for value in ctx.cfg.reminder_offsets_minutes],
         },
         now=now,
-        topics=[f"reminder:{target}"],
+        topics=[_condition_topic("pathe-sale-target", target)],
         expires_at=expiry,
         retry_existing=retry_existing,
     )
@@ -381,35 +438,139 @@ def deliver_heartbeat(ctx: Any, finding: Finding, now: datetime) -> bool:
     )
 
 
-def retire_stale_reminders(ctx: Any, current_target: str | None) -> None:
-    """Drop reminder work whose observed opening no longer exists or moved."""
-    changed = False
-    for delivery_id, record in list(ctx.state.setdefault("outbox", {}).items()):
-        ack = record["ack"]
-        if ack["type"] == "reminder" and ack["target"] != current_target:
-            ctx.state["outbox"].pop(delivery_id, None)
-            changed = True
-    if changed:
-        _persist(ctx)
+def reconcile_observations(
+    ctx: Any,
+    *,
+    observed_domains: set[str],
+    active_conditions: set[str],
+) -> None:
+    """Retire queued messages contradicted by authoritative observations.
 
-
-def retire_resolved_outages(ctx: Any, topic: str) -> None:
-    """Drop queued blind/degraded messages after a healthy observation.
-
-    Pending RECOVERED messages deliberately remain: they describe the current
-    healthy state and still deserve a safe retry after a definite failure.
+    A merged message is retired if any condition it states is now false; the
+    current analysis has already had a chance to enqueue a corrected message.
+    Domains absent from ``observed_domains`` are unknown, never false.
     """
     changed = False
     for delivery_id, record in list(ctx.state.setdefault("outbox", {}).items()):
-        outage = any(
-            kind in {"WATCHER_ERROR", "WATCHER_STILL_BLIND"}
-            for kind in record["kinds"]
+        contradicted = any(
+            parsed[0] in observed_domains and topic not in active_conditions
+            for topic in record.get("topics", [])
+            for parsed in [_condition(topic)]
+            if parsed is not None
         )
-        if outage and topic in record.get("topics", []):
+        if contradicted:
+            log.info("retired contradicted outbox work %s", delivery_id)
             ctx.state["outbox"].pop(delivery_id, None)
             changed = True
     if changed:
         _persist(ctx)
+
+
+def reconcile_source_observations(
+    ctx: Any,
+    *,
+    now: datetime,
+    pathe_snapshot: Any = None,
+    pathe_health: str | None = None,
+    cinesa_snapshot: Any = None,
+    cinesa_health: str | None = None,
+) -> None:
+    """Publish the latest authoritative source facts to the outbox."""
+    observed: set[str] = set()
+    active: set[str] = set()
+
+    for domain, health in (
+        ("pathe-health", pathe_health),
+        ("cinesa-health", cinesa_health),
+    ):
+        if health is not None:
+            observed.add(domain)
+            active.add(_condition_topic(domain, health))
+
+    if pathe_snapshot is not None:
+        shows = {
+            show.get("slug", ""): show
+            for show in pathe_snapshot.matched_shows
+            if show.get("slug")
+        }
+        for domain in _pending_condition_domains(ctx, "pathe-sale:"):
+            slug = domain.removeprefix("pathe-sale:")
+            observed.add(domain)
+            show = shows.get(slug)
+            sale = show.get("salesOpeningDatetime") if show else None
+            if show and sale and detect.selected_listing(show, ctx.cfg):
+                active.add(_condition_topic(domain, sale))
+
+        for domain in _pending_condition_domains(ctx, "pathe-tickets:"):
+            slug = domain.removeprefix("pathe-tickets:")
+            show = shows.get(slug)
+            if show is not None and not pathe_snapshot.endpoint_healthy(slug, "showtimes"):
+                continue
+            observed.add(domain)
+            if show is None:
+                continue
+            days = pathe_snapshot.showtimes.get(slug) or {}
+            entry = pathe_snapshot.cinema_entries.get(slug) or {}
+            if days:
+                formats = detect.summarize_sessions(show, days)["counts"]
+            elif entry.get("isBookable") or entry.get("bookable"):
+                formats = {detect.classify_format(show.get("title"), slug)}
+            else:
+                formats = set()
+            active.update(_condition_topic(domain, fmt) for fmt in formats)
+
+        selected = [
+            show for show in pathe_snapshot.matched_shows
+            if detect.selected_listing(show, ctx.cfg)
+        ]
+        dates_authoritative = all(
+            pathe_snapshot.endpoint_healthy(show.get("slug", ""), "showtimes")
+            for show in selected
+        )
+        if dates_authoritative:
+            open_days = {
+                finding.key.rsplit(":", 1)[-1]
+                for finding in detect.target_date_findings(
+                    pathe_snapshot, ctx.cfg, now
+                )
+            }
+            for day in getattr(ctx.cfg, "pathe_target_dates", []):
+                domain = f"pathe-availability:{day}"
+                observed.add(domain)
+                if day in open_days:
+                    active.add(_condition_topic(domain, "open"))
+
+        target = ctx.state.get("sale_target")
+        if target is not None:
+            observed.add("pathe-sale-target")
+            active.add(_condition_topic("pathe-sale-target", target))
+
+    if cinesa_snapshot is not None and cinesa_snapshot.days:
+        known = {day["date"] for day in cinesa_snapshot.days}
+        imax = set(
+            detect.imax_days(
+                cinesa_snapshot.days, ctx.cfg.cinesa_imax_attribute_id
+            )
+        )
+        for day in getattr(ctx.cfg, "cinesa_target_dates", []):
+            domain = (
+                f"cinesa-availability:{ctx.cfg.cinesa_site_id}:"
+                f"{ctx.cfg.cinesa_film_id}:{day}"
+            )
+            observed.add(domain)
+            if day in known:
+                value = "imax" if day in imax else "no-imax"
+                active.add(_condition_topic(domain, value))
+        observed.add("cinesa-imax-presence")
+        active.add(
+            _condition_topic(
+                "cinesa-imax-presence", "present" if imax else "absent"
+            )
+        )
+
+    reconcile_observations(
+        ctx, observed_domains=observed, active_conditions=active
+    )
 
 
 def recover(ctx: Any, now: datetime) -> bool:

@@ -132,30 +132,17 @@ def _run_source_jobs(
     _guard(
         failed, "baselines", jobs.advance_baselines, ctx, pathe_out, cinesa_out, findings, now
     )
-    if pathe_out.snapshot is not None:
-        _guard(
-            failed,
-            "reminder-supersession",
-            delivery.retire_stale_reminders,
-            ctx,
-            ctx.state.get("sale_target"),
-        )
-    if pathe_out.healthy:
-        _guard(
-            failed,
-            "pathe-outage-retirement",
-            delivery.retire_resolved_outages,
-            ctx,
-            "pathe-health",
-        )
-    if cinesa_out.healthy:
-        _guard(
-            failed,
-            "cinesa-outage-retirement",
-            delivery.retire_resolved_outages,
-            ctx,
-            "cinesa-health",
-        )
+    _guard(
+        failed,
+        "observation-reconciliation",
+        delivery.reconcile_source_observations,
+        ctx,
+        now=now,
+        pathe_snapshot=pathe_out.snapshot,
+        pathe_health=pathe_out.health,
+        cinesa_snapshot=cinesa_out.snapshot,
+        cinesa_health=cinesa_out.health,
+    )
     return sent_any, pathe_out.snapshot
 
 

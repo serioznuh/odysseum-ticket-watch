@@ -668,7 +668,7 @@ def test_healthy_poll_retires_failed_blind_alert_before_recovery(
     assert len(failed["outbox"]) == 1
     blind = next(iter(failed["outbox"].values()))
     assert blind["kinds"] == ["WATCHER_ERROR"]
-    assert blind["topics"] == ["pathe-health"]
+    assert blind["topics"] == ["condition:pathe-health=unhealthy"]
 
     healthy = Snapshot(
         matched_shows=[
@@ -683,6 +683,45 @@ def test_healthy_poll_retires_failed_blind_alert_before_recovery(
 
     assert runner.sent == []
     assert recovered["outbox"] == {}
+
+
+def test_renewed_failure_retires_pending_recovered_alert_before_recovery(
+    tmp_path, monkeypatch
+):
+    """Health supersession is symmetric: a failed RECOVERED notification must
+    not be replayed after the source becomes unhealthy again."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(NOW, NOW))
+    state = json.loads(runner.state.read_text(encoding="utf-8"))
+    stale = (NOW - timedelta(days=1)).isoformat()
+    state.update(
+        error_alerted=True,
+        failure_streak=3,
+        last_error="HTTP 500",
+        last_check_ok=stale,
+        last_catalogue_ok=stale,
+    )
+    runner.state.write_text(json.dumps(state), encoding="utf-8")
+    healthy = Snapshot(
+        matched_shows=[
+            {
+                "slug": "dune-troisieme-partie",
+                "title": "Dune : Troisième partie",
+                "isMovie": True,
+            }
+        ]
+    )
+
+    recovered = runner.run(healthy, delivered=False)
+    pending = next(iter(recovered["outbox"].values()))
+    assert pending["kinds"] == ["RECOVERED"]
+    assert pending["topics"] == ["condition:pathe-health=healthy"]
+
+    failed_again = runner.run(RuntimeError("temporary failure"), delivered=True)
+
+    assert runner.sent == []
+    assert failed_again["failure_streak"] == 1
+    assert failed_again["outbox"] == {}
 
 
 def test_stale_period_fires_once_at_the_threshold_then_daily():

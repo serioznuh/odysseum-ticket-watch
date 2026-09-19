@@ -84,8 +84,9 @@ A single-user Telegram watcher covering **two independent targets**:
   Definite failures remain pending; a failed pre-send claim save rolls back to pending. A
   post-send timeout is `uncertain` and is not replayed automatically. Current observations
   stay independent: an uncertain sale alert cannot freeze its opening or reminder ladder.
-  On checks, new reminders still lead, but failed ones wait for polling. Moved openings and
-  recovered source health retire obsolete reminders/outage alerts before outbox recovery.
+  On checks, new reminders lead but failed ones wait for polling. Authoritative observations
+  retire pending advice whose condition is now false, including inverse health transitions.
+  Unknown evidence retires nothing; an absent sale target preserves the pending `open` ping.
   Overlapping hosts can still both send: this is not exactly-once or cross-host exclusion.
 - **Pathé failure model** — catalogue failures still blind the check, while
   every best-effort detail/showtimes result explicitly distinguishes data,

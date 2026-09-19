@@ -9,7 +9,7 @@ from typing import ClassVar
 import pytest
 
 from watcher import coalesce, delivery, jobs, notify
-from watcher.detect import TZ_PARIS, Finding
+from watcher.detect import TZ_PARIS, CinesaSnapshot, Finding, Snapshot
 from watcher.state import DEFAULT_STATE, load_state, save_state
 from watcher.state_merge import merge_states
 
@@ -25,8 +25,15 @@ class Cfg:
     cinema_city = "Montpellier"
     film_title = "Dune : Troisième partie"
     pathe_target_format = "imax70"
+    pathe_target_dates: ClassVar = []
+    primary_slug = "dune"
+    cinema_slug = "odysseum"
     pathe_page_url = "https://example.invalid/event"
     film_page_url = "https://example.invalid/film"
+    cinesa_target_dates: ClassVar = []
+    cinesa_site_id = "032"
+    cinesa_film_id = "HO00003228"
+    cinesa_imax_attribute_id = "imax"
 
 
 def finding(
@@ -370,3 +377,90 @@ def test_changed_availability_retires_the_stale_pending_advice(tmp_path, monkeyp
     assert len(durable["outbox"]) == 1
     assert next(iter(durable["outbox"].values()))["keys"] == [with_imax.key]
     assert durable["alerts"] == {}
+
+
+def test_latest_snapshots_retire_all_disproved_availability_alerts(
+    tmp_path, monkeypatch
+):
+    """No replacement finding is required: authoritative absence contradicts
+    Pathé date, generic-ticket and Cinesa date advice in the same way."""
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    day = "2026-09-20"
+    monkeypatch.setattr(Cfg, "pathe_target_dates", [day])
+    monkeypatch.setattr(Cfg, "cinesa_target_dates", [day])
+    calls = []
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda *args, **kwargs: calls.append("attempt") or notify.SendResult("failed"),
+    )
+
+    pathe_date = finding(
+        f"pathe_target:{Cfg.cinema_slug}:{Cfg.primary_slug}:imax70:{day}",
+        kind="PATHE_TARGET_DATE",
+    )
+    tickets = finding("tickets:dune-imax:imax70", kind="TICKETS_AVAILABLE")
+    cinesa_date = finding(
+        f"cinesa_target:{Cfg.cinesa_site_id}:{Cfg.cinesa_film_id}:{day}",
+        kind="CINESA_TARGET_DATE",
+    )
+    for item in (pathe_date, tickets, cinesa_date):
+        assert delivery.deliver_alert(ctx, alert(item), NOW) is False
+    assert len(ctx.state["outbox"]) == 3
+
+    delivery.reconcile_source_observations(
+        ctx,
+        now=NOW,
+        pathe_snapshot=Snapshot(
+            matched_shows=[
+                {
+                    "slug": "dune-imax",
+                    "title": "Dune IMAX 70mm",
+                    "isMovie": False,
+                }
+            ]
+        ),
+        pathe_health="healthy",
+        cinesa_snapshot=CinesaSnapshot(
+            days=[{"date": "2026-09-19", "attributes": []}]
+        ),
+        cinesa_health="healthy",
+    )
+
+    assert ctx.state["outbox"] == {}
+    assert delivery.recover(ctx, NOW + timedelta(minutes=1)) is False
+    assert calls == ["attempt", "attempt", "attempt"]
+
+
+def test_missing_sale_target_does_not_disprove_pending_open_ping(
+    tmp_path, monkeypatch
+):
+    """`None` can mean sales just went live. Only a different observed target
+    contradicts the old ladder; the high-value open ping remains retryable."""
+    state_path = tmp_path / "state.json"
+    target = (NOW - timedelta(minutes=1)).isoformat()
+    ctx = context(state_path)
+    calls = []
+    outcomes = iter((notify.SendResult("failed"), notify.SendResult("confirmed")))
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda *args, **kwargs: calls.append("attempt") or next(outcomes),
+    )
+
+    assert delivery.deliver_reminder(
+        ctx, {"target": target, "offset": "open"}, NOW
+    ) is False
+    ctx.state["sale_target"] = None
+    delivery.reconcile_source_observations(
+        ctx,
+        now=NOW,
+        pathe_snapshot=Snapshot(),
+        pathe_health="healthy",
+    )
+
+    assert len(ctx.state["outbox"]) == 1
+    restarted = context(state_path, state=load_state(state_path))
+    assert delivery.recover(restarted, NOW + timedelta(minutes=1)) is True
+    assert calls == ["attempt", "attempt"]

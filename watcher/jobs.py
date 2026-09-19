@@ -80,7 +80,7 @@ class PatheOutcome:
     snapshot: detect.Snapshot | None = None
     findings: list[Finding] = field(default_factory=list)
     error_key: str | None = None
-    healthy: bool = False
+    health: str | None = None
 
 
 @dataclass
@@ -88,7 +88,7 @@ class CinesaOutcome:
     snapshot: detect.CinesaSnapshot | None = None
     findings: list[Finding] = field(default_factory=list)
     error_key: str | None = None
-    healthy: bool = False
+    health: str | None = None
     # A Chrome that may still hold the watcher profile lock. Unlike an ordinary
     # Cinesa outage, this needs the owner's hands and will break every later
     # mint, so it makes the run exit non-zero as well as feeding the streak.
@@ -149,6 +149,7 @@ def run_pathe_job(
         snap = pathe.fetch_snapshot(client, ctx.cfg, budget=budget)
     except Exception as e:
         log.exception("Pathé check failed")
+        out.health = "unhealthy"
         finding = alerts.record_pathe_failure(ctx.cfg, ctx.state, str(e), now)
         if finding is not None:
             out.findings.append(finding)
@@ -168,6 +169,7 @@ def run_pathe_job(
 
     degradation = snap.degradation_summary()
     if degradation:
+        out.health = "unhealthy"
         state_mod.refresh_catalogue_liveness(ctx.state, now)
         log.warning("%s", degradation)
         finding = alerts.record_pathe_failure(ctx.cfg, ctx.state, degradation, now)
@@ -187,7 +189,7 @@ def run_pathe_job(
             ctx.state["alerts"].pop(spent, None)
         ctx.state["last_check_ok"] = now.isoformat()
         ctx.state["last_catalogue_ok"] = now.isoformat()
-        out.healthy = True
+        out.health = "healthy"
     out.findings.extend(analyzed)
     return out
 
@@ -287,6 +289,7 @@ def run_cinesa_job(
         snap = cinesa.fetch_snapshot(ctx.cfg, budget=budget)
     except Exception as e:
         log.exception("Cinesa check failed")
+        out.health = "unhealthy"
         # Capped at the alert threshold: nothing reads a larger value,
         # and a counter that kept growing would rewrite state.json on
         # every firing of a long outage, commit and push included.
@@ -313,7 +316,7 @@ def run_cinesa_job(
             )
     else:
         out.snapshot = snap
-        out.healthy = True
+        out.health = "healthy"
         if cin.get("error_alerted"):
             out.findings.append(alerts.build_cinesa_recovered_finding(ctx.cfg, now))
         cin.pop("blind_since", None)
