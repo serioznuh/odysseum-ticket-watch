@@ -574,7 +574,14 @@ def update_from_snapshot(
             continue
         if advance_one_shot and slug not in state["shows_seen"]:
             state["shows_seen"].append(slug)
-        if advance_sales and show.get("salesOpeningDatetime"):
+        # Only a readable opening becomes a baseline. An unreadable one is
+        # unknown evidence: recording it would both corrupt the state file and
+        # retire the SALE_DATE alert for an opening never announced.
+        if (
+            advance_sales
+            and detect.usable_source_timestamp(show.get("salesOpeningDatetime"))
+            is not None
+        ):
             state["sales"][slug] = show["salesOpeningDatetime"]
 
         days = snap.showtimes.get(slug) or {}
@@ -602,7 +609,7 @@ def update_from_snapshot(
         show["slug"]: show["salesOpeningDatetime"]
         for show in snap.matched_shows
         if show.get("slug")
-        and show.get("salesOpeningDatetime")
+        and detect.usable_source_timestamp(show.get("salesOpeningDatetime")) is not None
         and detect.selected_listing(show, cfg)
         and snap.listing_metadata_authoritative(show["slug"], show)
     }
@@ -616,7 +623,21 @@ def update_from_snapshot(
     current_dt = detect.parse_iso(current_target)
     current_aware = detect.as_aware(current_dt) if current_dt is not None else None
     observed_dt = detect.parse_iso(observed_target)
-    observations_complete = snap.sale_observations_complete()
+    # A timestamp the watcher could not read is unknown evidence, never an
+    # absence. Counting it as one would let a single bad date clear
+    # `sale_target` and retire a valid reminder ladder.
+    unreadable_sales = sorted(
+        show.get("slug") or "an unnamed listing"
+        for show in snap.matched_shows
+        if show.get("salesOpeningDatetime")
+        and detect.usable_source_timestamp(show["salesOpeningDatetime"]) is None
+    )
+    if unreadable_sales:
+        log.warning(
+            "Pathé: unreadable sale opening for %s — keeping the current reminder target",
+            ", ".join(unreadable_sales),
+        )
+    observations_complete = snap.sale_observations_complete() and not unreadable_sales
     reported_targets = set(observed_sales.values())
 
     # With no later opening to arm, a reported opening remains the ladder

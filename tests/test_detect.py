@@ -156,6 +156,57 @@ def test_sale_date_changed_and_unchanged():
     assert findings[0].sale_datetime == new
 
 
+def test_usable_source_timestamp_accepts_only_readable_offset_aware_values():
+    """OTW-23. Both halves of the rule matter: `parse_iso` is how every reader
+    downstream resolves an opening, and a persisted timestamp must carry an
+    offset — a value failing either is no evidence at all."""
+    assert detect.usable_source_timestamp("2026-11-05T08:00:00+01:00") is not None
+    assert detect.usable_source_timestamp("2026-11-05T08:00:00") is None  # no offset
+    assert detect.usable_source_timestamp("bientôt") is None
+    assert detect.usable_source_timestamp("2026-13-45T99:00:00+01:00") is None
+    assert detect.usable_source_timestamp(None) is None
+    assert detect.usable_source_timestamp(1762326000) is None
+
+
+def test_reject_unusable_source_timestamps_drops_only_the_bad_fields():
+    good = "2026-11-05T08:00:00+01:00"
+    shows = [
+        primary_show(salesOpeningDatetime="2026-11-05T08:00:00"),
+        event_show(salesOpeningDatetime=good, showtimesDisplayDatetime="soon"),
+        {"title": "no slug", "salesOpeningDatetime": "n/a"},
+    ]
+
+    rejected = detect.reject_unusable_source_timestamps(shows)
+
+    assert rejected == {
+        PRIMARY: ["salesOpeningDatetime"],
+        event_show()["slug"]: ["showtimesDisplayDatetime"],
+        "": ["salesOpeningDatetime"],
+    }
+    assert "salesOpeningDatetime" not in shows[0]
+    assert shows[1]["salesOpeningDatetime"] == good
+    assert "showtimesDisplayDatetime" not in shows[1]
+    # A published null is Pathé saying "not yet", not a rejection.
+    assert detect.reject_unusable_source_timestamps([primary_show()]) == {}
+
+
+def test_unreadable_sale_opening_raises_no_sale_alert():
+    """A bad date must not become a dedup key or a reminder target, and it must
+    not claim the listing is newly known either."""
+    st = fresh_state()
+    st["shows_seen"] = [PRIMARY]
+    snap = Snapshot(
+        matched_shows=[
+            primary_show(
+                salesOpeningDatetime="2026-11-05T08:00:00",
+                showtimesDisplayDatetime="2026-11-04T08:00:00",
+            )
+        ]
+    )
+
+    assert detect.analyze_pathe(snap, st, Cfg, NOW) == []
+
+
 def test_tickets_available_with_imax70_format():
     show = event_show()
     st = fresh_state()

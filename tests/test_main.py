@@ -336,7 +336,7 @@ class PatheCheckRunner:
         monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat")
         monkeypatch.setattr(pathe, "make_client", object)
 
-    def run(self, result, *, delivered: bool) -> dict:
+    def run(self, result, *, delivered: bool, expect_exit: int = 0) -> dict:
         """One firing. `result` is a snapshot to return or an exception to raise."""
 
         def fake_fetch(client, cfg, **_budget):
@@ -363,9 +363,165 @@ class PatheCheckRunner:
                     "check",
                 ]
             )
-            == 0
+            == expect_exit
         )
         return json.loads(self.state.read_text(encoding="utf-8"))
+
+
+def test_an_offset_free_sale_date_neither_alerts_nor_breaks_the_save(
+    tmp_path, monkeypatch
+):
+    """OTW-23, end to end: the value that used to be accepted into observation
+    state and then crash the final save is unknown evidence instead."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    slug = "dune-troisieme-partie"
+    show = {
+        "slug": slug,
+        "title": "Dune : Troisième partie",
+        "salesOpeningDatetime": "2026-11-05T08:00:00",  # no UTC offset
+        "isMovie": True,
+    }
+
+    st = runner.run(Snapshot(matched_shows=[show]), delivered=True)
+
+    assert runner.sent == []
+    assert st["alerts"] == {}
+    assert st["sales"] == {}
+    assert st["sale_target"] is None
+    assert st["shows_seen"] == [slug]  # still watched, only its date is unknown
+    # The file on disk is valid state, which is the crash this prevents.
+    assert state_mod.load_state(runner.state)["sale_target"] is None
+
+
+def _break_save_after_supervision(monkeypatch, exc: Exception):
+    """Let every durable delivery write succeed and fail only the final save.
+
+    Supervision is the last job before the coordinator's bookkeeping save, so
+    flipping the writer there isolates that one write without depending on how
+    many times delivery persisted on the way. Returns a callable that restores
+    a working writer, for a test that also runs the next firing.
+    """
+    real_save = state_mod.save_state
+    real_supervision = jobs.run_supervision_job
+    breaking = {"on": False}
+
+    def save(path, state):
+        if breaking["on"]:
+            raise exc
+        real_save(path, state)
+
+    def supervision(ctx, now):
+        result = real_supervision(ctx, now)
+        breaking["on"] = True
+        return result
+
+    monkeypatch.setattr(state_mod, "save_state", save)
+    monkeypatch.setattr(jobs, "run_supervision_job", supervision)
+
+    def repair() -> None:
+        monkeypatch.setattr(state_mod, "save_state", real_save)
+        monkeypatch.setattr(jobs, "run_supervision_job", real_supervision)
+
+    return repair
+
+
+def test_final_save_failure_keeps_confirmed_receipts_and_replays_nothing(
+    tmp_path, monkeypatch, caplog
+):
+    """OTW-20 makes a receipt durable when it is confirmed; OTW-23 makes losing
+    the later bookkeeping save a reported failure rather than a lost send."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    sale = "2026-11-05T08:00:00+01:00"
+    slug = "dune-troisieme-partie"
+    show = {
+        "slug": slug,
+        "title": "Dune : Troisième partie",
+        "salesOpeningDatetime": sale,
+        "isMovie": True,
+    }
+    repair = _break_save_after_supervision(
+        monkeypatch, OSError("no space left on device")
+    )
+
+    with caplog.at_level("ERROR"):
+        st = runner.run(Snapshot(matched_shows=[show]), delivered=True, expect_exit=1)
+
+    assert len(runner.sent) == 1
+    # Durable: the receipt and its dedup key were written at confirmation time.
+    assert f"sale:{slug}:{sale}" in st["alerts"]
+    assert [r["keys"] for r in st["delivery_receipts"].values()] == [
+        [f"sale:{slug}:{sale}"]
+    ]
+    assert st["outbox"] == {}
+    # Lost with the save: only bookkeeping the next run re-derives. The delivered
+    # alert key is what stops it being announced twice.
+    assert st["sales"] == {}
+    assert "no space left on device" in caplog.text
+    assert "do not hand-edit the state file" in caplog.text
+    assert "Traceback" not in caplog.text
+
+    repair()
+    second = runner.run(Snapshot(matched_shows=[show]), delivered=True)
+    assert runner.sent == []
+    assert second["sales"] == {slug: sale}
+
+
+def test_final_save_validation_failure_preserves_the_last_validated_file(
+    tmp_path, monkeypatch, caplog
+):
+    """A state object this watcher would refuse to load must not replace the
+    file it did load, and must not end the CLI in a traceback either."""
+    config = _write_cli_config(tmp_path)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps(DEFAULT_STATE), encoding="utf-8")
+    before = state.read_bytes()
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat")
+    monkeypatch.setattr(notify, "send_telegram", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        state_mod,
+        "save_state",
+        lambda path, st: (_ for _ in ()).throw(
+            state_mod.StateError("sale_target: timestamp must include a UTC offset")
+        ),
+    )
+
+    with caplog.at_level("ERROR"):
+        result = cli.run(
+            ["--config", str(config), "--state", str(state), "--mode", "remind"]
+        )
+
+    assert result == 1
+    assert state.read_bytes() == before
+    assert "timestamp must include a UTC offset" in caplog.text
+    assert "no dedup or reminder history was reset" in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+def test_final_save_filesystem_failure_exits_non_zero_without_a_traceback(
+    tmp_path, monkeypatch, caplog
+):
+    config = _write_cli_config(tmp_path)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps(DEFAULT_STATE), encoding="utf-8")
+    before = state.read_bytes()
+    # `save_state` writes its temporary file beside the state file; a directory
+    # sitting in exactly that place is a filesystem failure it cannot route
+    # around, with the real code path left intact.
+    (tmp_path / "state.json.tmp").mkdir()
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat")
+    monkeypatch.setattr(notify, "send_telegram", lambda *a, **kw: True)
+
+    with caplog.at_level("ERROR"):
+        result = cli.run(
+            ["--config", str(config), "--state", str(state), "--mode", "remind"]
+        )
+
+    assert result == 1
+    assert state.read_bytes() == before
+    assert "final state save" in caplog.text
+    assert "Traceback" not in caplog.text
 
 
 def test_pathe_outage_stops_rewriting_state_once_capped(tmp_path, monkeypatch):

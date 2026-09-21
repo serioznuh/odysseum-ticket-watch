@@ -430,7 +430,7 @@ def build_heartbeat(cfg, snap: detect.Snapshot, st: dict, now: datetime) -> Find
     sales = sorted({
         detect.as_aware(dt)
         for show in snap.matched_shows if detect.selected_listing(show, cfg)
-        for dt in [detect.parse_iso(show.get("salesOpeningDatetime"))]
+        for dt in [detect.usable_source_timestamp(show.get("salesOpeningDatetime"))]
         if dt is not None and detect.as_aware(dt) > now
     })
     if sales:

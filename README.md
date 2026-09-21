@@ -30,7 +30,8 @@ are **silent** (`alerts.silent_kinds`).
 
 pathe.fr pages are bot-protected, but Pathé's public JSON API is open and
 publishes `salesOpeningDatetime` *before* sales start — a structured advance
-signal, so there is no HTML scraping and no guessing from "Réserver" buttons.
+signal, so there is no HTML scraping and no guessing from "Réserver" buttons. An
+unreadable date (malformed or offset-free) is unknown, never a withdrawal: it cannot alert or cancel a reminder.
 The daily check reads the catalogue, your cinema's programme and its bookable
 sessions (endpoints documented in [watcher/pathe.py](watcher/pathe.py)), plus
 Google News RSS for press leaks.
@@ -104,6 +105,8 @@ source .env
 State contains permanent alert receipts and reminder rungs, so a missing or
 invalid file stops the watcher before network access or Telegram delivery. The
 watcher never renames, replaces, or silently restores it; dry-runs are read-only.
+A save that cannot be validated or written reports its cause and exits non-zero,
+keeping the last validated file; confirmed sends are already recorded in it, so the next run re-derives the rest and nothing replays by itself.
 
 For a genuinely new installation with no state file, initialize it once:
 

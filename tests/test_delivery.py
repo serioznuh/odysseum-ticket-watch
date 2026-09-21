@@ -8,7 +8,7 @@ from typing import ClassVar
 
 import pytest
 
-from watcher import coalesce, delivery, jobs, notify
+from watcher import coalesce, delivery, jobs, notify, runner
 from watcher import state as state_mod
 from watcher.detect import TZ_PARIS, CinesaSnapshot, FetchResult, Finding, Snapshot
 from watcher.state import DEFAULT_STATE, load_state, save_state
@@ -201,6 +201,61 @@ def test_uncertain_outcome_is_quarantined_and_not_replayed(tmp_path, monkeypatch
     restarted = context(state_path, state=uncertain)
     assert delivery.recover(restarted, NOW + timedelta(minutes=5)) is False
     assert calls == ["attempt"]
+
+
+def test_failed_final_bookkeeping_save_costs_no_receipt_and_replays_nothing(
+    tmp_path, monkeypatch, caplog
+):
+    """OTW-23: the coordinator's last save is not what makes a send durable.
+
+    One confirmed alert and one attempt with an unknown outcome are already on
+    disk when that save fails. It must report the problem, leave the validated
+    file exactly as it is, and leave the next pass with the same two facts.
+    """
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda *a, **kw: notify.SendResult("confirmed", 11)
+    )
+    assert delivery.deliver_alert(ctx, alert(finding()), NOW) is True
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("connection vanished during send")
+
+    monkeypatch.setattr(notify, "send_telegram", crash)
+    with pytest.raises(RuntimeError, match="vanished"):
+        delivery.deliver_alert(
+            ctx, alert(finding(key="new_show:dune-imax-second")), NOW
+        )
+    durable = state_path.read_bytes()
+
+    # An invalid in-memory field is the failure observed on 2026-09-21: it used
+    # to surface only here, as an uncaught traceback out of the CLI.
+    ctx.state["sales"] = {"dune-imax": "2026-11-05T08:00:00"}
+    caplog.clear()  # the sender crash above logged its own (expected) traceback
+    with caplog.at_level("ERROR"):
+        assert runner._save_final_state(ctx, str(state_path)) is False
+
+    assert state_path.read_bytes() == durable
+    assert "must include a UTC offset" in caplog.text
+    assert "Traceback" not in caplog.text
+
+    calls = []
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda *a, **kw: calls.append("send") or notify.SendResult("confirmed", 12),
+    )
+    restarted = context(state_path, state=load_state(state_path))
+    assert delivery.recover(restarted, NOW + timedelta(minutes=5)) is False
+    after = load_state(state_path)
+
+    assert calls == []
+    assert after["alerts"] == {"new_show:dune-imax": NOW.isoformat()}
+    assert [r["keys"] for r in after["delivery_receipts"].values()] == [
+        ["new_show:dune-imax"]
+    ]
+    assert [r["status"] for r in after["outbox"].values()] == ["uncertain"]
 
 
 def test_sender_crash_is_durable_uncertain_and_still_fails_the_job(
