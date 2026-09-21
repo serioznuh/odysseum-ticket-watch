@@ -47,6 +47,14 @@
         "cloud_stale:2026-09-13T14:21:41+00:00"
       ],
       "telegram_message_id": 43
+    },
+    "b5033af686ee4717899a7008b2797e0a": {
+      "delivered_at": "2026-09-22T00:03:41.315560+02:00",
+      "delivery_id": "telegram:2ef310b1bbfa3b421e1424c1",
+      "keys": [
+        "heartbeat:2026-09-22"
+      ],
+      "telegram_message_id": 45
     }
   },
   "error_alerted": false,
@@ -59,9 +67,9 @@
       "imax70"
     ]
   },
-  "last_catalogue_ok": "2026-09-21T23:58:32.908637+02:00",
-  "last_check_ok": "2026-09-21T23:58:32.908637+02:00",
-  "last_heartbeat": "2026-09-14T23:32:25.869908+02:00",
+  "last_catalogue_ok": "2026-09-22T00:03:41.315560+02:00",
+  "last_check_ok": "2026-09-22T00:03:41.315560+02:00",
+  "last_heartbeat": "2026-09-22T00:03:41.315560+02:00",
   "outbox": {},
   "reminders_sent": {
     "2026-09-09T09:00:00+02:00": [
