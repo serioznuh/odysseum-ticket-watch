@@ -72,12 +72,8 @@ A single-user Telegram watcher covering **two independent targets**:
   from live selected listings appear; old or withdrawn dates retained in dedup
   state do not. It links to the selected format's event page and names degraded
   listing calls, but is withheld unless current cloud health is also proven.
-- **Shared state boundary** — live JSON is `.cache/state-sync/state.json`; Git
-  transports it on `refs/heads/runtime-state`, separate from `main`. The tracked
-  `state/state.json` is only the first-run seed. Both halves call
-  `watcher/state_sync.py` before and after a pass; Git plumbing commits the state
-  ref without checking it out, so state never dirties the code worktree.
-  Reconciliation unions receipts/baselines; conflicts fail closed and pushes retain receipts.
+- **Shared state boundary** — live JSON is `.cache/state-sync/state.json`; Git transports it on `refs/heads/runtime-state`, separate from `main`. Both halves call `watcher/state_sync.py` before and after a pass; Git plumbing commits the state ref without checking it out, so state never dirties the code worktree. Reconciliation unions receipts/baselines; conflicts fail closed and pushes retain receipts.
+  Creating that ref is never ordinary work. A confirmed absence is reported before anything local is touched, so live/base evidence survives it: the tracked `state/state.json` is only a first-run seed and cannot prove what was already sent. A clone that still holds receipts keeps running and raises one loud alert; a clone without them makes `sync` exit 3, and both startup wrappers stop there rather than deliver from that seed. A transport failure stays distinct and still continues on the last validated copy. `state_sync init` creates the ref once for a genuinely new install and adopts an independently created one instead of replacing it; owner-run `recover` unions every surviving store's receipts, keeps in-flight attempts quarantined as uncertain, and never accepts the seed as evidence (procedure in README).
 - **Delivery boundary** — every alert, reminder and heartbeat is saved to an
   outbox before Telegram is called. Confirmation stores member keys and Telegram's message ID.
   Definite failures remain pending; a failed pre-send claim save rolls back to pending. A

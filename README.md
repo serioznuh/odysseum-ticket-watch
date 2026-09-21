@@ -102,32 +102,19 @@ source .env
 
 ### State bootstrap and recovery
 
-State contains permanent alert receipts and reminder rungs, so a missing or
-invalid file stops the watcher before network access or Telegram delivery. The
-watcher never renames, replaces, or silently restores it; dry-runs are read-only.
-A save that cannot be validated or written reports its cause and exits non-zero,
-keeping the last validated file; confirmed sends are already recorded in it, so the next run re-derives the rest and nothing replays by itself.
+State contains permanent alert receipts and reminder rungs, so a missing or invalid file stops the watcher before network access or Telegram delivery. The watcher never renames, replaces, or silently restores it; dry-runs are read-only. A save that cannot be validated or written reports its cause and exits non-zero, keeping the last validated file; confirmed sends are already recorded in it, so the next run re-derives the rest and nothing replays by itself.
 
-For a genuinely new installation with no state file, initialize it once:
+The live file is materialized from the shared `runtime-state` ref, so that ref *is* this installation's delivery history — and **an ordinary sync never creates it**. When it is absent, `state_sync sync` leaves every local file untouched and reports that instead of reseeding from the tracked `state/state.json`, a frozen first-run seed that would look like proof nothing was ever sent. A clone that still holds receipts keeps running and raises one 🔴 alert; a clone without them exits **3**, and both [local-check.sh](scripts/local-check.sh) and the workflow stop there rather than deliver from an unverified seed. A network or credential failure stays separate: retried silently for a few firings, with the watcher still running on its last validated copy.
 
 ```bash
-.venv/bin/python -m watcher --bootstrap-state
+.venv/bin/python -m watcher.state_sync init    # NEW installation: create the ref, once
+.venv/bin/python -m watcher.state_sync recover --from /path/to/backup-state.json
 ```
 
-Bootstrap refuses to overwrite any existing file. A missing production file is
-**not** a new installation. To recover, first stop launchd and disable the Actions
-workflow so neither state writer can send or synchronize. Preserve the damaged
-file, then collect the production clone, remote history, and any backups. Start
-from the newest valid copy and reconcile every known Telegram receipt: take the
-union of `alerts` keys and, per sale timestamp, the union of `reminders_sent`;
-also retain the newest `sales`, `formats_seen`, and `shows_seen` baselines. Never
-resume directly from an older backup—it may omit recent sends and replay them.
+Every other host joins through an ordinary sync, never a second `init` — which adopts an already-created ref untouched, and refuses as soon as anything local proves the user was already notified: a missing ref is then a **recovery**, not a first run. (`python -m watcher --bootstrap-state` only creates an empty local file for a Git-less setup.)
 
-Install the reconciled candidate at `general.state_file`, then validate it without
-sending or rewriting it using `python -m watcher --mode remind --dry-run`. Ensure
-that exact repaired state reaches both the production clone and `main` before
-re-enabling Actions and launchd. If delivery history cannot be reconciled, keep
-the watcher stopped rather than risk duplicate historical notifications.
+Recovery is an owner action. Stop launchd and disable the Actions workflow first so neither writer can send or synchronize, keep the damaged file, and hand it every surviving store: the clone's own `state.json` and `base.json` are read automatically, while each backup or the other half's copy needs its own `--from`. Never resume from an older backup alone — it may omit recent sends and replay them. Recovery unions `alerts`, `delivery_receipts` and per-target `reminders_sent` rungs across all of them, keeps the newest `sales`, `formats_seen` and `shows_seen` baselines, and leaves an attempt that was still in flight marked `uncertain` so an unknown Telegram outcome is never replayed; it refuses the seed alone. If another host recreated the ref meanwhile, that history is left intact and the next sync unions this clone's receipts into it. Validate the result with `python -m watcher --mode remind --dry-run`, confirm both halves sync, then re-enable Actions and launchd. If delivery history cannot be reconciled, keep the watcher stopped rather than risk duplicate historical notifications.
+
 
 ## Deploy
 

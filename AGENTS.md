@@ -35,6 +35,10 @@ Core facts agents need before editing:
   --with-news` (cloud-safe news only) and never calls Pathé or Cinesa.
 - Both halves sync validated JSON on **`refs/heads/runtime-state`**, never `main`.
   OTW-14's merge preserves receipts; never rewrite either pushed history.
+- A **missing** state ref is an operator condition, not a bootstrap: ordinary sync
+  writes nothing, reports it, and exits `BOOTSTRAP_REQUIRED_EXIT` (3), which both
+  startup wrappers stop on. Only `state_sync init`/`recover` create that ref —
+  never re-add a seed fallback to `sync`.
 - The adaptive-cadence guard governs the **Pathé + news half only** and must
   stay before that half's network activity. The Cinesa half and the reminder
   ladder run on every firing by design.
