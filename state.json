@@ -5,6 +5,7 @@
     "cinesa_recovered:2026-08-01T1856": "2026-08-01T18:56:58.290476+02:00",
     "cinesa_target:032:HO00003228:2026-08-26": "2026-08-06T15:08:31.710968+02:00",
     "cinesa_target:032:HO00003228:2026-08-27": "2026-08-06T15:08:31.710968+02:00",
+    "cloud_stale:2026-09-06T16:59:59+00:00": "2026-09-21T10:22:03.534215+02:00",
     "cloud_stale:2026-09-13T14:21:41+00:00": "2026-09-21T10:16:52.596607+02:00",
     "new_show:dune-troisieme-partie-projection-imax-70mm-55289": "2026-09-03T21:46:42.176159+02:00",
     "new_show:la-seance-70mm-dune-troisieme-partie-55319": "2026-09-03T21:46:42.176159+02:00",
@@ -29,6 +30,14 @@
     "last_change": "2026-08-06T15:08:31.710968+02:00"
   },
   "delivery_receipts": {
+    "0618a8defd09421592e18979fc0fcb51": {
+      "delivered_at": "2026-09-21T10:22:03.534215+02:00",
+      "delivery_id": "telegram:00a04da006ca33c177ac5246",
+      "keys": [
+        "cloud_stale:2026-09-06T16:59:59+00:00"
+      ],
+      "telegram_message_id": 44
+    },
     "58e7ac6270974b97b7c030cde564bad1": {
       "delivered_at": "2026-09-21T10:16:52.596607+02:00",
       "delivery_id": "telegram:e0a374c8bf037eeb812d03ee",
@@ -48,8 +57,8 @@
       "imax70"
     ]
   },
-  "last_catalogue_ok": "2026-09-21T10:16:52.596607+02:00",
-  "last_check_ok": "2026-09-21T10:16:52.596607+02:00",
+  "last_catalogue_ok": "2026-09-21T10:22:03.534215+02:00",
+  "last_check_ok": "2026-09-21T10:22:03.534215+02:00",
   "last_heartbeat": "2026-09-14T23:32:25.869908+02:00",
   "outbox": {},
   "reminders_sent": {
