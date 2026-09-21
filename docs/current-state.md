@@ -30,12 +30,11 @@ A single-user Telegram watcher covering **two independent targets**:
   warning on time *and* the opening ping. Each polling job has an aggregate
   budget covering retries, feed loops and the token refresh (Pathé 120 s, news
   45 s, Cinesa 60 s; 240 s for all polling, under one launchd firing interval),
-  enforced at every blocking call, down to Chrome's launch and each CDP call;
-  teardown has its own allowance and falls back to the profile's own lock when
-  `ps` cannot find Chrome. A Chrome that may still hold that lock exits the run
-  non-zero and no token fallback absorbs it, as does a crashing job — neither
-  ever costs the pass its reminders, supervision or state save, and Pathé
-  analysis precedes the bookkeeping a crash would strand.
+  enforced at every blocking call, down to Chrome's launch and each CDP call; teardown has its own
+  allowance and falls back to the profile's own lock when `ps` cannot find Chrome. A Chrome that may
+  still hold that lock exits the run non-zero and no token fallback absorbs it, as does a crashing
+  job — neither ever costs the pass its reminders, supervision or state save, and Pathé analysis
+  precedes the bookkeeping a crash would strand. The final bookkeeping save is the same kind of contained failure: an invalid field or a filesystem error reports its cause, exits non-zero and leaves the last validated file untouched, because confirmed receipts were already durable and an uncertain attempt is never replayed on its own.
 - **Local half** — launchd agent `com.odysseum.ticket-watch` in the
   `~/.ticket-watch` clone fires `scripts/local-check.sh` every 5 min. An
   adaptive-cadence guard decides if a full Pathé + news check is due (≈4 h
@@ -105,6 +104,7 @@ A single-user Telegram watcher covering **two independent targets**:
   "not yet" (measured: a bookable event still 403s), so the 70 mm listings use
   cinema-programme `isBookable`, without a `refCmd` deep link. That exact
   refusal is expected healthy state; the observed JSON Akamai block is not.
+  Payload trust is separate from request health: a published timestamp the watcher cannot read — malformed, or without a UTC offset — is dropped at the fetch boundary and only that field becomes unknown for that listing, so it reaches no alert, baseline or state file, the gap it leaves can retire neither a live opening nor its reminders, and everything the listing still reports correctly keeps its full weight.
 - **Deployment is independent** — under the local process lock,
   `local-check.sh` fast-forwards `main` and re-execs the deployed script before
   its pre-run state sync. A corrupt state ref or rejected state push can fail and

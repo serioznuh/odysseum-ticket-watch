@@ -198,6 +198,62 @@ def test_a_transport_failure_on_one_listing_is_also_survivable():
     assert not snap.healthy
 
 
+def test_an_unreadable_sale_opening_is_dropped_and_marked_unknown(caplog):
+    """OTW-23: the catalogue is untrusted input. An offset-free opening is not a
+    weaker fact — it is unknown, and it must not travel inwards as one."""
+    shows = {
+        "shows": [
+            {
+                "slug": PRIMARY,
+                "title": "Dune : Troisième partie",
+                "salesOpeningDatetime": "2026-11-05T08:00:00",  # no UTC offset
+                "showtimesDisplayDatetime": "bientôt",
+            },
+            {
+                "slug": EVENT,
+                "title": "Dune - Troisième partie : Projection IMAX 70mm",
+                "salesOpeningDatetime": "2026-11-05T08:00:00+01:00",
+            },
+        ]
+    }
+
+    def handler(request):
+        path = request.url.path
+        if path.endswith("/api/shows"):
+            return httpx.Response(200, json=shows)
+        if path.endswith(f"/cinema/{CINEMA}/shows"):
+            return httpx.Response(200, json={"shows": {}})
+        if "/showtimes/" in path:
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json={"slug": path.rsplit("/", 1)[-1]})
+
+    with caplog.at_level("WARNING"):
+        snap = pathe.fetch_snapshot(client_for(handler), Cfg)
+
+    bad = next(s for s in snap.matched_shows if s["slug"] == PRIMARY)
+    good = next(s for s in snap.matched_shows if s["slug"] == EVENT)
+    assert "salesOpeningDatetime" not in bad
+    assert "showtimesDisplayDatetime" not in bad
+    assert good["salesOpeningDatetime"] == "2026-11-05T08:00:00+01:00"
+    assert snap.unreadable_metadata == {
+        PRIMARY: ["salesOpeningDatetime", "showtimesDisplayDatetime"]
+    }
+    # The gap the rejection leaves must not read as "Pathé withdrew it": this
+    # listing's *opening* may no longer contradict what is known, and absence of
+    # a sale date across the snapshot is no longer complete evidence.
+    assert snap.sale_metadata_authoritative(PRIMARY, bad) is False
+    assert snap.sale_metadata_authoritative(EVENT, good) is True
+    assert snap.sale_observations_complete() is False
+    # Everything else the listing reports keeps its weight: the rejection is per
+    # field, not a blanket downgrade of the listing.
+    assert snap.listing_metadata_authoritative(PRIMARY, bad) is True
+    assert snap.metadata_readable(PRIMARY, "showtimesDisplayDatetime") is False
+    assert snap.metadata_readable(EVENT, "showtimesDisplayDatetime") is True
+    # Fetch health is about the request, not the payload: nothing failed here.
+    assert snap.healthy
+    assert "unreadable salesOpeningDatetime" in caplog.text
+
+
 def test_a_broken_catalogue_call_still_fails_the_check():
     """The health signal must stay sharp: /shows failing is a real outage."""
 

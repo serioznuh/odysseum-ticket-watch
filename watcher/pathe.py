@@ -203,6 +203,18 @@ def fetch_snapshot(
             matched.append(detail_result.data or {"slug": slug, "title": slug})
             matched_slugs.add(slug)
 
+    # The catalogue is an untrusted input boundary. A published timestamp this
+    # watcher cannot read is recorded as unknown metadata for its listing and
+    # dropped here, so it can never reach an alert, a delivery decision or the
+    # state file (OTW-23).
+    unreadable = detect.reject_unusable_source_timestamps(matched)
+    for slug, fields in sorted(unreadable.items()):
+        log.warning(
+            "Pathé published unreadable %s for %s — treating that metadata as unknown",
+            ", ".join(fields),
+            slug or "an unnamed listing",
+        )
+
     entries: dict[str, dict] = {}
     showtimes: dict[str, dict] = {}
     for show in matched:
@@ -248,6 +260,7 @@ def fetch_snapshot(
         cinema_entries=entries,
         showtimes=showtimes,
         listing_results=listing_results,
+        unreadable_metadata=unreadable,
     )
     log.info(
         "snapshot: %d matched listing(s) %s | at %s: %d listed, %d with sessions%s",

@@ -8,7 +8,7 @@ from typing import ClassVar
 
 import pytest
 
-from watcher import coalesce, delivery, jobs, notify
+from watcher import coalesce, delivery, jobs, notify, runner
 from watcher import state as state_mod
 from watcher.detect import TZ_PARIS, CinesaSnapshot, FetchResult, Finding, Snapshot
 from watcher.state import DEFAULT_STATE, load_state, save_state
@@ -201,6 +201,61 @@ def test_uncertain_outcome_is_quarantined_and_not_replayed(tmp_path, monkeypatch
     restarted = context(state_path, state=uncertain)
     assert delivery.recover(restarted, NOW + timedelta(minutes=5)) is False
     assert calls == ["attempt"]
+
+
+def test_failed_final_bookkeeping_save_costs_no_receipt_and_replays_nothing(
+    tmp_path, monkeypatch, caplog
+):
+    """OTW-23: the coordinator's last save is not what makes a send durable.
+
+    One confirmed alert and one attempt with an unknown outcome are already on
+    disk when that save fails. It must report the problem, leave the validated
+    file exactly as it is, and leave the next pass with the same two facts.
+    """
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda *a, **kw: notify.SendResult("confirmed", 11)
+    )
+    assert delivery.deliver_alert(ctx, alert(finding()), NOW) is True
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("connection vanished during send")
+
+    monkeypatch.setattr(notify, "send_telegram", crash)
+    with pytest.raises(RuntimeError, match="vanished"):
+        delivery.deliver_alert(
+            ctx, alert(finding(key="new_show:dune-imax-second")), NOW
+        )
+    durable = state_path.read_bytes()
+
+    # An invalid in-memory field is the failure observed on 2026-09-21: it used
+    # to surface only here, as an uncaught traceback out of the CLI.
+    ctx.state["sales"] = {"dune-imax": "2026-11-05T08:00:00"}
+    caplog.clear()  # the sender crash above logged its own (expected) traceback
+    with caplog.at_level("ERROR"):
+        assert runner._save_final_state(ctx, str(state_path)) is False
+
+    assert state_path.read_bytes() == durable
+    assert "must include a UTC offset" in caplog.text
+    assert "Traceback" not in caplog.text
+
+    calls = []
+    monkeypatch.setattr(
+        notify,
+        "send_telegram",
+        lambda *a, **kw: calls.append("send") or notify.SendResult("confirmed", 12),
+    )
+    restarted = context(state_path, state=load_state(state_path))
+    assert delivery.recover(restarted, NOW + timedelta(minutes=5)) is False
+    after = load_state(state_path)
+
+    assert calls == []
+    assert after["alerts"] == {"new_show:dune-imax": NOW.isoformat()}
+    assert [r["keys"] for r in after["delivery_receipts"].values()] == [
+        ["new_show:dune-imax"]
+    ]
+    assert [r["status"] for r in after["outbox"].values()] == ["uncertain"]
 
 
 def test_sender_crash_is_durable_uncertain_and_still_fails_the_job(
@@ -583,6 +638,41 @@ def test_complete_contradicting_sale_evidence_retires_pending_sale(
     )
 
     assert ctx.state["outbox"] == {}
+
+
+def test_unreadable_opening_withholds_only_the_sale_condition(
+    tmp_path, monkeypatch
+):
+    """OTW-23, per field: the listing's opening is unknown, so a pending sale
+    message must survive — while its healthy session evidence still retires the
+    stale ticket alert for the same listing."""
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    sale = (NOW + timedelta(days=10)).isoformat()
+    sale_item = finding(f"sale:dune-imax:{sale}", kind="SALE_DATE", sale_datetime=sale)
+    ticket_item = finding("tickets:dune-imax:imax70", kind="TICKETS_AVAILABLE")
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda *args, **kwargs: notify.SendResult("failed")
+    )
+
+    assert delivery.deliver_alert(ctx, alert(sale_item), NOW) is False
+    assert delivery.deliver_alert(ctx, alert(ticket_item), NOW) is False
+
+    delivery.reconcile_source_observations(
+        ctx,
+        now=NOW,
+        # The opening was published but unreadable, so the boundary dropped it.
+        # Sessions and the programme entry are healthy and say "nothing
+        # bookable", which is exactly the evidence that retires a ticket alert.
+        pathe_snapshot=Snapshot(
+            matched_shows=[{"slug": "dune-imax", "title": "Dune IMAX 70mm"}],
+            unreadable_metadata={"dune-imax": ["salesOpeningDatetime"]},
+        ),
+        pathe_health="healthy",
+    )
+
+    remaining = [record["keys"] for record in ctx.state["outbox"].values()]
+    assert remaining == [[sale_item.key]]
 
 
 def test_partial_regeneration_supersedes_only_its_merged_member(

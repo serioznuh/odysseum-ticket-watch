@@ -83,6 +83,58 @@ def as_aware(dt: datetime) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=TZ_PARIS)
 
 
+# Timestamps the Pathé API publishes on a listing. The API is an untrusted
+# input boundary: every value observed in production so far carries an explicit
+# offset (`2026-11-05T08:00:00+01:00`), but one that is malformed or offset-free
+# must never be carried inwards. `state.save_state` rejects a timestamp without
+# a UTC offset, and it used to do so only at the end of a pass — long after the
+# bad value had been treated as fact (OTW-23).
+SOURCE_TIMESTAMP_FIELDS = ("salesOpeningDatetime", "showtimesDisplayDatetime")
+
+
+def usable_source_timestamp(value: Any) -> datetime | None:
+    """A source timestamp this watcher can act on, or None.
+
+    Both conditions come from code that already exists: everything downstream
+    resolves openings through `parse_iso`, and persisted timestamps must carry
+    a UTC offset. A value failing either is not weaker evidence — it is no
+    evidence at all, and the opening it claims to describe stays unknown.
+    """
+    if not isinstance(value, str):
+        return None
+    parsed = parse_iso(value)
+    if parsed is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def reject_unusable_source_timestamps(shows: list[dict]) -> dict[str, list[str]]:
+    """Drop unreadable source timestamps in place; report the listings hit.
+
+    Dropping the field is what keeps the value out of `sales`, `sale_target`
+    and every delivery decision. The returned mapping is what stops the
+    *absence* it leaves behind from being read as proof that Pathé withdrew
+    anything: the decisions that read a rejected field treat that listing's
+    answer as unknown, so a bad opening can neither retire a live reminder nor
+    retire pending notification work. The record is per field, so everything
+    the listing still reports correctly keeps its full weight.
+    """
+    rejected: dict[str, list[str]] = {}
+    for show in shows:
+        if not isinstance(show, dict):
+            continue
+        for name in SOURCE_TIMESTAMP_FIELDS:
+            value = show.get(name)
+            # Absent, null or empty means Pathé has not published it, which is
+            # an ordinary fact this watcher has always handled. Only a
+            # non-empty value it cannot read counts as a rejection.
+            if not value or usable_source_timestamp(value) is not None:
+                continue
+            show.pop(name, None)
+            rejected.setdefault(show.get("slug", ""), []).append(name)
+    return rejected
+
+
 def fmt_dt(dt: datetime | None) -> str:
     if dt is None:
         return "unknown"
@@ -206,6 +258,10 @@ class Snapshot:
     # Hand-built snapshots without this metadata remain authoritative for
     # backwards-compatible pure-analysis tests and callers.
     listing_results: dict[str, dict[str, FetchResult]] = field(default_factory=dict)
+    # slug -> source timestamp fields the fetch boundary could not read. The
+    # listing itself was fetched, so it stays on the watch list; only its
+    # unreadable metadata is downgraded to unknown.
+    unreadable_metadata: dict[str, list[str]] = field(default_factory=dict)
 
     @property
     def degraded_results(self) -> list[tuple[str, str, FetchResult]]:
@@ -244,12 +300,33 @@ class Snapshot:
             return False
         return show is None or bool(detail.data)
 
+    def metadata_readable(self, slug: str, field: str) -> bool:
+        """Whether one published field of this listing was readable.
+
+        Rejection is per field on purpose: a listing with a perfectly good sale
+        opening and an unreadable display timestamp must still arm the ladder,
+        and a listing with an unreadable opening must still let its healthy
+        session evidence retire stale ticket work.
+        """
+        return field not in self.unreadable_metadata.get(slug, ())
+
+    def sale_metadata_authoritative(self, slug: str, show: dict | None) -> bool:
+        """Whether this listing's sale opening can contradict what is known.
+
+        The dropped value leaves a gap that looks exactly like "no opening
+        published", so only this one decision is withheld for that listing.
+        """
+        return self.listing_metadata_authoritative(slug, show) and self.metadata_readable(
+            slug, "salesOpeningDatetime"
+        )
+
     def sale_observations_complete(self) -> bool:
         """Whether absent sale metadata can retire reminder delivery work.
 
         A reminder is time-critical enough that any degraded per-listing call,
-        including showtimes, makes absence unknown. Positive sale metadata is
-        still usable independently by callers.
+        including showtimes, makes absence unknown — as does an opening that was
+        published but unreadable. Positive sale metadata is still usable
+        independently by callers.
         """
         if any(
             not result.healthy
@@ -259,7 +336,7 @@ class Snapshot:
             return False
         return all(
             show.get("slug")
-            and self.listing_metadata_authoritative(show["slug"], show)
+            and self.sale_metadata_authoritative(show["slug"], show)
             for show in self.matched_shows
         )
 
@@ -408,7 +485,8 @@ def reminders_cover(
     future = [
         as_aware(dt)
         for dt in (
-            parse_iso(sh.get("salesOpeningDatetime")) for sh in snap.matched_shows
+            usable_source_timestamp(sh.get("salesOpeningDatetime"))
+            for sh in snap.matched_shows
             if selected_listing(sh, cfg)
         )
         if dt is not None and as_aware(dt) > now
@@ -429,13 +507,32 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
         title = show.get("title", slug)
         url = show_url(show)
         listing_fmt = classify_format(title, slug)
+        # The fetch boundary already drops unreadable timestamps and logs them.
+        # Re-checking here costs nothing and makes the rule hold for any other
+        # snapshot source: an opening this watcher cannot read must not reach an
+        # alert, a dedup key or the reminder ladder.
+        sale_iso = show.get("salesOpeningDatetime")
+        # Rejected at the fetch boundary (field dropped, recorded on the
+        # snapshot) or rejected right here. Either way the opening is *unknown*,
+        # which every message below has to say rather than "none published".
+        sale_unreadable = not snap.metadata_readable(slug, "salesOpeningDatetime")
+        if sale_iso and usable_source_timestamp(sale_iso) is None:
+            sale_iso = None
+            sale_unreadable = True
 
         # 1. Brand-new listing matching the film (e.g. a dedicated
         #    "Projection IMAX 70mm" event page, as Pathé did for L'Odyssée).
         if selected_listing(show, cfg) and slug not in shows_seen and slug != cfg.primary_slug:
             # A dedicated event page often appears with its opening already
-            # set, and the SALE_DATE finding below fires in the same pass.
-            new_sale = show.get("salesOpeningDatetime")
+            # set, and the SALE_DATE finding below fires in the same pass. An
+            # opening that was published but unreadable is neither of those: it
+            # must not be reported as "nothing published yet".
+            if sale_iso:
+                sale_phrase = f"sale opens {fmt_dt_short(parse_iso(sale_iso))}."
+            elif sale_unreadable:
+                sale_phrase = "sale date published but unreadable — still unknown."
+            else:
+                sale_phrase = "no sale date published yet."
             findings.append(
                 Finding(
                     kind="NEW_LISTING",
@@ -445,14 +542,7 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                     lines=[
                         watch_line(cfg),
                         f"“{title}”",
-                        (
-                            f"Release {fmt_release(show)} · "
-                            + (
-                                f"sale opens {fmt_dt_short(parse_iso(new_sale))}."
-                                if new_sale
-                                else "no sale date published yet."
-                            )
-                        ),
+                        f"Release {fmt_release(show)} · {sale_phrase}",
                         "Dedicated listings get their own opening — now on the watch list.",
                     ],
                     url=url,
@@ -461,10 +551,11 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
             )
 
         # 2. Sale-opening datetime published or changed (THE advance signal).
-        sale_iso = show.get("salesOpeningDatetime")
         if selected_listing(show, cfg) and sale_iso and known_sales.get(slug) != sale_iso:
             changed = slug in known_sales
             display_iso = show.get("showtimesDisplayDatetime")
+            if display_iso and usable_source_timestamp(display_iso) is None:
+                display_iso = None  # unreadable: say nothing rather than "unknown"
             sale_dt = parse_iso(sale_iso)
             lines = [f"{cfg.film_title} · {FORMAT_LABELS[listing_fmt]} · {cfg.cinema_name}"]
             if changed:

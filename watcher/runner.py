@@ -56,6 +56,36 @@ def _guard(failed: list[str], name: str, fn: Callable, *args, **kwargs):
         return None
 
 
+FINAL_SAVE_FAILURE = (
+    "final state save to %s failed: %s. The last validated state file is"
+    " unchanged and no dedup or reminder history was reset: every confirmed"
+    " send of this pass was already recorded when it was confirmed, and an"
+    " attempt with an unknown outcome stays quarantined rather than being"
+    " replayed. Fix the reported cause (an invalid field, a full disk or"
+    " permissions) and let the next scheduled run persist this pass's"
+    " bookkeeping; do not hand-edit the state file"
+)
+
+
+def _save_final_state(ctx: RunContext, state_path: str) -> bool:
+    """Persist the pass's bookkeeping. False on an expected, reported failure.
+
+    Validation and filesystem errors here are not bugs to crash on: the state
+    file this run loaded is still the last validated one, `save_state` refuses
+    to replace it with anything invalid, and OTW-20 already made every
+    confirmed receipt durable at the moment it was confirmed. So the run has
+    nothing to repair — it owes the owner a diagnostic they can act on and a
+    non-zero exit, not a traceback in launchd's log.
+    """
+    try:
+        state_mod.save_state(state_path, ctx.state)
+    except (state_mod.StateError, OSError) as exc:
+        log.error(FINAL_SAVE_FAILURE, state_path, exc)
+        return False
+    log.info("state saved to %s", state_path)
+    return True
+
+
 def _run_source_jobs(
     ctx: RunContext,
     now: datetime,
@@ -266,9 +296,10 @@ def execute(ctx: RunContext, state_path: str) -> int:
 
     if ctx.dry_run:
         log.info("dry-run: state NOT saved (%s)", state_path)
-    else:
-        state_mod.save_state(state_path, ctx.state)
-        log.info("state saved to %s", state_path)
+    elif _guard(failed, "state-save", _save_final_state, ctx, state_path) is False:
+        # `_guard` records an unexpected crash itself; an expected failure
+        # reports its own diagnostic and is recorded here.
+        failed.append("state-save")
 
     if failed:
         log.error("run completed with failed job(s): %s", ", ".join(sorted(set(failed))))

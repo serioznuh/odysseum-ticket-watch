@@ -221,6 +221,18 @@ def _listing_metadata_authoritative(
     return snapshot.listing_metadata_authoritative(slug, show)
 
 
+def _sale_metadata_authoritative(
+    snapshot: Any, slug: str, show: dict | None
+) -> bool:
+    """As above, plus: the listing's opening was actually readable (OTW-23).
+
+    Only sale-conditioned work needs this. Bookability, listing presence and
+    ticket formats are read from the programme and sessions, which an unreadable
+    timestamp says nothing about.
+    """
+    return snapshot.sale_metadata_authoritative(slug, show)
+
+
 def _pathe_dates_authoritative(snapshot: Any) -> bool:
     """Whether this snapshot can disprove target-format date availability."""
     shows = [show for show in snapshot.matched_shows if show.get("slug")]
@@ -892,9 +904,7 @@ def reconcile_source_observations(
                 if (
                     show.get("salesOpeningDatetime") == target
                     and detect.selected_listing(show, ctx.cfg)
-                    and _listing_metadata_authoritative(
-                        pathe_snapshot, slug, show
-                    )
+                    and _sale_metadata_authoritative(pathe_snapshot, slug, show)
                 ):
                     topic = _condition_topic(
                         f"pathe-bookability:{slug}", "not-bookable"
@@ -905,7 +915,7 @@ def reconcile_source_observations(
         for domain in _pending_condition_domains(ctx, "pathe-sale:"):
             slug = domain.removeprefix("pathe-sale:")
             show = shows.get(slug)
-            if not _listing_metadata_authoritative(pathe_snapshot, slug, show):
+            if not _sale_metadata_authoritative(pathe_snapshot, slug, show):
                 continue
             observed.add(domain)
             sale = show.get("salesOpeningDatetime") if show else None

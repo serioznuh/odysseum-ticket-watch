@@ -330,6 +330,126 @@ def test_passed_opening_does_not_shadow_a_new_future_target():
     assert st["sale_target"] == future
 
 
+def test_unreadable_sale_opening_never_enters_the_persisted_baselines(tmp_path):
+    """OTW-23: the offset-free opening that used to be accepted into observation
+    state and rejected only by the final save."""
+    st = fresh_state()
+    good = iso_in(timedelta(days=30))
+    snap = Snapshot(
+        matched_shows=[
+            {"slug": "bad", "title": "Bad", "salesOpeningDatetime": "2026-11-05T08:00:00"},
+            {"slug": "worse", "title": "Worse", "salesOpeningDatetime": "bientôt"},
+            {"slug": "good", "title": "Good", "salesOpeningDatetime": good},
+        ]
+    )
+
+    update_from_snapshot(st, snap, None, NOW)
+
+    assert st["sales"] == {"good": good}
+    assert st["sale_target"] == good
+    # The listings themselves stay on the watch list; only the dates are unknown.
+    assert set(st["shows_seen"]) == {"bad", "worse", "good"}
+    # And the result is now a state file that validates, which is the failure
+    # this rejection exists to prevent.
+    save_state(tmp_path / "state.json", st)
+    assert load_state(tmp_path / "state.json")["sale_target"] == good
+
+
+def test_unreadable_sale_opening_cannot_retire_a_valid_reminder_target():
+    """An unreadable date is unknown evidence, not proof that Pathé withdrew the
+    opening — so it must never clear the ladder's current target."""
+    st = fresh_state()
+    target = iso_in(timedelta(days=10))
+    st["sale_target"] = target
+    st["sales"] = {"dune": target}
+    snap = Snapshot(
+        matched_shows=[
+            {"slug": "dune", "title": "Dune", "salesOpeningDatetime": "2026-11-05T08:00:00"}
+        ]
+    )
+
+    update_from_snapshot(st, snap, None, NOW)
+
+    assert st["sale_target"] == target
+    assert st["sales"] == {"dune": target}
+    assert due_reminders(st, OFFSETS, NOW + timedelta(days=10, minutes=-15)) == [
+        {"offset": 15, "target": target}
+    ]
+
+
+def test_a_readable_opening_still_arms_the_ladder_beside_an_unreadable_field():
+    """Rejection is per field: an unreadable *display* timestamp says nothing
+    about the opening, so the ladder must still be armed by it."""
+    st = fresh_state()
+    sale = iso_in(timedelta(days=20))
+    snap = Snapshot(
+        matched_shows=[
+            {
+                "slug": "dune",
+                "title": "Dune",
+                "salesOpeningDatetime": sale,
+                # showtimesDisplayDatetime was dropped at the boundary
+            }
+        ],
+        unreadable_metadata={"dune": ["showtimesDisplayDatetime"]},
+    )
+
+    update_from_snapshot(st, snap, None, NOW)
+
+    assert st["sales"] == {"dune": sale}
+    assert st["sale_target"] == sale
+    assert due_reminders(st, OFFSETS, NOW + timedelta(days=19)) == [
+        {"offset": 1440, "target": sale}
+    ]
+    # And absence is still trustworthy for that listing once the opening goes.
+    update_from_snapshot(
+        st,
+        Snapshot(
+            matched_shows=[{"slug": "dune", "title": "Dune"}],
+            unreadable_metadata={"dune": ["showtimesDisplayDatetime"]},
+        ),
+        None,
+        NOW,
+    )
+    assert st["sale_target"] is None
+
+
+def test_an_unreadable_opening_still_records_its_listings_ticket_evidence():
+    """The other mixed case: the opening is unknown, but healthy session
+    evidence on the same listing must still advance its formats."""
+    st = fresh_state()
+    snap = Snapshot(
+        matched_shows=[{"slug": "dune", "title": "Dune : Projection IMAX 70mm"}],
+        showtimes={"dune": {"2026-12-16": [{"tags": ["imax"], "refCmd": "x"}]}},
+        unreadable_metadata={"dune": ["salesOpeningDatetime"]},
+    )
+
+    update_from_snapshot(st, snap, None, NOW)
+
+    assert st["formats_seen"] == {"dune": ["imax70"]}
+    assert st["tickets_available"] is True
+
+
+def test_a_listing_with_unreadable_metadata_cannot_clear_the_sale_target():
+    """The same guarantee through the snapshot's own report of what it could not
+    read, for the listing that no longer carries a sale date at all."""
+    st = fresh_state()
+    target = iso_in(timedelta(days=10))
+    st["sale_target"] = target
+    snap = Snapshot(
+        matched_shows=[{"slug": "dune", "title": "Dune"}],
+        unreadable_metadata={"dune": ["salesOpeningDatetime"]},
+    )
+
+    update_from_snapshot(st, snap, None, NOW)
+
+    assert st["sale_target"] == target
+    # A genuinely silent catalogue still retires it: absence is only unknown
+    # while something was unreadable.
+    update_from_snapshot(st, Snapshot(matched_shows=[{"slug": "dune", "title": "Dune"}]), None, NOW)
+    assert st["sale_target"] is None
+
+
 def test_undelivered_one_shot_alerts_leave_their_baselines_alone():
     """Failed NEW_LISTING/TICKETS_AVAILABLE sends must retry, while current
     sale and ticket facts still move forward."""
