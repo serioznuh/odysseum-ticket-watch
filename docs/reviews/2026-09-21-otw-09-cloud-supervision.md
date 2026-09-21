@@ -11,4 +11,5 @@ NOTES: [accepted] README.md and docs/current-state.md hold long single-paragraph
 
 ## Outcome
 <!-- cross-review-merge-state: APPROVED pr=26 -->
-Approved after 1 round of this continuation loop; eligible for merge pending GitHub confirmation. The earlier loop for the same PR stopped at its 3-round cap with one open docs finding (recorded in docs/reviews/2026-09-20-otw-09-cloud-supervision.md); this loop fixed it and both reviewers approved the same head. Done-when: met
+Approved after 1 round of this continuation loop; eligible for merge pending GitHub confirmation. The earlier loop for the same PR stopped at its 3-round cap with one open docs finding (recorded in docs/reviews/2026-09-20-otw-09-cloud-supervision.md); this loop fixed it and both reviewers approved the same head.
+Done-when: met
