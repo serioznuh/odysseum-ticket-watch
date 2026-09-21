@@ -115,14 +115,44 @@ def test_sale_summary_uses_live_selected_listings_and_deduplicates_instants(cfg,
     assert "19 Dec: booking not confirmed." in text
 
 
-@pytest.mark.parametrize("value", [None, "", "invalid", OLD_SALE, NOW.isoformat()])
-def test_missing_invalid_or_elapsed_live_sale_cannot_resurrect_stored_date(cfg, snap, value):
+@pytest.mark.parametrize("value", [None, "", OLD_SALE, NOW.isoformat()])
+def test_missing_or_elapsed_live_sale_cannot_resurrect_stored_date(cfg, snap, value):
     snap.matched_shows[1]["salesOpeningDatetime"] = value
     st = deepcopy(state.DEFAULT_STATE)
     st["sales"][EVENT] = FUTURE_SALE
     text = "\n".join(heartbeat(cfg, snap, st).lines)
     assert "No upcoming national sale opening published" in text
     assert "1 Oct" not in text
+
+
+@pytest.mark.parametrize("value", ["invalid", "2026-10-01T09:00:00"])
+def test_unreadable_live_sale_is_reported_unknown_not_as_no_opening(cfg, snap, value):
+    """OTW-23: a published opening this watcher cannot read is unknown. Calling
+    it "none published" in the weekly all-quiet status is a false statement —
+    and it must still not resurrect the stored date."""
+    snap.matched_shows[1]["salesOpeningDatetime"] = value
+    st = deepcopy(state.DEFAULT_STATE)
+    st["sales"][EVENT] = FUTURE_SALE
+    text = "\n".join(heartbeat(cfg, snap, st).lines)
+
+    assert "could not be read, so it stays unknown" in text
+    assert "No upcoming national sale opening published" not in text
+    assert "1 Oct" not in text
+
+
+def test_unreadable_opening_beside_a_readable_one_is_named_not_hidden(cfg, snap):
+    """The readable opening is still reported; the unknown one is not silently
+    folded into it."""
+    snap.matched_shows[1]["salesOpeningDatetime"] = FUTURE_SALE
+    snap.matched_shows.append(
+        {"slug": "second-imax-70mm", "title": "Dune IMAX 70mm"},
+    )
+    snap.unreadable_metadata = {"second-imax-70mm": ["salesOpeningDatetime"]}
+
+    text = "\n".join(heartbeat(cfg, snap).lines)
+
+    assert "Upcoming national sale opening: Thu 1 Oct, 09:00." in text
+    assert "Also unreadable, so still unknown: 1 listing." in text
 
 
 def test_passed_wanted_dates_are_not_reported_as_waiting_for_booking(cfg, snap):

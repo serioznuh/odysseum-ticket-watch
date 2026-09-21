@@ -512,15 +512,27 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
         # snapshot source: an opening this watcher cannot read must not reach an
         # alert, a dedup key or the reminder ladder.
         sale_iso = show.get("salesOpeningDatetime")
+        # Rejected at the fetch boundary (field dropped, recorded on the
+        # snapshot) or rejected right here. Either way the opening is *unknown*,
+        # which every message below has to say rather than "none published".
+        sale_unreadable = not snap.metadata_readable(slug, "salesOpeningDatetime")
         if sale_iso and usable_source_timestamp(sale_iso) is None:
             sale_iso = None
+            sale_unreadable = True
 
         # 1. Brand-new listing matching the film (e.g. a dedicated
         #    "Projection IMAX 70mm" event page, as Pathé did for L'Odyssée).
         if selected_listing(show, cfg) and slug not in shows_seen and slug != cfg.primary_slug:
             # A dedicated event page often appears with its opening already
-            # set, and the SALE_DATE finding below fires in the same pass.
-            new_sale = sale_iso
+            # set, and the SALE_DATE finding below fires in the same pass. An
+            # opening that was published but unreadable is neither of those: it
+            # must not be reported as "nothing published yet".
+            if sale_iso:
+                sale_phrase = f"sale opens {fmt_dt_short(parse_iso(sale_iso))}."
+            elif sale_unreadable:
+                sale_phrase = "sale date published but unreadable — still unknown."
+            else:
+                sale_phrase = "no sale date published yet."
             findings.append(
                 Finding(
                     kind="NEW_LISTING",
@@ -530,14 +542,7 @@ def analyze_pathe(snap: Snapshot, state: dict, cfg: Any, now: datetime) -> list[
                     lines=[
                         watch_line(cfg),
                         f"“{title}”",
-                        (
-                            f"Release {fmt_release(show)} · "
-                            + (
-                                f"sale opens {fmt_dt_short(parse_iso(new_sale))}."
-                                if new_sale
-                                else "no sale date published yet."
-                            )
-                        ),
+                        f"Release {fmt_release(show)} · {sale_phrase}",
                         "Dedicated listings get their own opening — now on the watch list.",
                     ],
                     url=url,

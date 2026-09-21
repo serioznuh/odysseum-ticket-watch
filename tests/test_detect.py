@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timedelta
 
+import pytest
+
 from watcher import detect
 from watcher.detect import FMT_IMAX, FMT_IMAX70, FMT_OTHER, Snapshot
 from watcher.state import DEFAULT_STATE
@@ -188,6 +190,39 @@ def test_reject_unusable_source_timestamps_drops_only_the_bad_fields():
     assert "showtimesDisplayDatetime" not in shows[1]
     # A published null is Pathé saying "not yet", not a rejection.
     assert detect.reject_unusable_source_timestamps([primary_show()]) == {}
+
+
+@pytest.mark.parametrize("dropped_at_boundary", [True, False])
+def test_new_listing_calls_an_unreadable_opening_unknown_not_absent(
+    dropped_at_boundary,
+):
+    """OTW-23: a dedicated listing whose published opening cannot be read must
+    not be announced as "no sale date published yet" — that is a false fact."""
+    show = event_show()
+    if dropped_at_boundary:
+        snap = Snapshot(
+            matched_shows=[show],
+            unreadable_metadata={show["slug"]: ["salesOpeningDatetime"]},
+        )
+    else:
+        snap = Snapshot(
+            matched_shows=[event_show(salesOpeningDatetime="2026-11-05T08:00:00")]
+        )
+
+    findings = detect.analyze_pathe(snap, fresh_state(), Cfg, NOW)
+
+    assert [f.kind for f in findings] == ["NEW_LISTING"]
+    message = whole_message(findings[0])
+    assert "sale date published but unreadable — still unknown." in message
+    assert "no sale date published yet" not in message
+
+
+def test_new_listing_without_any_published_opening_still_says_so():
+    findings = detect.analyze_pathe(
+        Snapshot(matched_shows=[event_show()]), fresh_state(), Cfg, NOW
+    )
+
+    assert "no sale date published yet." in whole_message(findings[0])
 
 
 def test_unreadable_sale_opening_raises_no_sale_alert():

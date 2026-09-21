@@ -433,11 +433,37 @@ def build_heartbeat(cfg, snap: detect.Snapshot, st: dict, now: datetime) -> Find
         for dt in [detect.usable_source_timestamp(show.get("salesOpeningDatetime"))]
         if dt is not None and detect.as_aware(dt) > now
     })
+    # An opening rejected as unreadable is unknown evidence. Folding it into the
+    # empty set would report confirmed absence for a date Pathé did publish.
+    # Rejected at the fetch boundary (recorded on the snapshot) or still carried
+    # in the payload; both mean the same thing here.
+    unreadable = sorted(
+        show.get("slug", "")
+        for show in snap.matched_shows
+        if detect.selected_listing(show, cfg)
+        and (
+            not snap.metadata_readable(show.get("slug", ""), "salesOpeningDatetime")
+            or (
+                show.get("salesOpeningDatetime")
+                and detect.usable_source_timestamp(show["salesOpeningDatetime"]) is None
+            )
+        )
+    )
     if sales:
         label = "opening" if len(sales) == 1 else "openings"
         sale_line = f"Upcoming national sale {label}: " + "; ".join(
             detect.fmt_dt_short(dt) for dt in sales
         ) + "."
+        if unreadable:
+            sale_line += (
+                " Also unreadable, so still unknown: "
+                f"{detect.plural(len(unreadable), 'listing')}."
+            )
+    elif unreadable:
+        sale_line = (
+            "A published sale opening could not be read, so it stays unknown"
+            f" ({detect.plural(len(unreadable), 'listing')})."
+        )
     else:
         scope = " for this format" if wanted else ""
         sale_line = f"No upcoming national sale opening published{scope}."
