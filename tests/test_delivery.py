@@ -640,6 +640,41 @@ def test_complete_contradicting_sale_evidence_retires_pending_sale(
     assert ctx.state["outbox"] == {}
 
 
+def test_unreadable_opening_withholds_only_the_sale_condition(
+    tmp_path, monkeypatch
+):
+    """OTW-23, per field: the listing's opening is unknown, so a pending sale
+    message must survive — while its healthy session evidence still retires the
+    stale ticket alert for the same listing."""
+    state_path = tmp_path / "state.json"
+    ctx = context(state_path)
+    sale = (NOW + timedelta(days=10)).isoformat()
+    sale_item = finding(f"sale:dune-imax:{sale}", kind="SALE_DATE", sale_datetime=sale)
+    ticket_item = finding("tickets:dune-imax:imax70", kind="TICKETS_AVAILABLE")
+    monkeypatch.setattr(
+        notify, "send_telegram", lambda *args, **kwargs: notify.SendResult("failed")
+    )
+
+    assert delivery.deliver_alert(ctx, alert(sale_item), NOW) is False
+    assert delivery.deliver_alert(ctx, alert(ticket_item), NOW) is False
+
+    delivery.reconcile_source_observations(
+        ctx,
+        now=NOW,
+        # The opening was published but unreadable, so the boundary dropped it.
+        # Sessions and the programme entry are healthy and say "nothing
+        # bookable", which is exactly the evidence that retires a ticket alert.
+        pathe_snapshot=Snapshot(
+            matched_shows=[{"slug": "dune-imax", "title": "Dune IMAX 70mm"}],
+            unreadable_metadata={"dune-imax": ["salesOpeningDatetime"]},
+        ),
+        pathe_health="healthy",
+    )
+
+    remaining = [record["keys"] for record in ctx.state["outbox"].values()]
+    assert remaining == [[sale_item.key]]
+
+
 def test_partial_regeneration_supersedes_only_its_merged_member(
     tmp_path, monkeypatch
 ):

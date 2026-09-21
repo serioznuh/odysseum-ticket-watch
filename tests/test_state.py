@@ -377,6 +377,59 @@ def test_unreadable_sale_opening_cannot_retire_a_valid_reminder_target():
     ]
 
 
+def test_a_readable_opening_still_arms_the_ladder_beside_an_unreadable_field():
+    """Rejection is per field: an unreadable *display* timestamp says nothing
+    about the opening, so the ladder must still be armed by it."""
+    st = fresh_state()
+    sale = iso_in(timedelta(days=20))
+    snap = Snapshot(
+        matched_shows=[
+            {
+                "slug": "dune",
+                "title": "Dune",
+                "salesOpeningDatetime": sale,
+                # showtimesDisplayDatetime was dropped at the boundary
+            }
+        ],
+        unreadable_metadata={"dune": ["showtimesDisplayDatetime"]},
+    )
+
+    update_from_snapshot(st, snap, None, NOW)
+
+    assert st["sales"] == {"dune": sale}
+    assert st["sale_target"] == sale
+    assert due_reminders(st, OFFSETS, NOW + timedelta(days=19)) == [
+        {"offset": 1440, "target": sale}
+    ]
+    # And absence is still trustworthy for that listing once the opening goes.
+    update_from_snapshot(
+        st,
+        Snapshot(
+            matched_shows=[{"slug": "dune", "title": "Dune"}],
+            unreadable_metadata={"dune": ["showtimesDisplayDatetime"]},
+        ),
+        None,
+        NOW,
+    )
+    assert st["sale_target"] is None
+
+
+def test_an_unreadable_opening_still_records_its_listings_ticket_evidence():
+    """The other mixed case: the opening is unknown, but healthy session
+    evidence on the same listing must still advance its formats."""
+    st = fresh_state()
+    snap = Snapshot(
+        matched_shows=[{"slug": "dune", "title": "Dune : Projection IMAX 70mm"}],
+        showtimes={"dune": {"2026-12-16": [{"tags": ["imax"], "refCmd": "x"}]}},
+        unreadable_metadata={"dune": ["salesOpeningDatetime"]},
+    )
+
+    update_from_snapshot(st, snap, None, NOW)
+
+    assert st["formats_seen"] == {"dune": ["imax70"]}
+    assert st["tickets_available"] is True
+
+
 def test_a_listing_with_unreadable_metadata_cannot_clear_the_sale_target():
     """The same guarantee through the snapshot's own report of what it could not
     read, for the listing that no longer carries a sale date at all."""

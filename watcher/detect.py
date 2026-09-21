@@ -114,9 +114,10 @@ def reject_unusable_source_timestamps(shows: list[dict]) -> dict[str, list[str]]
     Dropping the field is what keeps the value out of `sales`, `sale_target`
     and every delivery decision. The returned mapping is what stops the
     *absence* it leaves behind from being read as proof that Pathé withdrew
-    anything: `Snapshot.listing_metadata_authoritative` then refuses to let
-    that listing contradict known metadata, so a bad date can neither retire a
-    live reminder nor retire pending notification work.
+    anything: the decisions that read a rejected field treat that listing's
+    answer as unknown, so a bad opening can neither retire a live reminder nor
+    retire pending notification work. The record is per field, so everything
+    the listing still reports correctly keeps its full weight.
     """
     rejected: dict[str, list[str]] = {}
     for show in shows:
@@ -290,12 +291,8 @@ class Snapshot:
         A retained cinema-feed placeholder has no detail payload, even when
         the detail endpoint returned an authoritative empty/refusal response.
         It is useful for continued polling but cannot prove that metadata such
-        as a sale opening was withdrawn. Neither can a listing whose published
-        timestamps were unreadable: what this watcher could not read is unknown,
-        and a gap left by rejecting it must not pass for a withdrawal.
+        as a sale opening was withdrawn.
         """
-        if self.unreadable_metadata.get(slug):
-            return False
         detail = self.listing_results.get(slug, {}).get("detail")
         if detail is None:
             return True
@@ -303,12 +300,33 @@ class Snapshot:
             return False
         return show is None or bool(detail.data)
 
+    def metadata_readable(self, slug: str, field: str) -> bool:
+        """Whether one published field of this listing was readable.
+
+        Rejection is per field on purpose: a listing with a perfectly good sale
+        opening and an unreadable display timestamp must still arm the ladder,
+        and a listing with an unreadable opening must still let its healthy
+        session evidence retire stale ticket work.
+        """
+        return field not in self.unreadable_metadata.get(slug, ())
+
+    def sale_metadata_authoritative(self, slug: str, show: dict | None) -> bool:
+        """Whether this listing's sale opening can contradict what is known.
+
+        The dropped value leaves a gap that looks exactly like "no opening
+        published", so only this one decision is withheld for that listing.
+        """
+        return self.listing_metadata_authoritative(slug, show) and self.metadata_readable(
+            slug, "salesOpeningDatetime"
+        )
+
     def sale_observations_complete(self) -> bool:
         """Whether absent sale metadata can retire reminder delivery work.
 
         A reminder is time-critical enough that any degraded per-listing call,
-        including showtimes, makes absence unknown. Positive sale metadata is
-        still usable independently by callers.
+        including showtimes, makes absence unknown — as does an opening that was
+        published but unreadable. Positive sale metadata is still usable
+        independently by callers.
         """
         if any(
             not result.healthy
@@ -318,7 +336,7 @@ class Snapshot:
             return False
         return all(
             show.get("slug")
-            and self.listing_metadata_authoritative(show["slug"], show)
+            and self.sale_metadata_authoritative(show["slug"], show)
             for show in self.matched_shows
         )
 

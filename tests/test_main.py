@@ -393,6 +393,37 @@ def test_an_offset_free_sale_date_neither_alerts_nor_breaks_the_save(
     assert state_mod.load_state(runner.state)["sale_target"] is None
 
 
+def test_an_unreadable_display_date_still_announces_and_arms_the_opening(
+    tmp_path, monkeypatch
+):
+    """Rejection is per field. A listing whose *display* timestamp was dropped
+    still has a readable opening, so the promise the alert makes about reminders
+    has to be kept by the ladder."""
+    runner = PatheCheckRunner(tmp_path, monkeypatch)
+    slug = "dune-troisieme-partie"
+    sale = (datetime.now(TZ_PARIS) + timedelta(days=3)).isoformat()
+    show = {
+        "slug": slug,
+        "title": "Dune : Troisième partie",
+        "salesOpeningDatetime": sale,  # readable
+        "isMovie": True,
+    }
+
+    st = runner.run(
+        Snapshot(
+            matched_shows=[show],
+            unreadable_metadata={slug: ["showtimesDisplayDatetime"]},
+        ),
+        delivered=True,
+    )
+
+    assert len(runner.sent) == 1
+    assert "Reminders set" in runner.sent[0]
+    assert "Showtimes visible from" not in runner.sent[0]
+    assert st["sales"] == {slug: sale}
+    assert st["sale_target"] == sale
+
+
 def _break_save_after_supervision(monkeypatch, exc: Exception):
     """Let every durable delivery write succeed and fail only the final save.
 

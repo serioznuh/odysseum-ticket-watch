@@ -238,12 +238,17 @@ def test_an_unreadable_sale_opening_is_dropped_and_marked_unknown(caplog):
     assert snap.unreadable_metadata == {
         PRIMARY: ["salesOpeningDatetime", "showtimesDisplayDatetime"]
     }
-    # The gap the rejection leaves must not read as "Pathé withdrew it": that
-    # listing may no longer contradict metadata already known, and absence of a
-    # sale date across the snapshot is no longer complete evidence.
-    assert snap.listing_metadata_authoritative(PRIMARY, bad) is False
-    assert snap.listing_metadata_authoritative(EVENT, good) is True
+    # The gap the rejection leaves must not read as "Pathé withdrew it": this
+    # listing's *opening* may no longer contradict what is known, and absence of
+    # a sale date across the snapshot is no longer complete evidence.
+    assert snap.sale_metadata_authoritative(PRIMARY, bad) is False
+    assert snap.sale_metadata_authoritative(EVENT, good) is True
     assert snap.sale_observations_complete() is False
+    # Everything else the listing reports keeps its weight: the rejection is per
+    # field, not a blanket downgrade of the listing.
+    assert snap.listing_metadata_authoritative(PRIMARY, bad) is True
+    assert snap.metadata_readable(PRIMARY, "showtimesDisplayDatetime") is False
+    assert snap.metadata_readable(EVENT, "showtimesDisplayDatetime") is True
     # Fetch health is about the request, not the payload: nothing failed here.
     assert snap.healthy
     assert "unreadable salesOpeningDatetime" in caplog.text

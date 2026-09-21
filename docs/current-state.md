@@ -104,7 +104,7 @@ A single-user Telegram watcher covering **two independent targets**:
   "not yet" (measured: a bookable event still 403s), so the 70 mm listings use
   cinema-programme `isBookable`, without a `refCmd` deep link. That exact
   refusal is expected healthy state; the observed JSON Akamai block is not.
-  Payload trust is separate from request health: a published timestamp the watcher cannot read — malformed, or without a UTC offset — is dropped at the fetch boundary and that listing's metadata becomes unknown, so it reaches no alert, baseline or state file, and the gap it leaves can retire neither a live opening nor its reminders.
+  Payload trust is separate from request health: a published timestamp the watcher cannot read — malformed, or without a UTC offset — is dropped at the fetch boundary and only that field becomes unknown for that listing, so it reaches no alert, baseline or state file, the gap it leaves can retire neither a live opening nor its reminders, and everything the listing still reports correctly keeps its full weight.
 - **Deployment is independent** — under the local process lock,
   `local-check.sh` fast-forwards `main` and re-execs the deployed script before
   its pre-run state sync. A corrupt state ref or rejected state push can fail and
