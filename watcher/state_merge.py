@@ -24,7 +24,22 @@ class StateMergeError(StateError):
     """Two valid states cannot be reconciled without guessing."""
 
 
-_MISSING = object()
+class _Missing:
+    """Sentinel for "this key is absent from that snapshot".
+
+    Deepcopy-stable on purpose: ``_three_way`` copies whichever side it keeps,
+    and a copied sentinel would compare and test unequal to this one, so an
+    absent key would come back as an unusable object instead of staying absent.
+    """
+
+    def __deepcopy__(self, memo: dict) -> _Missing:
+        return self
+
+    def __copy__(self) -> _Missing:
+        return self
+
+
+_MISSING = _Missing()
 
 
 def _path_label(path: tuple[str, ...]) -> str:
@@ -112,7 +127,12 @@ def _merge_delivery_receipts(base: dict, upstream: dict, local: dict) -> dict:
     return merged
 
 
-def _ack_satisfied(state: dict, ack: dict) -> bool:
+def ack_satisfied(state: dict, ack: dict) -> bool:
+    """True when a state snapshot already records the work an outbox item claims.
+
+    Public because recovery reconciliation (``state_sync``) has to answer the
+    same question about stores that share no common base.
+    """
     if ack["type"] == "alerts":
         return all(key in state["alerts"] for key in ack["keys"])
     if ack["type"] == "reminder":
@@ -171,7 +191,7 @@ def _merge_outbox(
                 raise
             record = _resolve_concurrent_outbox(theirs, ours)
         if record is _MISSING or (
-            not record["force"] and _ack_satisfied(merged_state, record["ack"])
+            not record["force"] and ack_satisfied(merged_state, record["ack"])
         ):
             continue
         merged[delivery_id] = record

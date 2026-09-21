@@ -9,6 +9,11 @@ while owner/health fields retain its strict three-way behavior.
 
 The durable failure marker predates this boundary.  Its path and finding key
 remain stable so an in-flight failure episode is not re-alerted on upgrade.
+
+Creating the shared ref is never ordinary work (OTW-30).  A confirmed absence
+cannot be told apart from deletion of an established ref, so ``synchronize``
+refuses it and the operator runs ``init`` (a genuinely new installation) or
+``recover`` (an existing one, reconciling every surviving store first).
 """
 
 from __future__ import annotations
@@ -22,12 +27,13 @@ import subprocess
 import sys
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import state as state_mod
 from .detect import TZ_PARIS
-from .state_merge import StateMergeError, merge_states
+from .state_merge import StateMergeError, ack_satisfied, merge_states
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +44,26 @@ FETCHED_STATE_REF = "refs/otw/runtime-state"
 STATE_REF_FILE = "state.json"
 TRANSPORT_FAILURE_FILE = "transport-failure.json"
 TRANSPORT_FAILURE_THRESHOLD = 3
+DEFAULT_SEED_PATH = "state/state.json"
+# `sync` exits with this when the shared ref is confirmed absent and no verified
+# delivery history survives locally: the startup wrappers must stop instead of
+# letting the watcher deliver from the unverified tracked seed.  Mirrored by
+# scripts/local-check.sh and .github/workflows/watch.yml; a test pins them.
+BOOTSTRAP_REQUIRED_EXIT = 3
+
+# Any of these proves this installation already notified the user: receipts and
+# the reminder ladder directly, and the baselines that only advance once their
+# alert was delivered.  An empty snapshot proves nothing either way.
+_DELIVERY_EVIDENCE_FIELDS = (
+    "alerts",
+    "delivery_receipts",
+    "outbox",
+    "reminders_sent",
+    "sales",
+    "formats_seen",
+    "shows_seen",
+    "last_heartbeat",
+)
 
 
 class StateSyncError(RuntimeError):
@@ -46,6 +72,24 @@ class StateSyncError(RuntimeError):
 
 class StateSyncTransportError(StateSyncError):
     """The remote Git transport is temporarily unavailable or rejected."""
+
+
+class StateSyncRefAbsentError(StateSyncError):
+    """The shared state ref is confirmed absent, which only an operator may fix.
+
+    ``local_evidence`` says whether this clone still holds delivered receipts.
+    With them the watcher may keep running (and report the condition); without
+    them it has nothing trustworthy to deduplicate against, so the firing stops.
+    """
+
+    def __init__(self, message: str, *, local_evidence: bool) -> None:
+        super().__init__(message)
+        self.local_evidence = local_evidence
+
+
+def has_delivery_evidence(state: dict) -> bool:
+    """True when a snapshot proves an alert, reminder or heartbeat was sent."""
+    return any(state.get(field) for field in _DELIVERY_EVIDENCE_FIELDS)
 
 
 def _resolve_under(repo: Path, path: str | Path) -> Path:
@@ -176,11 +220,218 @@ def file_lock(path: str | Path, *, blocking: bool) -> Iterator[bool]:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+class _Store:
+    """The resolved on-disk locations of one clone's runtime-state store."""
+
+    def __init__(self, repo: str | Path, store: str | Path) -> None:
+        self.repo = Path(repo).resolve()
+        self.dir = _resolve_under(self.repo, store)
+        self.live = self.dir / STATE_REF_FILE
+        self.base = self.dir / "base.json"
+        self.lock = self.dir / "sync.lock"
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+
+def _ref_absent_error(
+    state_ref: str, local: dict | None
+) -> StateSyncRefAbsentError:
+    """Report a confirmed absence, without recreating the ref from a seed."""
+    if local is not None and has_delivery_evidence(local):
+        return StateSyncRefAbsentError(
+            f"shared state ref {state_ref} is missing while this clone still holds "
+            "delivered receipts; refusing to recreate it silently. Reconcile every "
+            "surviving store and run `python -m watcher.state_sync recover` "
+            "(README 'State bootstrap and recovery')",
+            local_evidence=True,
+        )
+    return StateSyncRefAbsentError(
+        f"shared state ref {state_ref} is missing and this clone holds no verified "
+        "delivery history; refusing to deliver from an unverified seed. Run "
+        "`python -m watcher.state_sync init` for a genuinely new installation, or "
+        "`recover` for an existing one (README 'State bootstrap and recovery')",
+        local_evidence=False,
+    )
+
+
+def reconcile_stores(stores: Sequence[dict]) -> dict:
+    """Union what every surviving store proves, and quarantine what it doesn't.
+
+    An older backup is never proof that an alert was *not* sent, so receipts,
+    reminder rungs and the baselines they gate take OTW-14's union.  A delivery
+    any store left in flight stays ``uncertain``, so recovery cannot turn an
+    unknown Telegram outcome into a replay.  Stores are applied in order, so the
+    freshest one (passed last) owns the plain health fields.
+    """
+    if not stores:
+        raise StateSyncError("no runtime-state store to reconcile")
+    try:
+        snapshots = [state_mod.migrate_state(store) for store in stores]
+        merged = snapshots[0]
+        for snapshot in snapshots[1:]:
+            # base == upstream keeps every union rule while letting the later
+            # snapshot win the fields that have no domain semantics.
+            merged = merge_states(merged, merged, snapshot)
+    except (StateMergeError, state_mod.StateError) as exc:
+        raise StateSyncError(
+            f"surviving runtime-state stores could not be reconciled: {exc}"
+        ) from exc
+    # The fold treats work a later store never knew about as retired, which is
+    # right for a real base and wrong here: an attempt one surviving store left
+    # in flight is unknown, not finished. Re-add every such attempt and mark it
+    # uncertain, unless this reconciliation itself proves it was delivered.
+    in_flight: dict[str, dict] = {}
+    for snapshot in snapshots:
+        for delivery_id, record in snapshot["outbox"].items():
+            if record["status"] in {"sending", "uncertain"}:
+                in_flight.setdefault(delivery_id, record)
+    for delivery_id, record in in_flight.items():
+        current = merged["outbox"].get(delivery_id)
+        if current is None:
+            if _delivery_settled(merged, delivery_id, record):
+                continue
+            current = deepcopy(record)
+            merged["outbox"][delivery_id] = current
+        current["status"] = "uncertain"
+        if "claim" not in current and "claim" in record:
+            current["claim"] = deepcopy(record["claim"])
+    return state_mod.migrate_state(merged)
+
+
+def _delivery_settled(merged: dict, delivery_id: str, record: dict) -> bool:
+    """True when the reconciled state itself proves this attempt was delivered."""
+    if any(
+        receipt["delivery_id"] == delivery_id
+        for receipt in merged["delivery_receipts"].values()
+    ):
+        return True
+    return not record["force"] and ack_satisfied(merged, record["ack"])
+
+
+def initialize(
+    repo: str | Path = ".",
+    *,
+    store: str | Path = DEFAULT_STORE_PATH,
+    seed: str | Path = DEFAULT_SEED_PATH,
+    remote: str = "origin",
+    state_ref: str = DEFAULT_STATE_REF,
+) -> tuple[Path, bool]:
+    """Create the shared state ref for a genuinely new installation.
+
+    Refuses as soon as anything local proves the user was already notified: a
+    missing ref is then a recovery, not a first run.  The live file is written
+    only once a ref backs it, so a failed initialization can never leave an
+    unverified seed behind for ordinary delivery.  Returns the live path and
+    whether an independently created remote ref was adopted instead.
+    """
+    paths = _Store(repo, store)
+    seed_path = _resolve_under(paths.repo, seed)
+
+    with file_lock(paths.lock, blocking=True):
+        existing = (
+            _load_file(paths.live, "local live state") if paths.live.exists() else None
+        )
+        if existing is not None and has_delivery_evidence(existing):
+            raise StateSyncError(
+                "local live state already holds delivery evidence, so this is not a "
+                "new installation; use `recover` to restore an existing one"
+            )
+        _, upstream = _remote_state(paths.repo, remote, state_ref)
+        if upstream is not None:
+            return _adopt_remote(paths, upstream), True
+
+        initial = existing if existing is not None else _load_file(seed_path, "seed state")
+        commit = _state_commit(paths.repo, initial, None)
+        pushed = _git(
+            paths.repo, "push", "--quiet", remote, f"{commit}:{state_ref}", check=False
+        )
+        if pushed.returncode != 0:
+            _, upstream = _remote_state(paths.repo, remote, state_ref)
+            if upstream is not None:
+                # Another host created the ref between the check and the push.
+                # Its history is authoritative and stays exactly as it is.
+                return _adopt_remote(paths, upstream), True
+            detail = (pushed.stderr or pushed.stdout).strip() or "push was rejected"
+            raise StateSyncTransportError(
+                f"could not create shared state ref {state_ref}: {detail}"
+            )
+        state_mod.save_state(paths.live, initial)
+        state_mod.save_state(paths.base, initial)
+        return paths.live, False
+
+
+def recover(
+    repo: str | Path = ".",
+    *,
+    store: str | Path = DEFAULT_STORE_PATH,
+    remote: str = "origin",
+    state_ref: str = DEFAULT_STATE_REF,
+    extra: Sequence[str | Path] = (),
+) -> tuple[Path, bool]:
+    """Rebuild the shared ref for an existing installation, owner-approved.
+
+    Every surviving store is reconciled first — the live file, the last
+    incorporated base, and any backup given in ``extra`` — so confirmed
+    receipts survive and in-flight attempts stay quarantined.  The tracked seed
+    is never a store: it would look like proof that nothing was ever sent.
+    """
+    paths = _Store(repo, store)
+    with file_lock(paths.lock, blocking=True):
+        stores: list[dict] = []
+        for item in extra:
+            path = _resolve_under(paths.repo, item)
+            stores.append(_load_file(path, f"recovery store {path}"))
+        if paths.base.exists():
+            stores.append(_load_file(paths.base, "state sync base"))
+        if paths.live.exists():
+            stores.append(_load_file(paths.live, "local live state"))
+        if not stores:
+            raise StateSyncError(
+                "no surviving runtime-state store to recover from; the tracked seed is "
+                "not proof that an alert was never sent. Supply a backup with --from, "
+                "or use `init` for a genuinely new installation"
+            )
+        recovered = reconcile_stores(stores)
+
+        _, upstream = _remote_state(paths.repo, remote, state_ref)
+        if upstream is None:
+            state_mod.save_state(paths.live, recovered)
+            commit = _state_commit(paths.repo, recovered, None)
+            pushed = _git(
+                paths.repo, "push", "--quiet", remote, f"{commit}:{state_ref}", check=False
+            )
+            if pushed.returncode == 0:
+                state_mod.save_state(paths.base, recovered)
+                return paths.live, False
+            _, upstream = _remote_state(paths.repo, remote, state_ref)
+            if upstream is None:
+                detail = (pushed.stderr or pushed.stdout).strip() or "push was rejected"
+                raise StateSyncTransportError(
+                    f"could not restore shared state ref {state_ref}: {detail}"
+                )
+
+        # The ref exists after all — created concurrently by another host, or
+        # never lost. Keep the reconciled evidence locally and leave that
+        # history untouched: dropping the stale base makes the next ordinary
+        # sync treat the remote as the base and union this clone's receipts
+        # into it instead of overwriting them.
+        state_mod.save_state(paths.live, recovered)
+        try:
+            paths.base.unlink()
+        except FileNotFoundError:
+            pass
+        return paths.live, True
+
+
+def _adopt_remote(paths: _Store, upstream: dict) -> Path:
+    state_mod.save_state(paths.live, upstream)
+    state_mod.save_state(paths.base, upstream)
+    return paths.live
+
+
 def synchronize(
     repo: str | Path = ".",
     *,
     store: str | Path = DEFAULT_STORE_PATH,
-    seed: str | Path = "state/state.json",
     remote: str = "origin",
     state_ref: str = DEFAULT_STATE_REF,
     push_attempts: int = 3,
@@ -191,44 +442,33 @@ def synchronize(
     updated before a push, so a rejected push or crash leaves enough evidence
     for the next run to retry without treating its receipts as remote-owned.
     The live file is never replaced until every input passes schema validation
-    and OTW-14's merge succeeds.
+    and OTW-14's merge succeeds.  A confirmed absence of the shared ref is an
+    operator condition, never a bootstrap: it is reported before anything local
+    is touched, so live and base evidence survive it unchanged.
     """
-    repo_path = Path(repo).resolve()
-    store_path = _resolve_under(repo_path, store)
-    live_path = store_path / STATE_REF_FILE
-    base_path = store_path / "base.json"
-    lock_path = store_path / "sync.lock"
-    seed_path = _resolve_under(repo_path, seed)
-    store_path.mkdir(parents=True, exist_ok=True)
+    paths = _Store(repo, store)
+    repo_path = paths.repo
+    live_path = paths.live
+    base_path = paths.base
 
-    with file_lock(lock_path, blocking=True):
+    with file_lock(paths.lock, blocking=True):
         local = _load_file(live_path, "local live state") if live_path.exists() else None
         last_error = "shared state push did not succeed"
         for _ in range(max(1, push_attempts)):
             remote_commit, upstream = _remote_state(repo_path, remote, state_ref)
-            if local is None:
-                if upstream is not None:
-                    local = upstream
-                elif seed_path.exists():
-                    local = _load_file(seed_path, "bootstrap state")
-                else:
-                    raise StateSyncError(
-                        "shared state does not exist and no valid bootstrap state is available"
-                    )
+            if upstream is None:
+                raise _ref_absent_error(state_ref, local)
 
-            if base_path.exists():
-                base = _load_file(base_path, "state sync base")
-            elif upstream is not None:
-                base = upstream
-            else:
-                base = local
+            if local is None:
+                local = upstream
+            base = (
+                _load_file(base_path, "state sync base")
+                if base_path.exists()
+                else upstream
+            )
 
             try:
-                merged = (
-                    merge_states(base, upstream, local)
-                    if upstream is not None
-                    else state_mod.migrate_state(local)
-                )
+                merged = merge_states(base, upstream, local)
             except (StateMergeError, state_mod.StateError) as exc:
                 raise StateSyncError(f"shared state reconciliation failed: {exc}") from exc
 
@@ -236,10 +476,10 @@ def synchronize(
             # write. A rejected or interrupted push therefore cannot lose a
             # receipt produced by the just-finished watcher pass.
             state_mod.save_state(live_path, merged)
-            state_mod.save_state(base_path, upstream if upstream is not None else base)
+            state_mod.save_state(base_path, upstream)
             local = merged
 
-            if upstream is not None and merged == upstream:
+            if merged == upstream:
                 state_mod.save_state(base_path, merged)
                 return live_path
 
@@ -422,7 +662,6 @@ def run(argv: list[str] | None = None) -> int:
     sync = subparsers.add_parser("sync")
     sync.add_argument("--repo", default=".")
     sync.add_argument("--store", default=DEFAULT_STORE_PATH)
-    sync.add_argument("--seed", default="state/state.json")
     sync.add_argument("--remote", default="origin")
     sync.add_argument("--ref", default=DEFAULT_STATE_REF)
     sync.add_argument("--push-attempts", type=int, default=3)
@@ -432,6 +671,30 @@ def run(argv: list[str] | None = None) -> int:
         default=TRANSPORT_FAILURE_THRESHOLD,
     )
     sync.add_argument("--marker", default=DEFAULT_MARKER_PATH)
+    init = subparsers.add_parser(
+        "init", help="create the shared state ref for a genuinely new installation"
+    )
+    init.add_argument("--repo", default=".")
+    init.add_argument("--store", default=DEFAULT_STORE_PATH)
+    init.add_argument("--seed", default=DEFAULT_SEED_PATH)
+    init.add_argument("--remote", default="origin")
+    init.add_argument("--ref", default=DEFAULT_STATE_REF)
+    restore = subparsers.add_parser(
+        "recover", help="rebuild the shared state ref from every surviving store"
+    )
+    restore.add_argument("--repo", default=".")
+    restore.add_argument("--store", default=DEFAULT_STORE_PATH)
+    restore.add_argument("--remote", default="origin")
+    restore.add_argument("--ref", default=DEFAULT_STATE_REF)
+    restore.add_argument(
+        "--from",
+        dest="extra",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="an additional surviving state file (a backup, or another clone's live"
+        " copy); repeatable. The tracked seed is never one",
+    )
     locked = subparsers.add_parser("locked")
     locked.add_argument("--lock", default=".cache/local-check.lock")
     locked.add_argument("child", nargs=argparse.REMAINDER)
@@ -451,11 +714,21 @@ def run(argv: list[str] | None = None) -> int:
                 live_path = synchronize(
                     repo,
                     store=args.store,
-                    seed=args.seed,
                     remote=args.remote,
                     state_ref=args.ref,
                     push_attempts=args.push_attempts,
                 )
+            except StateSyncRefAbsentError as exc:
+                # The transport answered, so this is not an outage streak.
+                clear_transport_failure(transport_streak)
+                if exc.local_evidence:
+                    # Verified receipts survive locally, so the watcher may still
+                    # run; a durable marker turns this into one loud alert.
+                    record_failure(f"runtime state ref is missing: {exc}", marker)
+                    print(f"state synchronization blocked: {exc}", file=sys.stderr)
+                    return 1
+                print(f"state synchronization blocked: {exc}", file=sys.stderr)
+                return BOOTSTRAP_REQUIRED_EXIT
             except StateSyncTransportError as exc:
                 streak = record_transport_failure(
                     str(exc),
@@ -481,6 +754,36 @@ def run(argv: list[str] | None = None) -> int:
                 return 1
             clear_transport_failure(transport_streak)
             resolve_failure(live_path, marker)
+        elif args.command in {"init", "recover"}:
+            repo = Path(args.repo).resolve()
+            try:
+                if args.command == "init":
+                    live_path, adopted = initialize(
+                        repo,
+                        store=args.store,
+                        seed=args.seed,
+                        remote=args.remote,
+                        state_ref=args.ref,
+                    )
+                else:
+                    live_path, adopted = recover(
+                        repo,
+                        store=args.store,
+                        remote=args.remote,
+                        state_ref=args.ref,
+                        extra=args.extra,
+                    )
+            except (OSError, StateSyncError, state_mod.StateError) as exc:
+                print(f"state {args.command} failed: {exc}", file=sys.stderr)
+                return 1
+            if adopted:
+                print(
+                    f"shared state ref {args.ref} already exists and was left intact; "
+                    f"reconciled local state is at {live_path}. Run "
+                    "`python -m watcher.state_sync sync` to union it upstream."
+                )
+            else:
+                print(f"created shared state ref {args.ref} from {live_path}")
         elif args.command == "locked":
             child: Sequence[str] = args.child
             if child and child[0] == "--":

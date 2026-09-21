@@ -69,9 +69,27 @@ jobs:
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           echo "with_news=$WITH_NEWS" >> "$GITHUB_OUTPUT"
 
+      # A transient transport failure keeps the last validated local copy and the
+      # pass continues, as before. Exit 3 is different: it means the shared state
+      # ref is confirmed absent and this runner has no verified delivery history
+      # (state_sync.BOOTSTRAP_REQUIRED_EXIT — a test pins the number). Creating
+      # that ref is an explicit operator action, so the guard below stops the job
+      # rather than let it deliver historical alerts from the tracked seed.
       - name: Synchronize runtime state (before)
+        id: presync
         continue-on-error: true
-        run: python -m watcher.state_sync sync
+        run: |
+          set +e
+          python -m watcher.state_sync sync
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      - name: Require explicit state initialization
+        if: ${{ steps.presync.outputs.code == '3' }}
+        run: |
+          echo "::error::shared runtime-state ref is missing with no verified local history; run 'python -m watcher.state_sync init' (new install) or 'recover' (existing one)"
+          exit 1
 
       - name: Run watcher (${{ steps.mode.outputs.mode }})
         env:
@@ -102,12 +120,12 @@ jobs:
       # probe after failover work so a transient Telegram/API failure cannot
       # cost a due reminder; `always()` still makes a bad probe fail the run.
       - name: Validate Telegram credentials (no message)
-        if: ${{ always() }}
+        if: ${{ always() && steps.presync.outputs.code != '3' }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python -m watcher --state .cache/state-sync/state.json --check-telegram
 
       - name: Synchronize runtime state (after)
-        if: ${{ always() && inputs.dry_run != true }}
+        if: ${{ always() && inputs.dry_run != true && steps.presync.outputs.code != '3' }}
         run: python -m watcher.state_sync sync

@@ -615,4 +615,9 @@ def test_scheduled_workflow_probes_telegram_after_failover_without_gating_it():
     watcher_pass = workflow.index("Run watcher (")
     probe = workflow.index("--check-telegram", watcher_pass)
     assert watcher_pass < probe
-    assert "if: ${{ always() }}" in workflow[watcher_pass:probe]
+    # `always()`: a failed failover pass must never cost the credential probe.
+    # It may carry further conditions (OTW-30 skips it when state was never
+    # initialized, pinned in test_state_sync.py), but not the watcher's outcome.
+    condition = workflow[watcher_pass:probe]
+    assert "if: ${{ always()" in condition
+    assert "steps.mode" not in condition[condition.index("if: ${{ always()") :]
