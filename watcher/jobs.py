@@ -55,6 +55,10 @@ PATHE_BUDGET_SECONDS = 120.0
 NEWS_BUDGET_SECONDS = 45.0
 CINESA_BUDGET_SECONDS = 60.0
 
+CLOUD_STALE_PREFIX = "cloud_stale:"
+CLOUD_RECOVERED_PREFIX = "cloud_recovered:"
+CLOUD_EPISODE_PREFIX = f"{CLOUD_STALE_PREFIX}episode:"
+
 
 @dataclass
 class RunContext:
@@ -500,11 +504,46 @@ def run_reminder_job(
     return sent
 
 
+def _cloud_recovery_key(stale_key: str) -> str:
+    return f"{CLOUD_RECOVERED_PREFIX}{stale_key.removeprefix(CLOUD_STALE_PREFIX)}"
+
+
+def _cloud_stale_receipts(state: dict) -> list[str]:
+    return sorted(
+        key for key in state.get("alerts", {}) if key.startswith(CLOUD_STALE_PREFIX)
+    )
+
+
+def _rearm_cloud_outage(state: dict, now: datetime) -> None:
+    """Close delivered outage episodes, including pre-OTW-27 timestamp keys."""
+    for stale_key in _cloud_stale_receipts(state):
+        recovery_key = _cloud_recovery_key(stale_key)
+        if not state_mod.already_sent(state, recovery_key):
+            state_mod.mark_sent(state, recovery_key, now)
+
+
+def _cloud_outage_key(state: dict) -> str | None:
+    """Return one stable key for the active episode, or None if already sent."""
+    stale_keys = _cloud_stale_receipts(state)
+    if any(
+        not state_mod.already_sent(state, _cloud_recovery_key(key))
+        for key in stale_keys
+    ):
+        return None
+
+    episode_numbers = []
+    for key in stale_keys:
+        suffix = key.removeprefix(CLOUD_EPISODE_PREFIX)
+        if key.startswith(CLOUD_EPISODE_PREFIX) and suffix.isdigit():
+            episode_numbers.append(int(suffix))
+    return f"{CLOUD_EPISODE_PREFIX}{max(episode_numbers, default=0) + 1}"
+
+
 def run_cloud_supervision_job(ctx: RunContext, now: datetime) -> str:
     """Alert locally when successful scheduled cloud runs have gone stale.
 
-    The public API is evidence, not a watched source: an API failure or an
-    empty/invalid history cannot prove an outage and must stay quiet.
+    The public API is evidence, not a watched source: only a validated complete
+    window with no recent success proves an outage; uncertainty stays quiet.
     """
     stale_hours = getattr(ctx.cfg, "cloud_stale_hours", 0)
     repository = getattr(ctx.cfg, "cloud_repository", "")
@@ -519,21 +558,27 @@ def run_cloud_supervision_job(ctx: RunContext, now: datetime) -> str:
     # This must happen even when the API call below fails: otherwise a pending
     # pre-upgrade heartbeat has no condition for unknown-health recovery to block.
     delivery.bind_cloud_health_conditions(ctx)
+    now = detect.as_aware(now)
+    stale_window = timedelta(hours=stale_hours)
     try:
-        last_success = cloud.latest_successful_scheduled_run(repository, workflow)
+        has_recent_success = cloud.has_successful_scheduled_run(
+            repository,
+            workflow,
+            since=now - stale_window,
+            until=now,
+        )
     except cloud.CloudStatusError as exc:
         log.warning("cloud supervision unavailable (no alert): %s", exc)
         return "unknown"
-    if last_success is None:
-        log.warning("cloud supervision found no successful scheduled run (no alert)")
-        return "unknown"
-    if detect.as_aware(now) - last_success <= timedelta(hours=stale_hours):
+    if has_recent_success:
         delivery.reconcile_cloud_health(ctx, "healthy")
+        _rearm_cloud_outage(ctx.state, now)
         return "healthy"
     delivery.reconcile_cloud_health(ctx, "stale")
-    finding = alerts.build_cloud_stale_finding(ctx.cfg, last_success, now)
-    if state_mod.already_sent(ctx.state, finding.key):
+    key = _cloud_outage_key(ctx.state)
+    if key is None:
         return "stale"
+    finding = alerts.build_cloud_stale_finding(ctx.cfg, key, stale_hours)
     deliver(ctx, [finding], now)
     return "stale"
 
