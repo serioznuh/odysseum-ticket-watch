@@ -44,9 +44,9 @@ A single-user Telegram watcher covering **two independent targets**:
   their alerts are delivered or the dates pass. No sub-minute guarantee; sleep
   still pauses checks. It gates neither the **Cinesa check** — one small call,
   not bot-gated — nor the **reminder ladder**, both of which run on every
-  firing. This half *owns* the ladder: 5-min firings give three chances inside
-  a 15-min warning. It queries the public Actions API before outbox replay and
-  heartbeat; failures withhold “healthy”. Runs from a residential IP: Akamai blocks Pathé from datacenter IPs, and Cloudflare challenges Cinesa from them.
+  firing. This half *owns* the ladder: 5-min firings give three chances inside a 15-min warning.
+  Before replay/heartbeat it validates a bounded public Actions result: any success proves health, uncertainty stays quiet, and a proven 18-hour absence alerts once until positive recovery.
+  Runs from a residential IP: Akamai blocks Pathé from datacenter IPs, and Cloudflare challenges Cinesa from them.
 - **Cloud half** — `.github/workflows/watch.yml` cron `*/15`: cloud-safe news,
   supervision, and reminders as a **failover** rather than their owner. It passes
   `--reminder-grace-minutes 25` (> the local 5-min interval), so it only sends

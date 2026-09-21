@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import pytest
 
 from watcher import cloud, delivery, jobs, notify, runner
 from watcher import state as state_mod
@@ -60,10 +61,9 @@ def _capture_delivery(monkeypatch, ctx):
 
 def test_dead_cloud_raises_one_loud_well_labelled_alert(monkeypatch):
     ctx = _context()
-    last_success = NOW - timedelta(hours=19)
     delivered = _capture_delivery(monkeypatch, ctx)
     monkeypatch.setattr(
-        cloud, "latest_successful_scheduled_run", lambda *args: last_success
+        cloud, "has_successful_scheduled_run", lambda *args, **kwargs: False
     )
 
     jobs.run_cloud_supervision_job(ctx, NOW)
@@ -72,8 +72,12 @@ def test_dead_cloud_raises_one_loud_well_labelled_alert(monkeypatch):
     finding = delivered[0]
     assert finding.kind == "WATCHER_ERROR"
     assert finding.kind not in ctx.cfg.silent_kinds
-    assert finding.key == f"cloud_stale:{last_success.isoformat()}"
+    assert finding.key == "cloud_stale:episode:1"
     assert finding.lines[0] == "Dune : Troisième partie · Pathé Odysseum"
+    assert "No successful scheduled cloud run was found in the last 18 h." in (
+        finding.lines
+    )
+    assert all("Last successful" not in line for line in finding.lines)
     assert "cloud failover and supervision are dark" in finding.lines[-1]
 
 
@@ -83,8 +87,8 @@ def test_quiet_but_successful_cloud_run_is_healthy_and_changes_no_state(monkeypa
     delivered = _capture_delivery(monkeypatch, ctx)
     monkeypatch.setattr(
         cloud,
-        "latest_successful_scheduled_run",
-        lambda *args: NOW - timedelta(minutes=30),
+        "has_successful_scheduled_run",
+        lambda *args, **kwargs: True,
     )
 
     health = jobs.run_cloud_supervision_job(ctx, NOW)
@@ -99,10 +103,10 @@ def test_github_api_blip_fails_quietly(monkeypatch):
     before = deepcopy(ctx.state)
     delivered = _capture_delivery(monkeypatch, ctx)
 
-    def unavailable(*args):
+    def unavailable(*args, **kwargs):
         raise cloud.CloudStatusError("temporary API failure")
 
-    monkeypatch.setattr(cloud, "latest_successful_scheduled_run", unavailable)
+    monkeypatch.setattr(cloud, "has_successful_scheduled_run", unavailable)
 
     health = jobs.run_cloud_supervision_job(ctx, NOW)
 
@@ -135,8 +139,10 @@ def test_api_blip_binds_and_defers_a_legacy_pending_heartbeat(tmp_path, monkeypa
 
     monkeypatch.setattr(
         cloud,
-        "latest_successful_scheduled_run",
-        lambda *args: (_ for _ in ()).throw(cloud.CloudStatusError("API blip")),
+        "has_successful_scheduled_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            cloud.CloudStatusError("API blip")
+        ),
     )
     assert jobs.run_cloud_supervision_job(ctx, NOW + timedelta(minutes=5)) == "unknown"
     assert pending["topics"] == ["condition:cloud-health=healthy"]
@@ -151,39 +157,67 @@ def test_api_blip_binds_and_defers_a_legacy_pending_heartbeat(tmp_path, monkeypa
 def test_cloud_alert_dedups_per_outage_and_rearms_after_a_later_success(monkeypatch):
     ctx = _context()
     delivered = _capture_delivery(monkeypatch, ctx)
-    old_success = NOW - timedelta(days=2)
-    latest = [old_success]
+    healthy = [False]
     monkeypatch.setattr(
-        cloud, "latest_successful_scheduled_run", lambda *args: latest[0]
+        cloud, "has_successful_scheduled_run", lambda *args, **kwargs: healthy[0]
     )
 
     jobs.run_cloud_supervision_job(ctx, NOW)
     jobs.run_cloud_supervision_job(ctx, NOW)
-    assert [finding.key for finding in delivered] == [
-        f"cloud_stale:{old_success.isoformat()}"
-    ]
+    assert [finding.key for finding in delivered] == ["cloud_stale:episode:1"]
 
     # A fresh success is healthy and re-arms a later, distinct outage without
     # deleting the durable receipt for the first one.
-    later_success = NOW - timedelta(hours=1)
-    latest[0] = later_success
+    healthy[0] = True
     jobs.run_cloud_supervision_job(ctx, NOW)
     assert len(delivered) == 1
 
+    healthy[0] = False
     later_now = NOW + timedelta(days=1)
     jobs.run_cloud_supervision_job(ctx, later_now)
     assert [finding.key for finding in delivered] == [
-        f"cloud_stale:{old_success.isoformat()}",
-        f"cloud_stale:{later_success.isoformat()}",
+        "cloud_stale:episode:1",
+        "cloud_stale:episode:2",
     ]
+
+
+def test_legacy_timestamp_keys_wait_for_positive_recovery_before_rearming(monkeypatch):
+    ctx = _context()
+    delivered = _capture_delivery(monkeypatch, ctx)
+    ctx.state["alerts"].update(
+        {
+            "cloud_stale:2026-09-13T08:15:00+02:00": NOW.isoformat(),
+            "cloud_stale:2026-09-06T08:15:00+02:00": NOW.isoformat(),
+        }
+    )
+    healthy = [False]
+    monkeypatch.setattr(
+        cloud, "has_successful_scheduled_run", lambda *args, **kwargs: healthy[0]
+    )
+
+    assert jobs.run_cloud_supervision_job(ctx, NOW) == "stale"
+    assert delivered == []
+
+    healthy[0] = True
+    assert jobs.run_cloud_supervision_job(ctx, NOW) == "healthy"
+    assert {
+        key for key in ctx.state["alerts"] if key.startswith("cloud_recovered:")
+    } == {
+        "cloud_recovered:2026-09-13T08:15:00+02:00",
+        "cloud_recovered:2026-09-06T08:15:00+02:00",
+    }
+
+    healthy[0] = False
+    assert jobs.run_cloud_supervision_job(ctx, NOW + timedelta(days=1)) == "stale"
+    assert [finding.key for finding in delivered] == ["cloud_stale:episode:1"]
 
 
 def test_fresh_cloud_retires_failed_stale_alert_before_recovery(tmp_path, monkeypatch):
     ctx = _durable_context(tmp_path)
     attempts = []
-    latest = [NOW - timedelta(days=2)]
+    healthy = [False]
     monkeypatch.setattr(
-        cloud, "latest_successful_scheduled_run", lambda *args: latest[0]
+        cloud, "has_successful_scheduled_run", lambda *args, **kwargs: healthy[0]
     )
     monkeypatch.setattr(
         notify,
@@ -208,7 +242,7 @@ def test_fresh_cloud_retires_failed_stale_alert_before_recovery(tmp_path, monkey
     # The next run proves recovery before outbox replay. The pending loud alert
     # is contradicted and removed, never sent after the outage has ended.
     ctx.delivery_attempts.clear()
-    latest[0] = NOW + timedelta(minutes=1)
+    healthy[0] = True
     assert jobs.run_cloud_supervision_job(ctx, NOW + timedelta(minutes=5)) == "healthy"
     assert ctx.state["outbox"] == {}
     assert delivery.recover(ctx, NOW + timedelta(minutes=5)) is False
@@ -254,8 +288,8 @@ def test_pending_healthy_heartbeat_is_retired_when_cloud_turns_stale(
     ctx.delivery_attempts.clear()
     monkeypatch.setattr(
         cloud,
-        "latest_successful_scheduled_run",
-        lambda *args: NOW - timedelta(days=2),
+        "has_successful_scheduled_run",
+        lambda *args, **kwargs: False,
     )
     assert jobs.run_cloud_supervision_job(ctx, NOW + timedelta(minutes=5)) == "stale"
     assert all(
@@ -273,8 +307,8 @@ def test_cloud_recovery_binds_but_never_replays_pending_cloud_health_work(
     attempts = []
     monkeypatch.setattr(
         cloud,
-        "latest_successful_scheduled_run",
-        lambda *args: NOW - timedelta(days=2),
+        "has_successful_scheduled_run",
+        lambda *args, **kwargs: False,
     )
     monkeypatch.setattr(
         notify,
@@ -358,35 +392,172 @@ def test_both_cloud_runner_branches_use_condition_aware_recovery(
     assert trace == ["cloud-recovery", "cloud-recovery"]
 
 
-def test_actions_api_requests_only_the_latest_scheduled_success(monkeypatch):
-    calls = []
+def _api_run(run_id, created_at, updated_at, **overrides):
+    run = {
+        "id": run_id,
+        "event": "schedule",
+        "status": "completed",
+        "conclusion": "success",
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+    run.update(overrides)
+    return run
 
+
+def _response(body):
     class Response:
         def raise_for_status(self):
             return None
 
         def json(self):
-            return {"workflow_runs": [{"updated_at": "2026-09-20T08:15:00Z"}]}
+            if isinstance(body, Exception):
+                raise body
+            return body
+
+    return Response()
+
+
+def test_actions_api_queries_and_validates_the_complete_health_window(monkeypatch):
+    calls = []
+    body = {
+        "total_count": 2,
+        "workflow_runs": [
+            _api_run(1, "2026-09-19T15:50:00Z", "2026-09-19T15:55:00Z"),
+            _api_run(2, "2026-09-20T08:10:00Z", "2026-09-20T08:15:00Z"),
+        ],
+    }
 
     def fake_get(url, **kwargs):
         calls.append((url, kwargs))
-        return Response()
+        return _response(body)
 
     monkeypatch.setattr(cloud.httpx, "get", fake_get)
 
-    result = cloud.latest_successful_scheduled_run(
-        "serioznuh/odysseum-ticket-watch", "watch.yml"
+    result = cloud.has_successful_scheduled_run(
+        "serioznuh/odysseum-ticket-watch",
+        "watch.yml",
+        since=NOW - timedelta(hours=18),
+        until=NOW,
     )
 
-    assert result == datetime(2026, 9, 20, 8, 15, tzinfo=timezone.utc)
+    assert result is True
     assert calls[0][0].endswith(
         "/repos/serioznuh/odysseum-ticket-watch/actions/workflows/watch.yml/runs"
     )
     assert calls[0][1]["params"] == {
         "event": "schedule",
         "status": "success",
-        "per_page": 1,
+        "created": "2026-09-19T15:45:00Z..2026-09-20T10:00:00Z",
+        "per_page": 74,
     }
+
+
+@pytest.mark.parametrize("old_day", ["2026-09-13", "2026-09-06"])
+def test_old_anonymous_row_fixture_cannot_raise_a_false_alert(
+    old_day, monkeypatch
+):
+    """The two production responses omitted a known recent run and violated
+    the new created filter. Such contradictory evidence is unknown, not stale.
+    """
+    ctx = _context()
+    delivered = _capture_delivery(monkeypatch, ctx)
+    body = {
+        "total_count": 1,
+        "workflow_runs": [
+            _api_run(
+                1,
+                f"{old_day}T08:10:00Z",
+                f"{old_day}T08:15:00Z",
+            )
+        ],
+    }
+    monkeypatch.setattr(cloud.httpx, "get", lambda *args, **kwargs: _response(body))
+
+    assert jobs.run_cloud_supervision_job(ctx, NOW) == "unknown"
+    assert delivered == []
+
+
+def test_alternating_old_rows_during_real_outage_stay_one_episode(monkeypatch):
+    ctx = _context()
+    delivered = _capture_delivery(monkeypatch, ctx)
+    bodies = iter(
+        [
+            {
+                "total_count": 1,
+                "workflow_runs": [
+                    _api_run(
+                        13,
+                        "2026-09-19T15:50:00Z",
+                        "2026-09-19T15:55:00Z",
+                    )
+                ],
+            },
+            {
+                "total_count": 1,
+                "workflow_runs": [
+                    _api_run(
+                        6,
+                        "2026-09-19T15:55:00Z",
+                        "2026-09-19T16:00:00Z",
+                    )
+                ],
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        cloud.httpx,
+        "get",
+        lambda *args, **kwargs: _response(next(bodies)),
+    )
+
+    assert jobs.run_cloud_supervision_job(ctx, NOW) == "stale"
+    assert jobs.run_cloud_supervision_job(ctx, NOW + timedelta(minutes=5)) == "stale"
+    assert [finding.key for finding in delivered] == ["cloud_stale:episode:1"]
+
+
+def test_complete_empty_actions_page_is_authoritative_absence(monkeypatch):
+    monkeypatch.setattr(
+        cloud.httpx,
+        "get",
+        lambda *args, **kwargs: _response({"total_count": 0, "workflow_runs": []}),
+    )
+
+    assert cloud.has_successful_scheduled_run(
+        "serioznuh/odysseum-ticket-watch",
+        "watch.yml",
+        since=NOW - timedelta(hours=18),
+        until=NOW,
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        ValueError("not JSON"),
+        {"workflow_runs": []},
+        {"total_count": 2, "workflow_runs": [_api_run(
+            1, "2026-09-20T08:10:00Z", "2026-09-20T08:15:00Z"
+        )]},
+        {"total_count": 1, "workflow_runs": [{"id": 1}]},
+        {"total_count": 1, "workflow_runs": [_api_run(
+            1,
+            "2026-09-20T08:10:00Z",
+            "2026-09-20T08:15:00Z",
+            event="workflow_dispatch",
+        )]},
+    ],
+    ids=["malformed-json", "missing-count", "partial", "malformed-row", "contradictory"],
+)
+def test_uncertain_actions_pages_fail_quiet(body, monkeypatch):
+    ctx = _context()
+    before = deepcopy(ctx.state)
+    delivered = _capture_delivery(monkeypatch, ctx)
+    monkeypatch.setattr(cloud.httpx, "get", lambda *args, **kwargs: _response(body))
+
+    assert jobs.run_cloud_supervision_job(ctx, NOW) == "unknown"
+    assert delivered == []
+    assert ctx.state == before
 
 
 def test_actions_api_transport_error_is_not_liveness_evidence(monkeypatch):
@@ -400,8 +571,11 @@ def test_actions_api_transport_error_is_not_liveness_evidence(monkeypatch):
     )
 
     try:
-        cloud.latest_successful_scheduled_run(
-            "serioznuh/odysseum-ticket-watch", "watch.yml"
+        cloud.has_successful_scheduled_run(
+            "serioznuh/odysseum-ticket-watch",
+            "watch.yml",
+            since=NOW - timedelta(hours=18),
+            until=NOW,
         )
     except cloud.CloudStatusError as exc:
         assert "unavailable" in str(exc)

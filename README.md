@@ -48,7 +48,7 @@ event listings (the 70 mm ones) always answer `"No movie allowed !"`, and their
 bookability is read off the cinema programme. Unexpected detail/showtimes failures
 degrade health without discarding the rest of the snapshot.
 
-Safety nets: 🔴 after 3 consecutive Pathé failures (including partial failures after 6 h), if the local catalogue pulse stops for 18 h (then every 24 h), or if no scheduled cloud run has succeeded for 18 h. The local check reads the public Actions API before outbox replay or heartbeat; recovery retires a pending stale-cloud alert, while stale/unknown health withholds the “healthy” heartbeat. Each cloud run validates its bot and chat without sending after failover work, so a transient probe failure cannot cost a due reminder. An API blip raises no alert, and no liveness timestamp churns shared state. If **both halves die**, only the absence of the 7-day heartbeat remains.
+Safety nets: 🔴 after 3 consecutive Pathé failures (including partial failures after 6 h), if the local catalogue pulse stops for 18 h (then every 24 h), or if a complete bounded Actions result contains no scheduled success in the last 18 h. The local check validates enough public API rows for every possible firing before outbox replay or heartbeat; any success proves health, while an API error, incomplete page, or contradictory result stays quiet. A cloud outage alerts once and re-arms only after positive recovery; recovery also retires a pending stale-cloud alert, while stale/unknown health withholds the “healthy” heartbeat. Each cloud run validates its bot and chat without sending after failover work, so a transient probe failure cannot cost a due reminder. No per-run liveness timestamp churns shared state. If **both halves die**, only the absence of the 7-day heartbeat remains.
 
 ### Cinesa target
 
@@ -182,7 +182,7 @@ deployment on `main` is independent of that state history.
 | `news.max_alerts_per_run` | `3` | Cap on news alerts per check. |
 | `news.google_news_queries` | *(see file)* | Google News RSS search URLs to scan. |
 | `news.extra_pages`, `news.cloud_extra_pages` | `[]`, `[]` | Extra URLs scanned locally, and the separate explicit allow-list scanned from the cloud. Cloud mode otherwise reads only `news.google.com` RSS and always refuses `pathe.fr`/`cinesa.es` hosts. |
-| `cloud.repository`, `cloud.workflow`, `cloud.stale_hours` | `""`, `"watch.yml"`, `0` | Public GitHub repository/workflow and maximum age of its latest successful scheduled run. `0` disables reverse supervision; shipped config uses 18 h. Successful runs include a read-only Telegram bot/chat check. |
+| `cloud.repository`, `cloud.workflow`, `cloud.stale_hours` | `""`, `"watch.yml"`, `0` | Public GitHub repository/workflow and bounded window in which any successful scheduled run proves health. `0` disables reverse supervision; shipped config uses 18 h. Successful runs include a read-only Telegram bot/chat check. |
 | `alerts.heartbeat_days` | `7` | 💤 "alive" summary when nothing was alerted for N days. `0` = off. |
 | `alerts.failure_streak_threshold` | `3` | ⚠️ after N consecutive failed Pathé checks. |
 | `alerts.stale_check_hours` | `18` | Cloud pass ⚠️ when the last successful check is older than this (local job died, or the Mac stayed shut). `0` = off. Sized from measured gaps: 4 h median, 12.9 h worst ordinary overnight — below ~16 h, normal nights trip it. |

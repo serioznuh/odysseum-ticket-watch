@@ -292,20 +292,19 @@ def build_stale_finding(cfg, st: dict, blind: timedelta, key: str, day: int) -> 
     )
 
 
-def build_cloud_stale_finding(cfg, last_success: datetime, now: datetime) -> Finding:
-    """Local-side supervision for a cloud cron that stopped succeeding."""
-    last_success = detect.as_aware(last_success)
-    blind = detect.as_aware(now) - last_success
+def build_cloud_stale_finding(cfg, key: str, stale_hours: int) -> Finding:
+    """Local-side alert for a complete cloud-success window with no match."""
+    window = fmt_duration(timedelta(hours=stale_hours))
     repository = cfg.cloud_repository
     workflow = cfg.cloud_workflow
     return Finding(
         kind="WATCHER_ERROR",
-        key=f"cloud_stale:{last_success.isoformat()}",
+        key=key,
         confidence="high",
-        title=f"Cloud checks have stopped — {fmt_duration(blind)}",
+        title=f"Cloud checks have stopped — no success in {window}",
         lines=[
             watch_label(cfg),
-            f"Last successful scheduled cloud run: {short_dt(last_success)}.",
+            f"No successful scheduled cloud run was found in the last {window}.",
             "GitHub Actions may be disabled, stuck, or failing (including Telegram).",
             "Local checks and reminders still run; cloud failover and supervision are dark.",
         ],
