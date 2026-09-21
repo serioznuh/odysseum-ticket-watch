@@ -170,41 +170,56 @@ def test_actionable_state_failure_marks_immediately(tmp_path, monkeypatch):
 IN_FLIGHT_ID = "telegram:news-leak-42"
 
 
-def ref_absent(*, local_evidence: bool):
+def ref_absent(*, established: bool):
     def fail(*args, **kwargs):
         raise state_sync.StateSyncRefAbsentError(
             "shared state ref refs/heads/runtime-state is missing",
-            local_evidence=local_evidence,
+            established=established,
         )
 
     return fail
 
 
-def test_missing_ref_without_local_evidence_blocks_the_firing(tmp_path, monkeypatch):
-    """Exit 3 is what the startup wrappers stop on: with no verified history
-    there is nothing to deduplicate against, so nothing may be delivered."""
-    monkeypatch.setattr(state_sync, "synchronize", ref_absent(local_evidence=False))
+def test_missing_ref_always_blocks_the_firing(tmp_path, monkeypatch):
+    """Exit 3 is what the startup wrappers stop on, and a confirmed absence
+    earns it whatever this clone holds: a receipt that lived only in the ref —
+    a reminder the cloud sent while the Mac slept — is invisible here, so any
+    local snapshot can be missing it and send it again."""
     argv = ["sync", "--repo", str(tmp_path)]
-
-    assert state_sync.run(argv) == state_sync.BOOTSTRAP_REQUIRED_EXIT
-    # No alert can reach the user from a runner in this condition, so no marker
-    # is left behind to fire later out of context.
-    assert state_sync.load_failure(tmp_path / state_sync.DEFAULT_MARKER_PATH) is None
-    assert not (
-        tmp_path / state_sync.DEFAULT_STORE_PATH / state_sync.TRANSPORT_FAILURE_FILE
-    ).exists()
+    for established in (False, True):
+        state_sync.clear_failure(tmp_path / state_sync.DEFAULT_MARKER_PATH)
+        monkeypatch.setattr(
+            state_sync, "synchronize", ref_absent(established=established)
+        )
+        assert state_sync.run(argv) == state_sync.BOOTSTRAP_REQUIRED_EXIT
 
 
-def test_missing_ref_with_local_receipts_marks_immediately(tmp_path, monkeypatch):
-    monkeypatch.setattr(state_sync, "synchronize", ref_absent(local_evidence=True))
+def test_missing_ref_marks_an_established_installation_for_one_alert(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(state_sync, "synchronize", ref_absent(established=True))
 
-    assert state_sync.run(["sync", "--repo", str(tmp_path)]) == 1
+    assert state_sync.run(["sync", "--repo", str(tmp_path)]) == (
+        state_sync.BOOTSTRAP_REQUIRED_EXIT
+    )
     marker = state_sync.load_failure(tmp_path / state_sync.DEFAULT_MARKER_PATH)
     assert marker is not None
     # The alert quotes this detail verbatim and truncates at 200 characters, so
-    # the operator action has to survive that cut.
+    # the operator action has to survive that cut. It is delivered once recovery
+    # lets a pass run again; the blocked firings report to stderr meanwhile.
     assert "is missing; run `watcher.state_sync recover`" in marker["detail"]
     assert len(marker["detail"]) < 200
+
+
+def test_missing_ref_on_a_new_install_leaves_no_alert_behind(tmp_path, monkeypatch):
+    monkeypatch.setattr(state_sync, "synchronize", ref_absent(established=False))
+
+    assert state_sync.run(["sync", "--repo", str(tmp_path)]) == (
+        state_sync.BOOTSTRAP_REQUIRED_EXIT
+    )
+    # Nothing was ever sent from here, so there is no history to alert about and
+    # the operator running `init` must not be greeted by a red herring.
+    assert state_sync.load_failure(tmp_path / state_sync.DEFAULT_MARKER_PATH) is None
 
 
 def test_missing_ref_is_not_counted_as_a_transport_outage(tmp_path, monkeypatch):
@@ -212,7 +227,7 @@ def test_missing_ref_is_not_counted_as_a_transport_outage(tmp_path, monkeypatch)
         tmp_path / state_sync.DEFAULT_STORE_PATH / state_sync.TRANSPORT_FAILURE_FILE
     )
     state_sync.record_transport_failure("offline", streak_path)
-    monkeypatch.setattr(state_sync, "synchronize", ref_absent(local_evidence=False))
+    monkeypatch.setattr(state_sync, "synchronize", ref_absent(established=False))
 
     assert state_sync.run(["sync", "--repo", str(tmp_path)]) == (
         state_sync.BOOTSTRAP_REQUIRED_EXIT

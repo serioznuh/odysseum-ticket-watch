@@ -45,10 +45,10 @@ STATE_REF_FILE = "state.json"
 TRANSPORT_FAILURE_FILE = "transport-failure.json"
 TRANSPORT_FAILURE_THRESHOLD = 3
 DEFAULT_SEED_PATH = "state/state.json"
-# `sync` exits with this when the shared ref is confirmed absent and no verified
-# delivery history survives locally: the startup wrappers must stop instead of
-# letting the watcher deliver from the unverified tracked seed.  Mirrored by
-# scripts/local-check.sh and .github/workflows/watch.yml; a test pins them.
+# `sync` exits with this on every confirmed absence of the shared ref: no local
+# snapshot can show a receipt that lived only in the ref, so the startup wrappers
+# must stop rather than let the watcher deliver from an unverified history.
+# Mirrored by scripts/local-check.sh and .github/workflows/watch.yml; a test pins them.
 BOOTSTRAP_REQUIRED_EXIT = 3
 
 # Any of these proves this installation already notified the user: receipts and
@@ -77,14 +77,16 @@ class StateSyncTransportError(StateSyncError):
 class StateSyncRefAbsentError(StateSyncError):
     """The shared state ref is confirmed absent, which only an operator may fix.
 
-    ``local_evidence`` says whether this clone still holds delivered receipts.
-    With them the watcher may keep running (and report the condition); without
-    them it has nothing trustworthy to deduplicate against, so the firing stops.
+    Ordinary delivery stops either way: whatever this clone holds locally, it
+    cannot see a receipt that lived only in the ref — a reminder the cloud sent
+    while the Mac slept, for instance — so sending again is exactly the risk.
+    ``established`` only decides whether a durable marker is warranted, i.e.
+    whether there is an installation history for the owner to be alerted about.
     """
 
-    def __init__(self, message: str, *, local_evidence: bool) -> None:
+    def __init__(self, message: str, *, established: bool) -> None:
         super().__init__(message)
-        self.local_evidence = local_evidence
+        self.established = established
 
 
 def has_delivery_evidence(state: dict) -> bool:
@@ -232,24 +234,42 @@ class _Store:
         self.dir.mkdir(parents=True, exist_ok=True)
 
 
-def _ref_absent_error(
-    state_ref: str, local: dict | None
-) -> StateSyncRefAbsentError:
+def _store_evidence(paths: _Store) -> bool:
+    """True when any local store shows this installation already notified.
+
+    Unreadable local state counts: a file this boundary cannot parse is not
+    proof that nothing was sent, so it is treated as an existing installation.
+    """
+    for path in (paths.live, paths.base):
+        if not path.exists():
+            continue
+        try:
+            state = _load_file(path, f"local state {path.name}")
+        except StateSyncError:
+            return True
+        if has_delivery_evidence(state):
+            return True
+    return False
+
+
+def _ref_absent_error(state_ref: str, established: bool) -> StateSyncRefAbsentError:
     """Report a confirmed absence, without recreating the ref from a seed."""
-    if local is not None and has_delivery_evidence(local):
+    if established:
         return StateSyncRefAbsentError(
-            f"shared state ref {state_ref} is missing while this clone still holds "
-            "delivered receipts; refusing to recreate it silently. Reconcile every "
-            "surviving store and run `python -m watcher.state_sync recover` "
+            f"shared state ref {state_ref} is missing while this clone holds an "
+            "installation history; refusing to recreate it silently and refusing to "
+            "deliver, because a receipt that lived only in the ref cannot be seen "
+            "here. Reconcile every surviving store and run "
+            "`python -m watcher.state_sync recover` "
             "(README 'State bootstrap and recovery')",
-            local_evidence=True,
+            established=True,
         )
     return StateSyncRefAbsentError(
         f"shared state ref {state_ref} is missing and this clone holds no verified "
         "delivery history; refusing to deliver from an unverified seed. Run "
         "`python -m watcher.state_sync init` for a genuinely new installation, or "
         "`recover` for an existing one (README 'State bootstrap and recovery')",
-        local_evidence=False,
+        established=False,
     )
 
 
@@ -327,14 +347,17 @@ def initialize(
     seed_path = _resolve_under(paths.repo, seed)
 
     with file_lock(paths.lock, blocking=True):
+        # Live *and* base: a clone that lost only its live file still proves the
+        # installation's history through the last incorporated base, and seeding
+        # over that would make every alert it recorded eligible again.
+        if _store_evidence(paths):
+            raise StateSyncError(
+                "a local store already holds delivery evidence, so this is not a new "
+                "installation; reconcile every surviving store with `recover` instead"
+            )
         existing = (
             _load_file(paths.live, "local live state") if paths.live.exists() else None
         )
-        if existing is not None and has_delivery_evidence(existing):
-            raise StateSyncError(
-                "local live state already holds delivery evidence, so this is not a "
-                "new installation; use `recover` to restore an existing one"
-            )
         _, upstream = _remote_state(paths.repo, remote, state_ref)
         if upstream is not None:
             return _adopt_remote(paths, upstream), True
@@ -457,7 +480,7 @@ def synchronize(
         for _ in range(max(1, push_attempts)):
             remote_commit, upstream = _remote_state(repo_path, remote, state_ref)
             if upstream is None:
-                raise _ref_absent_error(state_ref, local)
+                raise _ref_absent_error(state_ref, _store_evidence(paths))
 
             if local is None:
                 local = upstream
@@ -721,19 +744,18 @@ def run(argv: list[str] | None = None) -> int:
             except StateSyncRefAbsentError as exc:
                 # The transport answered, so this is not an outage streak.
                 clear_transport_failure(transport_streak)
-                if exc.local_evidence:
-                    # Verified receipts survive locally, so the watcher may still
-                    # run; a durable marker turns this into one loud alert. The
-                    # detail is capped at 200 characters, so it carries the action
-                    # rather than the full diagnostic, which goes to stderr below.
+                if exc.established:
+                    # An existing installation is blocked: keep a durable marker
+                    # so the owner gets one loud alert as soon as recovery lets a
+                    # pass run again. The marker detail is capped at 200
+                    # characters, so it carries the action rather than the full
+                    # diagnostic, which goes to stderr below either way.
                     record_failure(
                         f"shared runtime-state ref {args.ref} is missing; run "
                         "`watcher.state_sync recover` after reconciling every "
                         "surviving store",
                         marker,
                     )
-                    print(f"state synchronization blocked: {exc}", file=sys.stderr)
-                    return 1
                 print(f"state synchronization blocked: {exc}", file=sys.stderr)
                 return BOOTSTRAP_REQUIRED_EXIT
             except StateSyncTransportError as exc:

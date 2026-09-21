@@ -43,11 +43,12 @@ sync_state() {
   .venv/bin/python -m watcher.state_sync sync --store .cache/state-sync
 }
 
-# Mirrors watcher.state_sync.BOOTSTRAP_REQUIRED_EXIT (a test pins the two):
-# the shared state ref is confirmed absent and this clone holds no verified
-# delivery history, so nothing here may send. Creating that ref is an explicit
-# operator action (`state_sync init` for a new install, `recover` for an
-# existing one) — the tracked seed is not evidence of what was already sent.
+# Mirrors watcher.state_sync.BOOTSTRAP_REQUIRED_EXIT (a test pins the two): the
+# shared state ref is confirmed absent, so nothing here may send. Local receipts
+# are no defence — a reminder the cloud failover sent while this Mac slept lived
+# only in that ref, and this clone cannot see it. Creating the ref back is an
+# explicit operator action (`state_sync init` for a new install, `recover` for an
+# existing one); the tracked seed is not evidence of what was already sent.
 STATE_BOOTSTRAP_REQUIRED_EXIT=3
 
 # Pull shared state BEFORE the run. The watcher must see a reminder the cloud
@@ -57,12 +58,14 @@ STATE_BOOTSTRAP_REQUIRED_EXIT=3
 # (merge/schema) failure records the durable WATCHER_ERROR marker right away.
 # Either way, the watcher still runs so it can surface that marker to Telegram.
 # The one exception is the missing-ref condition above: there the firing stops
-# before the watcher can deliver historical alerts from an unverified seed.
+# before the watcher can deliver anything from an unverified history. The owner
+# still learns of it — that sync leaves the durable marker, which the first pass
+# after recovery delivers as one loud alert.
 pre_sync_status=0
 sync_state || pre_sync_status=$?
 if [ "$pre_sync_status" -eq "$STATE_BOOTSTRAP_REQUIRED_EXIT" ]; then
-  echo "ERROR: shared runtime-state ref is missing with no verified local history;" \
-       "run 'watcher.state_sync init' (new install) or 'recover' (existing one)" >&2
+  echo "ERROR: shared runtime-state ref is missing; no send may happen until" \
+       "'watcher.state_sync init' (new install) or 'recover' (existing one) runs" >&2
   exit "$pre_sync_status"
 fi
 

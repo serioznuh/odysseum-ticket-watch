@@ -44,7 +44,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-27 | Cloud supervision trusts an unstable one-row Actions response and false-alerts | P0 | S | Bugs | [x] |
 | OTW-28 | Coordinate Mac/cloud delivery before sending shared notifications | P1 | L | Infra, tooling & docs | [ ] |
 | OTW-29 | Bound Git operations and the local run's lifetime | P1 | M | Infra, tooling & docs | [ ] |
-| OTW-30 | Require explicit bootstrap when the shared runtime-state ref is missing | P2 | M | Infra, tooling & docs | [[x] |
+| OTW-30 | Require explicit bootstrap when the shared runtime-state ref is missing | P2 | M | Infra, tooling & docs | [x] |
 
 ## Recommended next work (reviewed 2026-09-21)
 

@@ -433,11 +433,12 @@ def test_existing_clone_preserves_live_and_base_when_the_ref_disappears(two_clon
 
     with pytest.raises(StateSyncRefAbsentError) as absent:
         synchronize(local)
-    assert absent.value.local_evidence is True
+    assert absent.value.established is True
 
-    # Verified receipts survive here, so the watcher may still run and report;
-    # the ref is still not recreated behind the owner's back.
-    assert run(["sync", "--repo", str(local)]) == 1
+    # Local receipts are not permission to keep sending: a reminder the cloud
+    # delivered while this Mac slept lived only in the ref. Delivery stops here
+    # too, and the ref is not recreated behind the owner's back.
+    assert run(["sync", "--repo", str(local)]) == BOOTSTRAP_REQUIRED_EXIT
     assert live_path(local).read_bytes() == live_before
     assert (local / DEFAULT_STORE_PATH / "base.json").read_bytes() == base_before
     assert remote_state_commit(origin) is None
@@ -553,7 +554,8 @@ def test_recovery_preserves_confirmed_receipts_and_quarantines_uncertainty(
 
     change_state(local, local_work)
     delete_state_ref(origin)
-    assert run(["sync", "--repo", str(local)]) == 1  # ordinary sync still refuses
+    # Ordinary sync refuses and blocks delivery until the owner recovers.
+    assert run(["sync", "--repo", str(local)]) == BOOTSTRAP_REQUIRED_EXIT
 
     assert run(["recover", "--repo", str(local), "--from", str(backup)]) == 0
     recovered = load_state(live_path(local))
@@ -658,3 +660,57 @@ def test_local_check_stops_before_the_watcher_when_the_ref_is_missing(
     assert not (fresh / "watcher-invocations").exists()
     assert not live_path(fresh).exists()
     assert remote_state_commit(origin) is None
+
+
+def test_a_surviving_base_alone_still_proves_an_existing_installation(two_clones):
+    """The live file can be lost on its own — a wiped `.cache` entry, a failed
+    write — while `base.json` still records what was delivered. Seeding over
+    that would make every alert it holds eligible again, so `init` must refuse
+    and point at recovery, which reads that base as a store."""
+    origin, local, _ = two_clones
+    deliver(local, HISTORIC_ALERT, "attempt-historic")
+    synchronize(local)
+    base = local / DEFAULT_STORE_PATH / "base.json"
+    assert HISTORIC_ALERT in load_state(base)["alerts"]
+    live_path(local).unlink()
+    delete_state_ref(origin)
+
+    assert run(["sync", "--repo", str(local)]) == BOOTSTRAP_REQUIRED_EXIT
+    assert run(["init", "--repo", str(local)]) == 1
+    assert remote_state_commit(origin) is None
+    assert not live_path(local).exists()  # no seed materialized behind the owner
+
+    assert run(["recover", "--repo", str(local)]) == 0
+    assert HISTORIC_ALERT in load_state(live_path(local))["alerts"]
+    joined = clone_of(local.parent, origin, "joined-after-base-recovery")
+    assert run(["sync", "--repo", str(joined)]) == 0
+    assert HISTORIC_ALERT in load_state(live_path(joined))["alerts"]
+
+
+def test_local_check_stops_before_the_watcher_even_with_local_receipts(two_clones):
+    """The established clone is blocked at the wrapper too. Its own receipts say
+    nothing about what the other half delivered into the ref, so continuing
+    would re-send exactly the reminder the cloud already sent."""
+    origin, local, _ = two_clones
+    deliver(local, HISTORIC_ALERT, "attempt-historic")
+    synchronize(local)
+    delete_state_ref(origin)
+
+    script = install_local_check(local)
+    env = os.environ.copy()
+    env.update({"PYTHONPATH": str(ROOT), "REAL_PYTHON": sys.executable})
+    fired = subprocess.run(
+        ["/bin/bash", str(script)],
+        cwd=local,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert fired.returncode == BOOTSTRAP_REQUIRED_EXIT
+    assert not (local / "watcher-invocations").exists()
+    assert HISTORIC_ALERT in load_state(live_path(local))["alerts"]
+    # The owner still learns about it: one durable marker, delivered as a loud
+    # alert by the first pass that runs after recovery.
+    assert load_failure(local / DEFAULT_MARKER_PATH) is not None

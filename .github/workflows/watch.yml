@@ -70,11 +70,11 @@ jobs:
           echo "with_news=$WITH_NEWS" >> "$GITHUB_OUTPUT"
 
       # A transient transport failure keeps the last validated local copy and the
-      # pass continues, as before. Exit 3 is different: it means the shared state
-      # ref is confirmed absent and this runner has no verified delivery history
-      # (state_sync.BOOTSTRAP_REQUIRED_EXIT — a test pins the number). Creating
-      # that ref is an explicit operator action, so the guard below stops the job
-      # rather than let it deliver historical alerts from the tracked seed.
+      # pass continues, as before. Exit 3 is different: the shared state ref is
+      # confirmed absent (state_sync.BOOTSTRAP_REQUIRED_EXIT — a test pins the
+      # number), so no snapshot here can show a receipt that lived only in that
+      # ref. Creating it back is an explicit operator action, and the guard below
+      # stops the job rather than let it re-send history it cannot see.
       - name: Synchronize runtime state (before)
         id: presync
         continue-on-error: true
@@ -88,7 +88,7 @@ jobs:
       - name: Require explicit state initialization
         if: ${{ steps.presync.outputs.code == '3' }}
         run: |
-          echo "::error::shared runtime-state ref is missing with no verified local history; run 'python -m watcher.state_sync init' (new install) or 'recover' (existing one)"
+          echo "::error::shared runtime-state ref is missing; no send may happen until 'python -m watcher.state_sync init' (new install) or 'recover' (existing one) runs"
           exit 1
 
       - name: Run watcher (${{ steps.mode.outputs.mode }})
