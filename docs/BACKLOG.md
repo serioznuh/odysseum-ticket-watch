@@ -5,11 +5,13 @@
 sketch, file paths, done-when). IDs are never renumbered or reused; new items get the
 next free number in whichever section fits. Completion is tracked **only** in the Done
 column of the index table below.
+An explicitly superseded item is closed with `[x]` and its replacement named;
+parked or deferred items stay unchecked and state their restart condition.
 
 Priorities: **P0** broken/urgent · **P1** high value · **P2** nice to have · **P3** someday.
 Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 
-## Index (sorted by priority)
+## Index (stable ID order)
 
 | ID | Title | Priority | Effort | Section | Done |
 |----|-------|----------|--------|---------|------|
@@ -24,7 +26,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-09 | Supervision is one-directional — nothing watches the cloud half | P2 | M | Features | [x] |
 | OTW-10 | Cinesa VPN 403 repeatedly launches headed Chrome | P1 | S | Bugs | [x] |
 | OTW-11 | Make Cinesa Chrome refresh normally imperceptible | P2 | S | UX & design | [x] |
-| OTW-12 | `reminders_cover` can over-promise on two same-pass events | P3 | S | Bugs | [ ] |
+| OTW-12 | Keep reminder promises aligned with current observations | P3 | S | Bugs | [ ] |
 | OTW-13 | A persistent per-listing Pathé failure is reported as healthy | P2 | S | Bugs | [x] |
 | OTW-14 | An aborted state rebase can wedge the push until a human intervenes | P3 | S | Bugs | [x] |
 | OTW-15 | Reminders ride a cloud cron that fires ~11% of its schedule | P0 | M | Bugs | [x] |
@@ -34,31 +36,35 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-19 | Split orchestration into bounded jobs | P2 | M | Infra, tooling & docs | [x] |
 | OTW-20 | Persist a notification outbox and delivery receipts | P1 | L | Infra, tooling & docs | [x] |
 | OTW-21 | Separate deployment from runtime-state synchronization | P1 | L | Infra, tooling & docs | [x] |
-| OTW-22 | Move the local owner to an always-on residential host | P2 | L | Infra, tooling & docs | [ ] |
-| OTW-23 | An uncaught save_state failure after delivery can re-send alerts | P2 | S | Bugs | [ ] |
-| OTW-24 | Harden Cinesa leak tracking against a builder exception, and always persist state in CI | P3 | S | Bugs | [ ] |
-| OTW-25 | Exercise OTW-14's rebase recovery against a real git rebase, not just a fake-Git test double | P3 | S | Infra, tooling & docs | [ ] |
-| OTW-26 | Bound the runtime-state git ref's unbounded history growth | P3 | S | Infra, tooling & docs | [ ] |
+| OTW-22 | Move the local owner to an always-on residential host (parked) | P2 | L | Infra, tooling & docs | [ ] |
+| OTW-23 | Validate source timestamps and handle final state-save failures | P2 | S | Bugs | [ ] |
+| OTW-24 | Guarantee Cinesa leak tracking when outcome-building raises | P3 | S | Bugs | [ ] |
+| OTW-25 | Test legacy rebase recovery (superseded by OTW-21) | P3 | S | Infra, tooling & docs | [x] |
+| OTW-26 | Bound runtime-state history fetched by ephemeral runners | P3 | M | Infra, tooling & docs | [ ] |
 | OTW-27 | Cloud supervision trusts an unstable one-row Actions response and false-alerts | P0 | S | Bugs | [x] |
 
-## Architecture implementation sequence
+## Recommended next work (reviewed 2026-09-21)
 
-1. **OTW-18** — validate state before changing how it is stored or delivered.
-2. **OTW-13** — expose partial Pathé failures and preserve evidence quality.
-3. **OTW-19** — extract jobs and protect reminders from slow polling.
-4. **OTW-21 + OTW-14** — separate synchronization from deployment and resolve
-   conflicts without losing delivery history. Design the OTW-20 delivery
-   ownership contract here; implement it with the outbox in the next step.
-5. **OTW-20** — persist pending notifications and confirmed delivery receipts.
-6. **OTW-08** — add cloud news coverage using the shared delivery contract.
-7. **OTW-09** — add reverse supervision of the cloud half.
-8. **OTW-22** — migrate to an approved always-on home host. This can move
-   earlier once OTW-18, OTW-21 and OTW-09 are ready and a host is available.
+The next phase is stabilization of the implemented architecture. The index
+above is the completion record; estimates below include implementation and
+verification, and dependencies listed on completed items are historical.
 
-Remaining independent work: **OTW-12**, **OTW-17**, then **OTW-01**;
-**OTW-04** becomes useful when Cinesa is enabled again. These are not
-dependencies of the architecture sequence. New items remain unchecked until
-their individual acceptance criteria are met.
+| Order | ID | Work and reason for this position | Effort estimate |
+| --- | --- | --- | --- |
+| 1 | OTW-23 | Reject malformed source timestamps early and report final save failures cleanly; finish the state boundary first. | S · 3–4 h |
+| 2 | OTW-12 | Make reminder wording agree with the effective ladder after fresh observations; a false promise is reproducible. | S · 3–4 h |
+| 3 | OTW-17 | Clarify merged new/moved sale announcements; a small, visible improvement to alert precision. | S · 2–4 h |
+| 4 | OTW-26 | Bound CI's state-history download before its cost grows further; verify shallow-fetch and push races with real Git. | M · about 1 day |
+| 5 | OTW-01 | Add documentation checks after the backlog descriptions and statuses are current. | S · 2–4 h |
+| 6 | OTW-24 | Finish Cinesa's exceptional cleanup bookkeeping; low urgency while Cinesa is disabled, but complete before future use. | S · 2–3 h |
+
+**Deferred:** OTW-04 becomes useful when Cinesa is enabled for an active watch
+again (S · 3–4 h). **Parked by owner:** OTW-22 has no available host beyond the
+current MacBook; revisit only when another approved host exists and re-estimate
+then. It is not a dependency of any item in the active queue.
+
+**Closed as superseded:** OTW-25's legacy rebase path no longer exists; OTW-21
+already covers the replacement synchronization mechanism with real-Git tests.
 
 ## 1. Critical — security & breakage
 
@@ -391,6 +397,8 @@ has been verified.
 
 ### OTW-04 · Cinesa alert: include session times + booking link
 **Priority:** P2 · **Effort:** S
+**Scheduling:** deferred while Cinesa is disabled; revisit when enabling it
+for an active watch (current estimate: 3–4 h including verification).
 **Problem:** The 🎫 "watched date opened in IMAX" alert
 (`detect.analyze_cinesa`) says the date is bookable and links to the film page,
 but not *which* IMAX sessions exist or their times — for a popular film the
@@ -535,31 +543,30 @@ or exceeding a budget makes `python -m pytest -q` fail.
 and update AGENTS.md + docs/verification.md commands.
 **Done when:** `ruff check .` passes locally and in CI, and the docs mention it.
 
-### OTW-12 · `reminders_cover` can over-promise on two same-pass events
+### OTW-12 · Keep reminder promises aligned with current observations
 **Priority:** P3 · **Effort:** S
-**Problem:** `detect.reminders_cover()` gates the "Reminders set: …" line on the
-opening being the earliest future one and tickets not yet bookable. It agrees
-with `due_reminders` in every ordinary case (verified by differential test over
-five scenarios), but has two narrow disagreements, both needing two independent
-Pathé events inside a single poll:
-1. It reads `state["tickets_available"]`, which `analyze_pathe` sees one run
-   stale — `update_from_snapshot` sets it afterwards. If one listing's sessions
-   become bookable in the *same* pass that another first announces a future
-   opening, the claim is made and the ladder is then switched off.
-2. It derives "earliest future opening" from `snap.matched_shows`, while
-   `update_from_snapshot` derives `sale_target` from `state["sales"]`, which
-   never prunes slugs that left the catalogue. If a previously-seen listing
-   with an earlier opening disappears from `/shows` while a later opening is
-   announced in the same pass, the claim is made while the ladder still targets
-   the vanished listing.
-Both self-correct from the next pass on, and both are strictly narrower than
-the unconditional promise they replaced (2026-09-02 review, PR #11).
-**Fix:** Union the snapshot's openings with `state["sales"]` inside
-`reminders_cover`, and take `tickets_available` from the snapshot being analysed
-rather than from state.
-**Done when:** the differential test in `tests/test_detect.py` is extended with
-both same-pass scenarios and `reminders_cover` agrees with `due_reminders` in
-each.
+**Problem:** `detect.reminders_cover()` reads delivered format evidence from
+the state before the current snapshot advances it. On 2026-09-21 a synthetic
+snapshot with a future opening and newly bookable IMAX 70mm reproduced a
+"Reminders set" promise followed by an empty reminder ladder after the
+observation was applied. The wording and effective scheduler policy disagree.
+**Scope update:** the original second scenario — a withdrawn listing retained
+in `state["sales"]` pinning the ladder — is already fixed by OTW-20:
+`update_from_snapshot` derives `sale_target` from current observations and
+preserves an older target only when evidence is incomplete. Do not apply the
+old suggestion to union historical `sales` back into the target calculation.
+**Fix sketch:** derive the promise and effective ladder from the same
+selected-format, post-observation policy. Preserve delivered-baseline gates
+and distinguish complete observations from degraded/unknown evidence; a
+failed fetch must not invent either availability or withdrawal. Keep existing
+dedup keys, reminder offsets and local/cloud grace semantics.
+**Files:** `watcher/detect.py`, `watcher/state.py`, `watcher/jobs.py` if needed,
+`tests/test_detect.py`, `tests/test_state.py`, `tests/test_main.py`.
+**Done when:** differential tests cover same-pass selected-format booking,
+booking in another format, an authoritatively withdrawn earlier listing and
+incomplete observations that preserve an older target. Announcement wording
+agrees with the resulting reminder policy in each case; the already-fixed
+withdrawal behavior stays intact; ruff, pytest and an affected-flow dry-run pass.
 
 ### OTW-18 · Validate state and make recovery explicit
 **Priority:** P1 · **Effort:** M
@@ -681,6 +688,9 @@ the explicit-approval rules in `docs/verification.md`.
 
 ### OTW-22 · Move the local owner to an always-on residential host
 **Priority:** P2 · **Effort:** L
+**Scheduling:** parked by the owner on 2026-09-21. The current MacBook is the
+only available host. Resume only after another approved host becomes available;
+this item does not block the active queue. Re-estimate effort for that host.
 **Problem:** laptop sleep stops source checks and the local reminder owner.
 Cloud failover cannot fetch Pathé and its scheduled runs have measured long
 gaps. Refactoring the watcher cannot make a sleeping laptop perform checks.
@@ -696,8 +706,8 @@ procedure. Stop the old local owner, reconcile its final receipts, and then
 synchronize verified state before enabling delivery on the replacement, so
 there is never a second active local sender.
 Retain OTW-09's reverse supervision and update host-specific diagnostics.
-**Dependencies:** OTW-18, OTW-21 and OTW-09; may move earlier in the sequence
-when those are ready and an approved host exists. Purchasing hardware and
+**Dependencies:** OTW-18, OTW-21 and OTW-09; scheduling additionally requires
+another approved host. Purchasing hardware and
 changing production scheduling/cutover require the owner's explicit approval.
 **Files:** `scripts/`, deployment/configuration instructions in `README.md`,
 runtime ownership in `docs/current-state.md`, host-specific messages and tests
@@ -709,55 +719,58 @@ Cloud supervision observes the new owner, reverse supervision remains active,
 rollback is documented, and Cinesa's GUI step is verified if enabled. Ruff,
 pytest, source dry-runs and the approved operational checks pass.
 
-### OTW-23 · An uncaught save_state failure after delivery can re-send alerts
+### OTW-23 · Validate source timestamps and handle final state-save failures
 **Priority:** P2 · **Effort:** S
-**Problem:** OTW-18 made `load_state`/`migrate_state` fail closed with a clean
-diagnostic exit, but `__main__.run`'s call to `save_state` after delivery is
-not wrapped: a `StateError` there (for example from a malformed upstream
-timestamp reaching `_parse_timestamp`, which since OTW-18 requires a UTC
-offset) exits with a traceback and never persists the run's updated dedup
-memory. Alerts already sent in that run would then be re-sent on the next
-firing, because the delivery baseline never reached disk. No evidence today
-that Pathé emits such a timestamp (production has always been offset-aware),
-so this is hardening rather than an active bug.
-**Fix sketch:** catch `StateError` around the post-delivery `save_state` call
-in `watcher/__main__.py`, log it, and exit with an actionable diagnostic
-instead of an uncaught traceback. Consider also validating/dropping a
-malformed `salesOpeningDatetime` at ingestion in `watcher/state.py` so a bad
-upstream value cannot become fatal only after delivery.
-**Files:** `watcher/__main__.py`, `watcher/state.py`, `tests/test_main.py`.
-**Done when:** a test simulating a `StateError` from the post-delivery
-`save_state` call exits with a clear diagnostic (no traceback) and the run's
-already-sent alerts are not silently lost from the next diagnostic; ruff and
-pytest pass.
+**Problem:** `runner.execute` still calls the final `save_state` without
+handling validation or filesystem failures, so the CLI can end with an
+uncaught traceback. A synthetic `salesOpeningDatetime` without a UTC offset
+was accepted into observation state and rejected only on save during the
+2026-09-21 assessment. There is no evidence that production Pathé responses
+currently contain that value; this is hardening of an untrusted input boundary.
+**Scope update:** OTW-20 persists confirmed receipts immediately, so an ordinary
+failure of the final bookkeeping save no longer discards those receipts or
+automatically re-sends delivered alerts. Failed receipt writes already recover
+as `uncertain`; preserve that precision-first policy.
+**Fix sketch:** reject malformed or offset-free source timestamps before they
+enter persisted observations or delivery decisions. Treat the invalid value
+as unknown/degraded evidence, not proof that an opening was withdrawn. Handle
+expected final-save failures with an actionable diagnostic and non-zero exit;
+preserve the last validated file and never reset dedup state on failure.
+**Files:** `watcher/runner.py`, `watcher/state.py`, `watcher/detect.py` or the
+source boundary as needed, `watcher/__main__.py`, `tests/test_main.py`,
+`tests/test_state.py`, `tests/test_delivery.py`.
+**Done when:** tests cover malformed and offset-free source timestamps plus
+validation/filesystem failure at the final save. The CLI reports a clear error
+without an uncaught traceback, confirmed receipts remain recoverable, uncertain
+attempts are not automatically replayed, and rejecting a bad date cannot retire
+a valid existing reminder. Ruff, pytest and an affected-flow dry-run pass.
 
-### OTW-24 · Harden Cinesa leak tracking against a builder exception, and always persist state in CI
+### OTW-24 · Guarantee Cinesa leak tracking when outcome-building raises
 **Priority:** P3 · **Effort:** S
-**Problem:** Raised in dual review (Claude + Codex) of OTW-19's Cinesa
-Chrome-cleanup/leak-detection rework. Two narrow, non-blocking gaps:
-1. `jobs.run_cinesa_job` calls `track_profile_leak(ctx, out, now, budget)`
-   after the `try/except/else` that builds `CinesaOutcome`, not in a
-   `finally`. If `detect.analyze_cinesa` or `build_cinesa_error_finding` ever
-   raised, `_guard` would discard the whole outcome and the leak check for
-   that run would never happen — a latent bug needing another bug to trigger,
-   since both are pure builders over already-parsed data today.
-2. `.github/workflows/watch.yml`'s "Persist state" step has no `if: always()`.
-   A run that now legitimately exits 1 (a detected Cinesa leak, or any other
-   guarded job failure) still saves useful state locally but skips the commit
-   step, matching the old pre-OTW-19 behavior (an uncaught exception also
-   skipped it) rather than regressing — but `if: always()` would be strictly
-   better now that a failing run can carry state worth persisting.
-**Fix sketch:** move the `track_profile_leak` call into a `finally` (or an
-equivalent guarantee) around the Cinesa job body so leak reconciliation runs
-even if outcome-building itself raises; add `if: always()` to the "Persist
-state" step in `watch.yml` so a failing run's state still reaches origin.
-**Files:** `watcher/jobs.py`, `.github/workflows/watch.yml`, `tests/test_main.py`.
-**Done when:** a test simulating an exception from Cinesa outcome-building
-still records/clears the leak episode; the workflow persists state on a
-failing run; ruff and pytest pass.
+**Problem:** `jobs.run_cinesa_job` calls `track_profile_leak` after the
+`try/except/else` that builds `CinesaOutcome`. If `detect.analyze_cinesa` or an
+alert builder raises, `_guard` discards the outcome and that run skips leak
+reconciliation. This is a narrow exceptional path; Cinesa is currently disabled.
+**Already covered:** the second issue originally tracked here is fixed:
+`.github/workflows/watch.yml` runs "Synchronize runtime state (after)" with
+`always() && inputs.dry_run != true`. Preserve that behavior; no new CI
+persistence implementation is needed.
+**Fix sketch:** guarantee leak reconciliation even when outcome-building raises,
+using `finally` or an equivalent structure. Ensure the episode bookkeeping
+survives the runner discarding a failed outcome; merely updating a discarded
+result is insufficient. Continue surfacing the original job failure.
+**Files:** `watcher/jobs.py`, `watcher/runner.py` if needed, `tests/test_main.py`
+or `tests/test_budget.py`; retain existing workflow behavior.
+**Done when:** injected analysis and error-builder exceptions still record or
+clear the leak episode correctly, the run reports the job failure, and existing
+post-failure synchronization and dry-run behavior remain intact. Ruff, pytest
+and an affected-flow dry-run pass. Complete before future Cinesa use.
 
 ### OTW-25 · Exercise OTW-14's rebase recovery against a real git rebase, not just a fake-Git test double
 **Priority:** P3 · **Effort:** S
+**Disposition:** closed as superseded by OTW-21; removed from the active queue
+on 2026-09-21. The original scope below is historical and should not be
+implemented against a code path that no longer exists.
 **Problem:** Raised in dual review (Claude + Codex) of OTW-14's state-rebase
 recovery. `tests/test_state_merge.py`'s shell-boundary test exercises
 `scripts/local-check.sh`'s conflict-detection and merge-invocation logic
@@ -783,24 +796,29 @@ no longer has a rebase-recovery code path to test. `tests/test_sync_integration.
 conflicting receipts, failed pushes, overlapping invocations — against the
 new mechanism.
 
-### OTW-26 · Bound the runtime-state git ref's unbounded history growth
-**Priority:** P3 · **Effort:** S
+### OTW-26 · Bound runtime-state history fetched by ephemeral runners
+**Priority:** P3 · **Effort:** M
 **Problem:** Raised in dual review (Claude + Codex) of OTW-21. The dedicated
-`refs/heads/runtime-state` ref that carries live `state/state.json` (see
-`watcher/state_sync.py`) is fetched with no `--depth` bound and grows by one
-commit per successful sync — roughly 288/day at the 5-min local cadence, plus
-the 15-min cloud cadence. On the local Mac this is a slow, harmless creep; on
-a GitHub Actions runner (`actions/checkout`, ephemeral per run) it means every
-firing re-fetches the whole ref history from scratch, growing linearly over
-the life of the ref.
-**Fix sketch:** periodically compact the ref (e.g. force-push a fresh
-single-commit history once it exceeds a size/commit-count threshold, keeping
-the latest state), or fetch/push with a bounded shallow history where the
-underlying git plumbing allows it. Preserve the compare-and-swap push
-semantics `watcher/state_sync.py` relies on across a compaction.
-**Files:** `watcher/state_sync.py`, `.github/workflows/watch.yml`.
-**Done when:** the runtime-state ref's history no longer grows unbounded
-(either compacted periodically or fetched with a bounded depth), a fresh
-GitHub Actions checkout's fetch of that ref does not scale with the ref's
-total lifetime, and no confirmed receipt is lost across a compaction; ruff
-and pytest pass.
+`refs/heads/runtime-state` ref carries `state.json`, synchronized locally to
+`.cache/state-sync/state.json`. `watcher/state_sync.py` fetches it without a
+depth bound, so each fresh Actions checkout downloads its entire growing
+history. A changed merged payload creates another commit; unchanged syncs do
+not. Download cost therefore grows with state history over the ref's lifetime.
+**Scope clarification:** bound history transferred to ephemeral runners.
+Shallow fetch does not prune history retained on the remote; remote retention
+is a separate concern. The previous force-push compaction sketch conflicts
+with the repository's preserve-pushed-history rule and is not the default fix.
+**Fix sketch:** fetch only a bounded recent history for the state ref while
+preserving normal fast-forward pushes, race/retry behavior and the local
+`base.json` used for three-way reconciliation. Keep code-branch deployment
+independent. Verify the chosen shallow strategy with real temporary Git
+repositories, including repeated fetches and a competing push.
+**Reference:** [Git fetch depth documentation](https://git-scm.com/docs/git-fetch).
+**Files:** `watcher/state_sync.py`, `.github/workflows/watch.yml` if needed,
+`tests/test_sync_integration.py` and relevant state-sync tests.
+**Done when:** with a fixed current snapshot size, a fresh runner downloads a
+bounded number of state-history commits regardless of the ref's age. Tests
+cover a shallow initial fetch, later syncs, rejected concurrent pushes and
+retry without losing confirmed receipts. Remote history is preserved, code
+deployment remains independent, and ruff, pytest and an affected-flow dry-run
+pass. Estimate: about one day including Git integration verification.
