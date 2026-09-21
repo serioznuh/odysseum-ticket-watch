@@ -21,4 +21,6 @@ NOTES: none
 
 ## Outcome
 <!-- cross-review-merge-state: APPROVED -->
-Approved after 2 rounds; eligible for merge pending GitHub confirmation. Done-when: met — both anonymous-response fixtures stay silent while a recent success exists, alternating old rows during an outage give one episode alert, confirmed recovery re-arms, API uncertainty stays silent, ruff and pytest pass.
+Approved after 2 rounds; eligible for merge pending GitHub confirmation.
+Done-when: met
+Evidence: both anonymous-response fixtures stay silent while a recent success exists, alternating old rows during an outage give one episode alert, confirmed recovery re-arms, API uncertainty stays silent, ruff and pytest pass.
