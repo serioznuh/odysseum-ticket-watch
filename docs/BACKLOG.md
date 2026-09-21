@@ -42,6 +42,9 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-25 | Test legacy rebase recovery (superseded by OTW-21) | P3 | S | Infra, tooling & docs | [x] |
 | OTW-26 | Bound runtime-state history fetched by ephemeral runners | P3 | M | Infra, tooling & docs | [ ] |
 | OTW-27 | Cloud supervision trusts an unstable one-row Actions response and false-alerts | P0 | S | Bugs | [x] |
+| OTW-28 | Coordinate Mac/cloud delivery before sending shared notifications | P1 | L | Infra, tooling & docs | [ ] |
+| OTW-29 | Bound Git operations and the local run's lifetime | P1 | M | Infra, tooling & docs | [ ] |
+| OTW-30 | Require explicit bootstrap when the shared runtime-state ref is missing | P2 | M | Infra, tooling & docs | [ ] |
 
 ## Recommended next work (reviewed 2026-09-21)
 
@@ -52,11 +55,19 @@ verification, and dependencies listed on completed items are historical.
 | Order | ID | Work and reason for this position | Effort estimate |
 | --- | --- | --- | --- |
 | 1 | OTW-23 | Reject malformed source timestamps early and report final save failures cleanly; finish the state boundary first. | S · 3–4 h |
-| 2 | OTW-12 | Make reminder wording agree with the effective ladder after fresh observations; a false promise is reproducible. | S · 3–4 h |
-| 3 | OTW-17 | Clarify merged new/moved sale announcements; a small, visible improvement to alert precision. | S · 2–4 h |
-| 4 | OTW-26 | Bound CI's state-history download before its cost grows further; verify shallow-fetch and push races with real Git. | M · about 1 day |
-| 5 | OTW-01 | Add documentation checks after the backlog descriptions and statuses are current. | S · 2–4 h |
-| 6 | OTW-24 | Finish Cinesa's exceptional cleanup bookkeeping; low urgency while Cinesa is disabled, but complete before future use. | S · 2–3 h |
+| 2 | OTW-30 | Stop an absent state ref from silently restoring stale dedup history; establish trusted startup state before delivery coordination. | M · about 1 day |
+| 3 | OTW-29 | Bound Git waits and release the local lock safely after a hung run; coordination must not introduce another indefinite wait. | M · about 1 day |
+| 4 | OTW-28 | Prevent Mac/cloud overlap from sending the same finding twice, using the trusted startup and bounded transport above. | L · 2–3 days |
+| 5 | OTW-12 | Make reminder wording agree with the effective ladder after fresh observations; a false promise is reproducible. | S · 3–4 h |
+| 6 | OTW-17 | Clarify merged new/moved sale announcements; a small, visible improvement to alert precision. | S · 2–4 h |
+| 7 | OTW-26 | Bound CI's state-history download before its cost grows further; preserve the delivery coordination contract during fetch optimization. | M · about 1 day |
+| 8 | OTW-01 | Add documentation checks after the backlog descriptions and statuses are current. | S · 2–4 h |
+| 9 | OTW-24 | Finish Cinesa's exceptional cleanup bookkeeping; low urgency while Cinesa is disabled, but complete before future use. | S · 2–3 h |
+
+OTW-28 tracks the remaining delivery race accepted in OTW-20/OTW-21 and made
+visible by OTW-08. OTW-29 and OTW-30 promote two accepted OTW-21 operational
+risks into explicit work; isolated checks reproduced both on 2026-09-21, without
+changing production state. They do not depend on an additional host or OTW-22.
 
 **Deferred:** OTW-04 becomes useful when Cinesa is enabled for an active watch
 again (S · 3–4 h). **Parked by owner:** OTW-22 has no available host beyond the
@@ -650,6 +661,8 @@ partial merged-group failure and overlapping local/cloud attempts. Confirmed
 receipts survive restart and synchronization; superseded work is retired
 without changing historical keys; undelivered baselines stay eligible. The
 remaining uncertainty policy is explicit. Ruff, pytest and a dry-run pass.
+**Follow-up:** OTW-28 owns prevention of concurrent Mac/cloud sends; this
+completed item preserves receipts and documents the race but does not close it.
 
 ### OTW-21 · Separate deployment from runtime-state synchronization
 **Priority:** P1 · **Effort:** L
@@ -685,6 +698,8 @@ independent of a clean runtime-state worktree. Tests document the remaining
 send race and OTW-20's coordination contract without promising exactly-once
 delivery. Ruff, pytest and dry-runs pass; live scheduling/deploy checks follow
 the explicit-approval rules in `docs/verification.md`.
+**Follow-ups:** OTW-28 adds delivery coordination, OTW-29 bounds transport and
+local-run lifetime, and OTW-30 makes missing-ref bootstrap explicit.
 
 ### OTW-22 · Move the local owner to an always-on residential host
 **Priority:** P2 · **Effort:** L
@@ -822,3 +837,126 @@ cover a shallow initial fetch, later syncs, rejected concurrent pushes and
 retry without losing confirmed receipts. Remote history is preserved, code
 deployment remains independent, and ruff, pytest and an affected-flow dry-run
 pass. Estimate: about one day including Git integration verification.
+
+### OTW-28 · Coordinate Mac/cloud delivery before sending shared notifications
+**Priority:** P1 · **Effort:** L (2–3 days including fault-injection tests)
+**Problem:** the Mac and cloud can read the same unsent finding before either
+publishes its receipt. `delivery._attempt` persists a claim only to that host's
+local JSON; the other host can independently send the same message. Merging
+receipts afterward preserves history but cannot undo the duplicate. This is
+explicitly reproduced by
+`test_overlapping_hosts_preserve_both_attempt_receipts_without_exactly_once_claim`
+in `tests/test_delivery.py` and is a documented limitation of completed
+OTW-20/OTW-21, exercised by OTW-08's two news readers.
+**Fix sketch:** establish authoritative permission to send before Telegram is
+called. Prefer the existing shared-state transport if an atomic reservation
+can satisfy the contract; ordinary three-way merging of local claims or a
+time delay alone is insufficient. Arbitrate on logical member keys and their
+existing episode identities, not only the merged message's ID: hosts may
+group the same finding differently. A losing or unconfirmed reservation must
+not send; keep definitely-unsent work pending without advancing its baseline.
+Cover fresh findings and outbox recovery on both hosts, including reminder
+failover when both hosts are eligible. Preserve cloud news while the Mac is
+asleep, the existing reminder grace, member-key acknowledgement, and the
+silent/loud policy. Bound coordination waits using OTW-29 and honor OTW-30's
+missing-state guard. Existing keys and confirmed receipts must survive rollout.
+Specify crash, failed-sync, wake-from-sleep and ownership-transfer behavior.
+A lease expiring does not prove its previous holder stopped or that Telegram
+rejected a request: prevent a resumed stale sender from racing a replacement,
+and quarantine ambiguous attempts rather than automatically taking them over.
+Keep the existing precision-first `uncertain` policy; do not promise exactly-once
+delivery across an ambiguous Telegram response. No extra host is required.
+**Dependencies:** OTW-20, OTW-21 and OTW-08 are complete. Implement OTW-29 and
+OTW-30 before enabling shared reservations; OTW-22 is not a dependency.
+**Files:** `watcher/delivery.py`, `watcher/state_sync.py`, `watcher/state.py`,
+`watcher/state_merge.py`, runner/jobs and startup wrappers as needed;
+`tests/test_delivery.py`, `tests/test_sync_integration.py`, reminder and news
+tests; owner doc `docs/current-state.md`.
+**Done when:** two independent temporary clones starting from the same state
+and racing before either receipt is published make at most one mocked Telegram
+call per logical notification, including differently grouped overlapping
+findings. Tests cover rejected/unknown claim pushes, failed pre-run sync,
+definite send failure, crashes before/after reservation and send, uncertain
+receipt writes, clock skew, Mac wake/resume, and a stale holder after attempted
+takeover. Known-unsent work remains safely retryable, ambiguous work stays
+quarantined, confirmed member receipts survive reconciliation, and independent
+news/reminder work still runs on the eligible host. Ruff, pytest and dry-runs
+pass; live sends or scheduling changes follow the existing approval rules.
+
+### OTW-29 · Bound Git operations and the local run's lifetime
+**Priority:** P1 · **Effort:** M (about 1 day)
+**Problem:** OTW-19 bounds source polling inside the watcher, but the local
+wrapper first runs `git pull` and state synchronization under a process lock.
+Neither `state_sync._git` nor the `locked` child wait has a timeout, and the
+shell's deployment pull is also unbounded. A live but hung Git child can stop
+the watcher before its first reminder check and hold the lock across later
+firings. Cloud supervision can eventually report the outage but cannot resume
+Pathé checks. The cloud job already has an eight-minute overall cap; this
+does not protect the local wrapper.
+**Evidence:** the 2026-09-21 isolated check used a stalled temporary Git shim:
+the first locked run stayed waiting and a second firing skipped as overlapping.
+The missing lifetime bound was previously accepted in the OTW-21 review.
+**Fix sketch:** add bounded network/process waits for code deployment and both
+state syncs, plus a documented overall local-run deadline and cleanup allowance.
+Use the existing Python stdlib boundary rather than requiring a platform-specific
+`timeout` binary. Preserve code-first deployment and the mandatory pre-run sync;
+on timeout follow the existing fallback and notification policy, subject to
+OTW-28's send-ownership rules and OTW-30's state-integrity guard. Classify Git
+transport timeouts as transport failures without a new noisy alert path.
+Terminate and reap only the invocation's owned process tree before releasing
+the overlap lock; never delete a lock file to let a second writer race a live
+first writer. Retain saved receipts and pending work when post-run sync stalls;
+an interrupted send must retain its conservative `uncertain` recovery behavior.
+**Dependencies:** OTW-19 and OTW-21 are complete. This supplies bounded waits
+for OTW-28; it does not require OTW-22 or a cadence change.
+**Files:** `scripts/local-check.sh`, `watcher/state_sync.py`,
+`tests/test_state_sync.py`, `tests/test_sync_integration.py`; owner doc
+`docs/current-state.md`.
+**Done when:** controlled hung children exercise deployment, pre/post-run sync
+and the overall watchdog. Each ends within the configured bound plus cleanup,
+returns an actionable non-zero result, leaves validated state and confirmed
+receipts intact, and allows the next firing to acquire the lock only after the
+old process tree has stopped. A transient timeout respects existing alert
+gating; healthy deployment, sync and reminder behavior remain intact. Ruff,
+pytest and an affected-flow dry-run pass on the supported Python/macOS setup.
+
+### OTW-30 · Require explicit bootstrap when the shared runtime-state ref is missing
+**Priority:** P2 · **Effort:** M (about 1 day)
+**Problem:** when `refs/heads/runtime-state` is absent and a fresh runner has no
+local live file, `state_sync.synchronize` silently loads the frozen tracked
+`state/state.json` seed and pushes a new state ref. It cannot distinguish a
+genuinely new installation from deletion of an established production ref.
+Receipts newer than the seed disappear from that runner's view, so historical
+alerts can become eligible again. OTW-18's explicit recovery requirement does
+not currently protect this OTW-21 bootstrap path.
+**Evidence:** a 2026-09-21 real-Git check in temporary repositories published
+a confirmed delivery, removed only the temporary remote state ref, and started
+a fresh clone. Normal sync succeeded and recreated the ref without that alert
+or delivery receipt. This is a reproduced recovery hazard, not evidence that
+production state has been lost.
+**Fix sketch:** normal scheduled synchronization must not silently create a
+missing shared ref from the seed. Require an explicit initialization operation
+for a genuinely new installation, separate from owner-approved recovery of an
+existing one. On confirmed ref absence, preserve local live/base files, report
+the condition, and prevent ordinary delivery from using an unverified seed;
+startup wrappers must honor this even where pre-run sync currently allows
+continuation after transport failure. Keep temporary transport failure and
+confirmed absence distinct. Recovery must reconcile available confirmed
+receipts and uncertain attempts from surviving stores before delivery resumes;
+never treat an older seed or backup as proof that an alert was not sent.
+Use normal history-preserving writes and leave an independently created remote
+ref intact if initialization/recovery races another host. Document the operator
+procedure without performing a production reset as part of implementation.
+**Dependencies:** OTW-18 and OTW-21 are complete. This guards the startup state
+used by OTW-28 and does not depend on OTW-22.
+**Files:** `watcher/state_sync.py`, `watcher/__main__.py` if needed,
+`scripts/local-check.sh`, `.github/workflows/watch.yml`,
+`tests/test_state_sync.py`, `tests/test_sync_integration.py`, startup tests;
+owner doc `README.md` for bootstrap/recovery instructions.
+**Done when:** a fresh clone facing a deleted state ref cannot silently reseed
+or send historical alerts; an existing clone preserves its live/base evidence.
+Explicit first-time initialization works, concurrent creation is safe, and a
+tested recovery preserves confirmed receipts and quarantined uncertainty before
+normal sends resume. Transport outages remain distinct and the existing safe
+fallback is preserved. Ruff, pytest and isolated dry-runs pass; production
+state edits remain subject to the existing explicit-approval rule.
