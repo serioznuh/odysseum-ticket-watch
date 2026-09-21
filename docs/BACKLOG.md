@@ -39,6 +39,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-24 | Harden Cinesa leak tracking against a builder exception, and always persist state in CI | P3 | S | Bugs | [ ] |
 | OTW-25 | Exercise OTW-14's rebase recovery against a real git rebase, not just a fake-Git test double | P3 | S | Infra, tooling & docs | [ ] |
 | OTW-26 | Bound the runtime-state git ref's unbounded history growth | P3 | S | Infra, tooling & docs | [ ] |
+| OTW-27 | Cloud supervision trusts an unstable one-row Actions response and false-alerts | P0 | S | Bugs | [ ] |
 
 ## Architecture implementation sequence
 
@@ -62,6 +63,36 @@ their individual acceptance criteria are met.
 ## 1. Critical — security & breakage
 
 ## 2. Bugs
+
+### OTW-27 · Cloud supervision trusts an unstable one-row Actions response and false-alerts
+**Priority:** P0 · **Effort:** S
+**Problem:** The first production firings after OTW-09 deployed on 2026-09-21
+sent two loud, false "Cloud checks have stopped" alerts six minutes apart.
+Actions was healthy: scheduled run `35569229823` had succeeded that morning.
+The exact anonymous request in `watcher/cloud.py` asks for
+`event=schedule&status=success&per_page=1`, then treats `workflow_runs[0]` as
+the newest success. GitHub's endpoint does not document that ordering, and the
+request returned inconsistent old rows: 2026-09-13 on the 10:16 local firing,
+then 2026-09-06 on the 10:22 firing; an authenticated listing and an anonymous
+ten-row listing both showed the current run. Each old timestamp also produced
+a fresh `cloud_stale:{last_success}` key, so dedup turned the changing bad
+evidence into repeated alerts rather than containing it. This violates the
+watcher's precision-first alert policy and can buzz every five minutes.
+**Fix sketch:** Do not infer an outage from the first row of an unordered
+response. Query a bounded `created` window covering the 18-hour health
+threshold, request enough rows for every possible scheduled firing in that
+window, validate each row, and treat any qualifying success as proof of
+health. If no recent success exists, obtain historical context separately or
+word the alert as a bounded absence rather than claiming an unverified exact
+"last" run. Key/dedup the outage episode independently of whichever historical
+candidate the API happens to return, and re-arm only after positive recovery.
+API errors, malformed/partial pages and contradictory results must fail quiet.
+**Files:** `watcher/cloud.py`, `watcher/jobs.py`, `watcher/alerts.py`,
+`tests/test_cloud_supervision.py`.
+**Done when:** fixtures reproducing both anonymous responses above cannot
+raise an alert while a recent scheduled success exists; alternating old rows
+during a real outage produce one alert for the episode; a confirmed recovery
+re-arms the next outage; API uncertainty stays silent; ruff and pytest pass.
 
 ### OTW-17 · A merged sale message mixing new and moved openings reads oddly
 **Priority:** P3 · **Effort:** S
