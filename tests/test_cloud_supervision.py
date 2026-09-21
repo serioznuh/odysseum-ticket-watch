@@ -531,13 +531,36 @@ def test_complete_empty_actions_page_is_authoritative_absence(monkeypatch):
     ) is False
 
 
+def test_partial_page_with_recent_success_is_healthy_and_rearms(monkeypatch):
+    ctx = _context()
+    delivered = _capture_delivery(monkeypatch, ctx)
+    state_mod.mark_sent(ctx.state, "cloud_stale:episode:1", NOW - timedelta(days=1))
+    body = {
+        "total_count": 2,
+        "workflow_runs": [
+            _api_run(2, "2026-09-20T08:10:00Z", "2026-09-20T08:15:00Z")
+        ],
+    }
+    monkeypatch.setattr(cloud.httpx, "get", lambda *args, **kwargs: _response(body))
+
+    assert jobs.run_cloud_supervision_job(ctx, NOW) == "healthy"
+    assert state_mod.already_sent(ctx.state, "cloud_recovered:episode:1")
+    assert delivered == []
+
+    monkeypatch.setattr(
+        cloud, "has_successful_scheduled_run", lambda *args, **kwargs: False
+    )
+    assert jobs.run_cloud_supervision_job(ctx, NOW + timedelta(days=1)) == "stale"
+    assert [finding.key for finding in delivered] == ["cloud_stale:episode:2"]
+
+
 @pytest.mark.parametrize(
     "body",
     [
         ValueError("not JSON"),
         {"workflow_runs": []},
         {"total_count": 2, "workflow_runs": [_api_run(
-            1, "2026-09-20T08:10:00Z", "2026-09-20T08:15:00Z"
+            1, "2026-09-19T15:50:00Z", "2026-09-19T15:55:00Z"
         )]},
         {"total_count": 1, "workflow_runs": [{"id": 1}]},
         {"total_count": 1, "workflow_runs": [_api_run(

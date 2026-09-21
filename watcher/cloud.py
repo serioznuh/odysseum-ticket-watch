@@ -107,10 +107,10 @@ def has_successful_scheduled_run(
         or isinstance(total_count, bool)
         or not isinstance(total_count, int)
         or total_count < 0
-        or total_count != len(runs)
-        or total_count > per_page
+        or total_count < len(runs)
+        or len(runs) > per_page
     ):
-        raise CloudStatusError("GitHub Actions API returned an incomplete run page")
+        raise CloudStatusError("GitHub Actions API returned an invalid run page")
 
     successful = False
     run_ids = set()
@@ -138,4 +138,8 @@ def has_successful_scheduled_run(
             raise CloudStatusError("GitHub Actions API returned a run outside the window")
         if completed >= since:
             successful = True
-    return successful
+    if successful:
+        return True
+    if total_count != len(runs) or total_count > per_page:
+        raise CloudStatusError("GitHub Actions API returned an incomplete run page")
+    return False
