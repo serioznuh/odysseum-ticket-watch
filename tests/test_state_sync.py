@@ -201,7 +201,10 @@ def test_missing_ref_with_local_receipts_marks_immediately(tmp_path, monkeypatch
     assert state_sync.run(["sync", "--repo", str(tmp_path)]) == 1
     marker = state_sync.load_failure(tmp_path / state_sync.DEFAULT_MARKER_PATH)
     assert marker is not None
-    assert "ref is missing" in marker["detail"]
+    # The alert quotes this detail verbatim and truncates at 200 characters, so
+    # the operator action has to survive that cut.
+    assert "is missing; run `watcher.state_sync recover`" in marker["detail"]
+    assert len(marker["detail"]) < 200
 
 
 def test_missing_ref_is_not_counted_as_a_transport_outage(tmp_path, monkeypatch):

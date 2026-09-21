@@ -723,8 +723,15 @@ def run(argv: list[str] | None = None) -> int:
                 clear_transport_failure(transport_streak)
                 if exc.local_evidence:
                     # Verified receipts survive locally, so the watcher may still
-                    # run; a durable marker turns this into one loud alert.
-                    record_failure(f"runtime state ref is missing: {exc}", marker)
+                    # run; a durable marker turns this into one loud alert. The
+                    # detail is capped at 200 characters, so it carries the action
+                    # rather than the full diagnostic, which goes to stderr below.
+                    record_failure(
+                        f"shared runtime-state ref {args.ref} is missing; run "
+                        "`watcher.state_sync recover` after reconciling every "
+                        "surviving store",
+                        marker,
+                    )
                     print(f"state synchronization blocked: {exc}", file=sys.stderr)
                     return 1
                 print(f"state synchronization blocked: {exc}", file=sys.stderr)
