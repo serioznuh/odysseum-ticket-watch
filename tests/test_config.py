@@ -52,6 +52,9 @@ def test_cloud_extra_pages_default_to_none(tmp_path):
     cfg = load_config(config)
 
     assert cfg.cloud_extra_pages == []
+    assert cfg.cloud_repository == ""
+    assert cfg.cloud_workflow == "watch.yml"
+    assert cfg.cloud_stale_hours == 0
 
 
 def test_shipped_config_silences_every_kind_the_code_treats_as_quiet():
@@ -67,6 +70,9 @@ def test_shipped_config_silences_every_kind_the_code_treats_as_quiet():
 
     missing = [k for k in notify.DEFAULT_SILENT_KINDS if k not in cfg.silent_kinds]
     assert cfg.cloud_extra_pages == []
+    assert cfg.cloud_repository == "serioznuh/odysseum-ticket-watch"
+    assert cfg.cloud_workflow == "watch.yml"
+    assert cfg.cloud_stale_hours == 18
     assert missing == [], (
         f"config.toml alerts.silent_kinds is missing {missing} — these kinds "
         "will notify loudly in production"

@@ -210,6 +210,30 @@ def render_reminder(
     )
 
 
+def check_telegram_credentials(cfg: Any) -> bool:
+    """Validate the cloud bot token and target chat without sending anything."""
+    if not (cfg.telegram_token and cfg.telegram_chat_id):
+        log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — cannot validate")
+        return False
+
+    base = f"https://api.telegram.org/bot{cfg.telegram_token}"
+    checks = (("getMe", {}), ("getChat", {"chat_id": cfg.telegram_chat_id}))
+    for method, payload in checks:
+        try:
+            response = httpx.post(f"{base}/{method}", json=payload, timeout=20.0)
+            response.raise_for_status()
+            body = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            detail = str(exc).replace(cfg.telegram_token, "***")
+            log.error("telegram credential check failed at %s: %s", method, detail)
+            return False
+        if not isinstance(body, dict) or body.get("ok") is not True:
+            log.error("telegram credential check returned not-ok at %s", method)
+            return False
+    log.info("telegram bot and target chat validated (no message sent)")
+    return True
+
+
 def send_telegram(
     cfg: Any, text: str, *, dry_run: bool, silent: bool = False
 ) -> SendResult:

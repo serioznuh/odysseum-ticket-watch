@@ -45,8 +45,8 @@ A single-user Telegram watcher covering **two independent targets**:
   still pauses checks. It gates neither the **Cinesa check** — one small call,
   not bot-gated — nor the **reminder ladder**, both of which run on every
   firing. This half *owns* the ladder: 5-min firings give three chances inside
-  a 15-min warning. Runs from a residential IP: Akamai blocks Pathé from
-  datacenter IPs, and Cloudflare challenges Cinesa from them.
+  a 15-min warning. It queries the public Actions API before outbox replay and
+  heartbeat; failures withhold “healthy”. Runs from a residential IP: Akamai blocks Pathé from datacenter IPs, and Cloudflare challenges Cinesa from them.
 - **Cloud half** — `.github/workflows/watch.yml` cron `*/15`: cloud-safe news,
   supervision, and reminders as a **failover** rather than their owner. It passes
   `--reminder-grace-minutes 25` (> the local 5-min interval), so it only sends
@@ -60,7 +60,7 @@ A single-user Telegram watcher covering **two independent targets**:
   2026-09-03 this cron fired 10.9% of its schedule (median gap 58 min, max 11.5
   h), which is why the ladder is no longer cloud-owned (OTW-15). Scheduled
   `remind --with-news` passes read Google News plus opted-in `cloud_extra_pages`;
-  they never call Pathé/Cinesa; failures cannot block reminders/supervision; plain `remind` is request-free.
+  they never call Pathé/Cinesa. Every run validates its bot/chat read-only after failover work, so a failed probe cannot cost a reminder and success proves credentials.
 - **Format-specific reminders** — standard tickets no longer cancel the IMAX
   ladder. Existing `formats_seen` provides the format evidence without manual
   state edits. The opening-time message says availability is unconfirmed and
@@ -71,8 +71,8 @@ A single-user Telegram watcher covering **two independent targets**:
   in the selected format, using the same rules as the date alerts. Other dates
   and formats cannot confirm those bookings. Only future national sale openings
   from live selected listings appear; old or withdrawn dates retained in dedup
-  state do not. The heartbeat links to the selected format's event page and
-  explicitly names any detail/showtimes calls that are currently degraded.
+  state do not. It links to the selected format's event page and names degraded
+  listing calls, but is withheld unless current cloud health is also proven.
 - **Shared state boundary** — live JSON is `.cache/state-sync/state.json`; Git
   transports it on `refs/heads/runtime-state`, separate from `main`. The tracked
   `state/state.json` is only the first-run seed. Both halves call
@@ -84,8 +84,8 @@ A single-user Telegram watcher covering **two independent targets**:
   Definite failures remain pending; a failed pre-send claim save rolls back to pending. A
   post-send timeout is `uncertain` and is not replayed automatically. Current observations
   stay independent: an uncertain sale alert cannot freeze its opening or reminder ladder.
-  Only complete, positive contradictory evidence retires a member. Per-member conditions and
-  expiries preserve unaffected merged siblings across supersession, acknowledgement and expiry.
+  Only complete, positive contradictory evidence retires a member. Cloud passes defer
+  cloud-health work; local proof retires recovered outage alerts and stale heartbeats.
   The next opening owns the ladder; booking retires old pings while recent openings keep war-room cadence.
   Overlapping local/cloud hosts can still send the same news finding: claims are not distributed locks.
 - **Pathé failure model** — catalogue failures still blind the check, while
@@ -163,7 +163,7 @@ A single-user Telegram watcher covering **two independent targets**:
 ## User workflow
 
 - Passive: alerts arrive on Telegram; quiet kinds (news leads, heartbeat,
-  recovery) are silent, time-critical ones buzz.
+  recovery) are silent, time-critical and first local/cloud outage alerts buzz.
 - Manual production-state runs: first `source .env && .venv/bin/python -m
   watcher.state_sync sync`; then run `.venv/bin/python -m watcher --state .cache/state-sync/state.json --mode check [--dry-run]` (`--test-telegram` smokes).
 - Deploying = pushing to `main`: the `~/.ticket-watch` clone pulls on its next

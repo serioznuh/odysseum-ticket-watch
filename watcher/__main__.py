@@ -33,6 +33,7 @@ from .alerts import (  # noqa: F401  (re-exported: the alert builders' public ho
     build_cinesa_error_finding,
     build_cinesa_leak_finding,
     build_cinesa_recovered_finding,
+    build_cloud_stale_finding,
     build_error_finding,
     build_heartbeat,
     build_recovered_finding,
@@ -97,6 +98,11 @@ def build_parser() -> argparse.ArgumentParser:
         " so it only sends what the local half missed",
     )
     parser.add_argument("--test-telegram", action="store_true", help="send a test message and exit")
+    parser.add_argument(
+        "--check-telegram",
+        action="store_true",
+        help="validate the Telegram bot and chat without sending a message",
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--version", action="version", version=__version__)
     return parser
@@ -139,6 +145,9 @@ def run(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
         )
         return 0 if ok else 1
+
+    if args.check_telegram:
+        return 0 if notify.check_telegram_credentials(cfg) else 1
 
     if not args.dry_run and not (cfg.telegram_token and cfg.telegram_chat_id):
         log.error(

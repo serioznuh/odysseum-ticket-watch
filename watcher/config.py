@@ -38,6 +38,10 @@ class Config:
     google_news_queries: list[str]
     extra_pages: list[str]
     cloud_extra_pages: list[str]
+    # [cloud]
+    cloud_repository: str
+    cloud_workflow: str
+    cloud_stale_hours: int
     # [alerts]
     heartbeat_days: int
     failure_streak_threshold: int
@@ -85,6 +89,7 @@ def load_config(path: str | Path) -> Config:
     cadence = raw.get("cadence", {})
     general = raw.get("general", {})
     cinesa = raw.get("cinesa", {})
+    cloud = raw.get("cloud", {})
 
     if "primary_slug" not in film:
         raise ValueError("config: [film] primary_slug is required")
@@ -148,6 +153,9 @@ def load_config(path: str | Path) -> Config:
         google_news_queries=list(news.get("google_news_queries", [])),
         extra_pages=list(news.get("extra_pages", [])),
         cloud_extra_pages=list(news.get("cloud_extra_pages", [])),
+        cloud_repository=str(cloud.get("repository", "")),
+        cloud_workflow=str(cloud.get("workflow", "watch.yml")),
+        cloud_stale_hours=int(cloud.get("stale_hours", 0)),
         heartbeat_days=int(alerts.get("heartbeat_days", 7)),
         failure_streak_threshold=int(alerts.get("failure_streak_threshold", 3)),
         stale_check_hours=int(alerts.get("stale_check_hours", 72)),

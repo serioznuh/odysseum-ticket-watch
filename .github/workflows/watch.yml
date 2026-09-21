@@ -98,6 +98,16 @@ jobs:
             python -m watcher --state .cache/state-sync/state.json --mode "${{ steps.mode.outputs.mode }}" --reminder-grace-minutes 25 ${{ steps.mode.outputs.with_news }} ${{ inputs.dry_run == true && '--dry-run' || '' }}
           fi
 
+      # A quiet watcher pass may make no Telegram call. Run this read-only
+      # probe after failover work so a transient Telegram/API failure cannot
+      # cost a due reminder; `always()` still makes a bad probe fail the run.
+      - name: Validate Telegram credentials (no message)
+        if: ${{ always() }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m watcher --state .cache/state-sync/state.json --check-telegram
+
       - name: Synchronize runtime state (after)
         if: ${{ always() && inputs.dry_run != true }}
         run: python -m watcher.state_sync sync

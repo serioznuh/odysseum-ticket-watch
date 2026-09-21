@@ -25,7 +25,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
-from . import alerts, cdp, cinesa, coalesce, delivery, detect, news, pathe, state_sync
+from . import (
+    alerts,
+    cdp,
+    cinesa,
+    cloud,
+    coalesce,
+    delivery,
+    detect,
+    news,
+    pathe,
+    state_sync,
+)
 from . import state as state_mod
 from .budget import Budget
 from .detect import Finding
@@ -441,6 +452,7 @@ def run_heartbeat_job(
     snap: detect.Snapshot | None,
     now: datetime,
     sent_any: bool,
+    cloud_health: str = "disabled",
 ) -> None:
     """The weekly all-quiet status, suppressed on any run that already spoke.
 
@@ -448,7 +460,7 @@ def run_heartbeat_job(
     stood in for the heartbeat and must not start doing so now that they are
     also computed before the check.
     """
-    if snap is None or sent_any:
+    if snap is None or sent_any or cloud_health in {"stale", "unknown"}:
         return
     if not alerts.heartbeat_due(ctx.state, now, ctx.cfg.heartbeat_days):
         return
@@ -488,9 +500,46 @@ def run_reminder_job(
     return sent
 
 
+def run_cloud_supervision_job(ctx: RunContext, now: datetime) -> str:
+    """Alert locally when successful scheduled cloud runs have gone stale.
+
+    The public API is evidence, not a watched source: an API failure or an
+    empty/invalid history cannot prove an outage and must stay quiet.
+    """
+    stale_hours = getattr(ctx.cfg, "cloud_stale_hours", 0)
+    repository = getattr(ctx.cfg, "cloud_repository", "")
+    workflow = getattr(ctx.cfg, "cloud_workflow", "")
+    if (
+        stale_hours <= 0
+        or not repository
+        or not workflow
+        or alerts.running_in_ci()
+    ):
+        return "disabled"
+    # This must happen even when the API call below fails: otherwise a pending
+    # pre-upgrade heartbeat has no condition for unknown-health recovery to block.
+    delivery.bind_cloud_health_conditions(ctx)
+    try:
+        last_success = cloud.latest_successful_scheduled_run(repository, workflow)
+    except cloud.CloudStatusError as exc:
+        log.warning("cloud supervision unavailable (no alert): %s", exc)
+        return "unknown"
+    if last_success is None:
+        log.warning("cloud supervision found no successful scheduled run (no alert)")
+        return "unknown"
+    if detect.as_aware(now) - last_success <= timedelta(hours=stale_hours):
+        delivery.reconcile_cloud_health(ctx, "healthy")
+        return "healthy"
+    delivery.reconcile_cloud_health(ctx, "stale")
+    finding = alerts.build_cloud_stale_finding(ctx.cfg, last_success, now)
+    if state_mod.already_sent(ctx.state, finding.key):
+        return "stale"
+    deliver(ctx, [finding], now)
+    return "stale"
+
+
 def run_supervision_job(ctx: RunContext, now: datetime) -> None:
-    """Alert when the Pathé check — running on another machine than this cloud
-    pass — stopped reporting."""
+    """Cloud-side dead-man's switch for the local catalogue pulse."""
     if ctx.adaptive_cadence:
         return
     if not state_mod.is_catalogue_check_stale(ctx.state, ctx.cfg.stale_check_hours, now):

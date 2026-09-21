@@ -12,14 +12,13 @@ The order *is* the contract (OTW-19):
    news job. Each polling job runs under an
    aggregate time budget, and each job here is guarded, so a job that is
    skipped, disabled or outright broken cannot take the rest of the pass with it.
-3. **Delivery** of this pass's findings (dedup, coalescing, durable outbox,
-   sending and immediate receipt persistence), then the baselines they gate.
-   Fresh findings get the first chance to supersede stale pending work before
-   safe pending records from an earlier run are recovered.
+3. **Delivery and observations**: current findings first, then the local pass's
+   reverse-cloud probe, then safe pending recovery and the heartbeat. Fresh or
+   contradictory evidence retires stale conditional work before it can replay.
 4. **Due reminders again**, recomputed against a fresh clock and the
    observations that just landed. `reminders_sent` is the dedup record, so a
    rung sent in step 1 cannot be sent twice.
-5. **Supervision**, then a final state save for non-delivery bookkeeping.
+5. **Cloud-side local supervision**, then the final bookkeeping save.
 
 Everything runs in this process, one job after another. There is exactly one
 writer to `ctx.state` per run — the guarantee the monolithic `run()` had
@@ -211,11 +210,30 @@ def execute(ctx: RunContext, state_path: str) -> int:
     if ctx.mode == "check":
         polling = ctx.budget(jobs.POLLING_BUDGET_SECONDS, "polling")
         sent_now, pathe_snapshot = _run_source_jobs(ctx, now, polling, failed)
+        # Reverse supervision is an observation, not final bookkeeping. Probe
+        # before recovery so a fresh cloud run retires a failed stale-cloud
+        # alert, and a stale result retires any pending "healthy" heartbeat.
+        cloud_health = _guard(
+            failed,
+            "cloud-supervision",
+            jobs.run_cloud_supervision_job,
+            ctx,
+            now,
+        )
+        cloud_health = cloud_health or "unknown"
         # Polling and delivery of the current observations deliberately happen
         # before recovery. Their topic policy can retire a failed message whose
         # opening or availability changed while it was pending; replaying first
         # would send stale advice and then its correction back-to-back.
-        recovered = _guard(failed, "outbox-recovery", delivery.recover, ctx, now)
+        blocked_conditions = {"cloud-health"} if cloud_health == "unknown" else set()
+        recovered = _guard(
+            failed,
+            "outbox-recovery",
+            delivery.recover,
+            ctx,
+            now,
+            blocked_condition_domains=blocked_conditions,
+        )
         _guard(
             failed,
             "heartbeat",
@@ -224,17 +242,18 @@ def execute(ctx: RunContext, state_path: str) -> int:
             pathe_snapshot,
             now,
             sent_now or bool(recovered),
+            cloud_health,
         )
     elif ctx.with_news:
         polling = ctx.budget(jobs.NEWS_BUDGET_SECONDS, "cloud news polling")
         _run_cloud_news_job(ctx, now, polling, failed)
         # As in check mode, current findings get the first chance to establish
         # their receipt before older safe pending work is replayed.
-        _guard(failed, "outbox-recovery", delivery.recover, ctx, now)
+        _guard(failed, "outbox-recovery", delivery.recover_cloud, ctx, now)
     else:
         # Remind-only runs have no source observations that could supersede the
         # queue, so safe pending work can be recovered immediately.
-        _guard(failed, "outbox-recovery", delivery.recover, ctx, now)
+        _guard(failed, "outbox-recovery", delivery.recover_cloud, ctx, now)
 
     # Read the clock AGAIN. Polling is budgeted but still not free, and a run
     # that started at T-16 and reaches this line at T+5 must send the "sale is

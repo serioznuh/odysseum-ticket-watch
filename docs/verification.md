@@ -13,6 +13,16 @@ Use for docs, tests, or local logic changes:
 
 Expected current result: Ruff reports no errors and all collected tests pass.
 
+For reverse cloud supervision and its read-only Telegram probe:
+
+```bash
+.venv/bin/python -m pytest -q tests/test_cloud_supervision.py tests/test_delivery.py tests/test_heartbeat.py tests/test_main.py tests/test_notify.py tests/test_config.py
+```
+
+These mocked tests cover stale, fresh/idle, API-failure, both cloud recovery branches,
+heartbeat/outbox ordering and dedup without calling GitHub or Telegram. A real `--check-telegram` validates credentials but
+sends no message; testing the edited Actions workflow still needs approval below.
+
 ## Watcher behavior check
 
 Use when detection, news filtering, alert text, or cadence logic changes:
@@ -59,7 +69,8 @@ source .env && .venv/bin/python -m watcher --test-telegram
   `~/.ticket-watch`, then `launchctl kickstart gui/$(id -u)/com.odysseum.ticket-watch`
   and check `logs/`.
 - **Actions** (`watch.yml` changes): Actions → *ticket-watch* → Run workflow with
-  mode `test` (Telegram hello) or `remind` + dry-run.
+  mode `test` (Telegram hello) or `remind` + dry-run; confirm the credential-check
+  step succeeds after the watcher step.
 - **State file edits** (live state at `.cache/state-sync/state.json`, or the
   tracked seed at `state/state.json`): approval required — wrong edits either
   re-send every past alert or silence future ones.
