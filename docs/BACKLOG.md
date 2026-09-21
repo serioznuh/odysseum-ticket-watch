@@ -39,7 +39,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-24 | Harden Cinesa leak tracking against a builder exception, and always persist state in CI | P3 | S | Bugs | [ ] |
 | OTW-25 | Exercise OTW-14's rebase recovery against a real git rebase, not just a fake-Git test double | P3 | S | Infra, tooling & docs | [ ] |
 | OTW-26 | Bound the runtime-state git ref's unbounded history growth | P3 | S | Infra, tooling & docs | [ ] |
-| OTW-27 | Cloud supervision trusts an unstable one-row Actions response and false-alerts | P0 | S | Bugs | [ ] |
+| OTW-27 | Cloud supervision trusts an unstable one-row Actions response and false-alerts | P0 | S | Bugs | [x] |
 
 ## Architecture implementation sequence
 
