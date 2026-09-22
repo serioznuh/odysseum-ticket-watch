@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import signal
 import subprocess
 from copy import deepcopy
 from datetime import datetime
@@ -450,3 +451,37 @@ def test_local_check_bounds_the_deployment_pull_and_the_whole_firing():
     # The pull runs through the stdlib boundary, and deployment still comes first.
     assert "state_sync bounded" in "".join(lines[pull - 1 : pull + 1])
     assert locked < pull < pre_sync
+
+
+def test_termination_stays_forwarded_while_the_tree_is_cleaned_up():
+    """A signal arriving during timeout cleanup must still be forwarded to the
+    owned tree. If the handlers were uninstalled before cleanup, that signal
+    would end this supervisor while part of its tree could still be running."""
+    original = signal.getsignal(signal.SIGTERM)
+    observed = {}
+    real_stop_tree = state_sync._stop_tree
+
+    def watch_cleanup(process, *, grace):
+        observed["during"] = signal.getsignal(signal.SIGTERM)
+        return real_stop_tree(process, grace=grace)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(state_sync, "_stop_tree", watch_cleanup)
+        _, timed_out = state_sync._run_bounded(
+            ["/bin/sh", "-c", "sleep 30 & wait"],
+            timeout=0.2,
+            cleanup_grace=1.0,
+            capture=False,
+        )
+
+    assert timed_out is True
+    assert callable(observed["during"]) and observed["during"] is not original
+    # …and the supervisor hands the signals back once no child of its own is left.
+    assert signal.getsignal(signal.SIGTERM) is original
+
+
+def test_a_git_tree_is_cleaned_up_inside_its_supervisors_allowance():
+    """A sync stopped by the overall deadline has to finish stopping its own Git
+    child before the supervisor above it escalates to SIGKILL, which that Git
+    child would otherwise outlive."""
+    assert state_sync.GIT_CLEANUP_GRACE_SECONDS < state_sync.CLEANUP_GRACE_SECONDS

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -1065,3 +1066,60 @@ def test_failed_deployment_still_runs_the_watcher_on_installed_code(two_clones):
     # The watcher ran anyway, on the installed code, with the last validated state.
     assert (local / "watcher-invocations").exists()
     assert HISTORIC_ALERT not in load_state(live_path(local))["alerts"]
+
+
+def test_a_signal_mid_git_call_stops_the_git_tree_before_the_lock_is_free(
+    tmp_path, two_clones
+):
+    """The hole a separate session opens: the locked firing's group kill reaches
+    the state sync, but not the Git child *it* started in a session of its own.
+    Every supervisor in the chain has to hand the stop down, so by the time the
+    lock can be seen as free no Git process of that firing is still running."""
+    _, local, _ = two_clones
+    synchronize(local)
+    shim, pids_file = hung_git(tmp_path / "hung-signal", "ls-remote", "fetch")
+    lock = tmp_path / "local-check.lock"
+    env = child_env()
+    env["PATH"] = f"{shim.parent}{os.pathsep}{env['PATH']}"
+    # `exec` so the state sync itself is the supervised child: a signal to the
+    # locked supervisor reaches it, and only its own forwarding reaches Git.
+    sync_command = (
+        f'exec "{sys.executable}" -m watcher.state_sync sync'
+        f' --repo "{local}" --store "{local}/{DEFAULT_STORE_PATH}"'
+    )
+    firing = subprocess.Popen(
+        supervisor(
+            "locked",
+            "--lock",
+            str(lock),
+            "--cleanup-grace",
+            str(GRACE),
+            "--",
+            "/bin/sh",
+            "-c",
+            sync_command,
+        ),
+        cwd=ROOT,
+        env=env,
+    )
+    hung = hung_pids(pids_file)  # Git and its helper are running
+
+    os.kill(firing.pid, signal.SIGTERM)
+    assert firing.wait(timeout=PATIENCE) != 0
+
+    # No tolerance here on purpose: the supervisor may only exit — which is the
+    # moment the lock becomes observable — after the whole tree has stopped.
+    assert [pid for pid in hung if is_alive(pid)] == []
+    assert lock.exists()  # released, never deleted
+    followed = subprocess.run(
+        supervisor("locked", "--lock", str(lock), "--", "/bin/echo", "next firing"),
+        cwd=ROOT,
+        env=child_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert followed.returncode == 0
+    assert "already running" not in followed.stderr
+    # The interrupted sync wrote nothing new and left the validated copy in place.
+    assert load_state(live_path(local)) == load_state(local / DEFAULT_STORE_PATH / "base.json")

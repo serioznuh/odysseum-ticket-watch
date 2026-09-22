@@ -63,6 +63,11 @@ BOOTSTRAP_REQUIRED_EXIT = 3
 # long, network round trips included; a wedged fetch or push is the case that
 # matters and it is reported as a transport failure, never as a new alert path.
 GIT_TIMEOUT_SECONDS = 45.0
+# Cleanup allowance for one Git tree. Deliberately shorter than the supervisor's
+# below: a sync stopped by the overall deadline (or by launchd) has to finish
+# stopping its Git child inside the window before that supervisor escalates to
+# SIGKILL, which would otherwise strand the Git child it can no longer reach.
+GIT_CLEANUP_GRACE_SECONDS = 3.0
 # The wrapper's deployment pull, which can legitimately transfer more than a
 # state blob.  Deployment stays first: exceeding this is a failed deployment, so
 # the firing continues on the installed code exactly as before.
@@ -129,7 +134,14 @@ def _resolve_under(repo: Path, path: str | Path) -> Path:
 
 
 def _signal_group(pid: int, signum: int) -> bool:
-    """Signal one process group, reporting whether anything was still in it."""
+    """Signal one process group, reporting whether anything signalable is left.
+
+    The supervised child leads its own session, so ``pid`` is also its process
+    group id and that group is exactly the tree this invocation owns.  EPERM
+    counts as gone alongside ESRCH: a group whose only remaining member is the
+    unreaped child reports EPERM, while one live member still answers 0
+    (measured on macOS), so nothing still running is ever read as stopped.
+    """
     try:
         os.killpg(pid, signum)
     except (ProcessLookupError, PermissionError):
@@ -138,7 +150,7 @@ def _signal_group(pid: int, signum: int) -> bool:
 
 
 def _drain_group(pid: int, *, grace: float) -> bool:
-    """True once the supervised process group holds no process any more."""
+    """True once nothing in the owned process group is running any more."""
     deadline = time.monotonic() + max(0.0, grace)
     while True:
         if not _signal_group(pid, 0):
@@ -148,13 +160,27 @@ def _drain_group(pid: int, *, grace: float) -> bool:
         time.sleep(0.05)
 
 
-def _stop_tree(process: subprocess.Popen, *, grace: float) -> tuple[str | None, str | None]:
-    """Stop the child and everything it started, then reap the child itself.
+def _stop_group(pid: int, *, grace: float) -> bool:
+    """SIGTERM then SIGKILL the owned process group, reporting whether it went.
 
-    The child leads its own session, so its process group is exactly the tree
-    this invocation owns: the grandchildren a hung Git leaves behind (``ssh``,
-    ``git-remote-https``) are reached, and nothing else can be.  SIGTERM first,
-    SIGKILL after the documented cleanup allowance.
+    This is the one escalation every path uses — the deadline, the final
+    confirmation, and the signal handler.  It only signals and sleeps, never
+    touching ``Popen`` state the main thread may be inside, so running it from a
+    handler cannot deadlock against the wait it interrupts.
+    """
+    _signal_group(pid, signal.SIGTERM)
+    if _drain_group(pid, grace=grace):
+        return True
+    _signal_group(pid, signal.SIGKILL)
+    return _drain_group(pid, grace=grace)
+
+
+def _stop_tree(process: subprocess.Popen, *, grace: float) -> tuple[str | None, str | None]:
+    """Stop the owned tree and reap the child, for the main thread only.
+
+    Same escalation as ``_stop_group``, plus the reap that only the owner of the
+    ``Popen`` may do: the grandchildren a hung Git leaves behind (``ssh``,
+    ``git-remote-https``) go with it, and nothing outside the tree can.
     """
     captured: tuple[str | None, str | None] = (None, None)
     for signum in (signal.SIGTERM, signal.SIGKILL):
@@ -174,21 +200,42 @@ def _stop_tree(process: subprocess.Popen, *, grace: float) -> tuple[str | None, 
     return captured
 
 
-@contextmanager
-def _stop_tree_on_signal(process: subprocess.Popen, *, grace: float) -> Iterator[None]:
-    """Take the supervised tree down with this supervisor when it is stopped.
+def _confirm_stopped(process: subprocess.Popen, *, grace: float) -> None:
+    """Leave nothing of the owned tree running, whatever ended the wait.
 
-    launchd stops a job with SIGTERM and a manual run ends with Ctrl-C; neither
-    reaches the child any more, because it leads its own session.  Without this
-    the supervisor would exit and release the overlap lock while its writer is
-    still alive — the one race that lock exists to prevent.  The handler only
-    signals the group, so it stays safe to run while the main thread waits.
+    The child is reaped by now, but it may have left part of its own tree behind,
+    and a signal may have arrived mid-cleanup.  Nothing may outlive the overlap
+    lock this invocation holds, so the same escalation runs until the group is
+    empty.
+    """
+    if _drain_group(process.pid, grace=grace):
+        return
+    if not _stop_group(process.pid, grace=grace):
+        log.error("owned process group %s did not stop", process.pid)
+
+
+@contextmanager
+def _stop_tree_on_signal(
+    supervised: list[subprocess.Popen], *, grace: float, received: list[int]
+) -> Iterator[None]:
+    """Take the owned tree down with this supervisor when it is asked to stop.
+
+    launchd stops a job with SIGTERM, a manual run ends with Ctrl-C, and the
+    overall deadline signals a whole firing's group — none of which reach a child
+    that leads its own session, so without this a state sync would die and leave
+    its Git child and remote helper running while the lock looks free.  The
+    handler stops the tree and only records the signal; the caller re-raises it
+    once the tree is confirmed gone, so the supervisor can never exit first.
+
+    ``supervised`` is filled in by the caller rather than passed by value, so the
+    handler is already in place while the child is being started: a signal in that
+    instant finds nothing to stop and is acted on as soon as there is a child.
     """
 
     def handler(signum: int, frame: object) -> None:
-        _signal_group(process.pid, signal.SIGTERM)
-        if not _drain_group(process.pid, grace=grace):
-            _signal_group(process.pid, signal.SIGKILL)
+        received.append(signum)
+        for process in supervised:
+            _stop_group(process.pid, grace=grace)
 
     installed: dict[int, object] = {}
     try:
@@ -204,6 +251,18 @@ def _stop_tree_on_signal(process: subprocess.Popen, *, grace: float) -> Iterator
             signal.signal(signum, previous)
 
 
+def _die_by_signal(signum: int) -> None:
+    """Exit the way the signal asked, now that the owned tree has stopped.
+
+    Deferring the death this far is the point: the process that holds the overlap
+    lock outlives every child it started, so the next firing cannot see the lock
+    released while a writer of this one is still alive.
+    """
+    log.error("stopped by signal %s after stopping this invocation's children", signum)
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
 def _run_bounded(
     command: Sequence[str],
     *,
@@ -213,43 +272,47 @@ def _run_bounded(
     env: dict[str, str] | None = None,
     input_text: str | None = None,
     capture: bool = True,
-    adopt_signals: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], bool]:
     """Run a child under a finite wait, owning the whole tree it starts.
 
     Returns the completed process and whether the deadline — rather than the
-    child — ended it.  The caller only continues once that tree has stopped, so
-    a supervisor holding the overlap lock never releases it to a second writer
-    while the first one is still alive.
+    child — ended it.  Every way this call can end stops that tree first: the
+    deadline, the child's own exit, and a signal aimed at this process, which is
+    re-raised only once the tree is gone.  A supervisor holding the overlap lock
+    therefore never releases it while a writer of its own is still alive.
     """
     grace = CLEANUP_GRACE_SECONDS if cleanup_grace is None else cleanup_grace
-    process = subprocess.Popen(
-        list(command),
-        cwd=cwd,
-        env=env,
-        text=True,
-        stdin=subprocess.PIPE if input_text is not None else None,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.PIPE if capture else None,
-        start_new_session=True,
-    )
     timed_out = False
-    try:
-        if adopt_signals:
-            with _stop_tree_on_signal(process, grace=grace):
-                stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+    interrupted: list[int] = []
+    supervised: list[subprocess.Popen] = []
+    # Installed for the child's whole lifetime — while it starts, while this waits
+    # and while it is cleaned up — so no signal can end this process in a window
+    # where part of the tree is still running.
+    with _stop_tree_on_signal(supervised, grace=grace, received=interrupted):
+        process = subprocess.Popen(
+            list(command),
+            cwd=cwd,
+            env=env,
+            text=True,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            start_new_session=True,
+        )
+        supervised.append(process)
+        if interrupted:
+            # Stopped while the child was starting: stop it rather than begin a
+            # wait this process has already been told to abandon.
+            stdout, stderr = _stop_tree(process, grace=grace)
         else:
-            stdout, stderr = process.communicate(input=input_text, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        stdout, stderr = _stop_tree(process, grace=grace)
-    if not _drain_group(process.pid, grace=grace):
-        # The child is reaped but left part of its own tree behind. Stop that too
-        # rather than let it outlive the lock this invocation holds.
-        _signal_group(process.pid, signal.SIGTERM)
-        if not _drain_group(process.pid, grace=grace):
-            _signal_group(process.pid, signal.SIGKILL)
-            _drain_group(process.pid, grace=grace)
+            try:
+                stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                stdout, stderr = _stop_tree(process, grace=grace)
+        _confirm_stopped(process, grace=grace)
+    if interrupted:
+        _die_by_signal(interrupted[0])
     # A tree that survived even SIGKILL leaves no status; report it as killed
     # rather than let None reach a caller that expects an exit code.
     returncode = -signal.SIGKILL if process.returncode is None else process.returncode
@@ -283,6 +346,7 @@ def _git(
         env=env,
         input_text=input_text,
         timeout=limit,
+        cleanup_grace=GIT_CLEANUP_GRACE_SECONDS,
     )
     if timed_out:
         # A Git child that never answers is a transport condition, not a state
@@ -1061,7 +1125,6 @@ def run(argv: list[str] | None = None) -> int:
                     capture=False,
                     timeout=args.deadline,
                     cleanup_grace=args.cleanup_grace,
-                    adopt_signals=True,
                 )
                 if timed_out:
                     print(
@@ -1079,7 +1142,6 @@ def run(argv: list[str] | None = None) -> int:
                 capture=False,
                 timeout=args.timeout,
                 cleanup_grace=args.cleanup_grace,
-                adopt_signals=True,
             )
             if timed_out:
                 print(

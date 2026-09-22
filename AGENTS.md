@@ -51,7 +51,9 @@ Core facts agents need before editing:
   whole firing. A timeout is a **transport** failure (the existing capped streak,
   no new alert path), never a confirmed absence; a supervisor releases the
   overlap lock only after stopping and reaping its own process tree, never by
-  deleting the lock file.
+  deleting the lock file. Each level forwards a stop it receives down to the tree
+  it owns — a sessioned Git child is unreachable from above — and its cleanup
+  allowance must fit inside the level above's.
 
 ### Cinesa half (second target)
 
