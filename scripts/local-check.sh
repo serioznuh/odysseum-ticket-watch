@@ -44,11 +44,27 @@ status=0
 # stopped with its whole process tree and counts as a failed deployment, so this
 # firing continues on the installed code instead of hanging until the overall
 # deadline and losing the reminder check entirely.
+#
+# Mirrors watcher.state_sync.UNCONFIRMED_TREE_EXIT (a test pins the two): a
+# bounded child left a process group running that nothing here could stop. That
+# group may still write, so this firing stops at once instead of stacking more
+# work beside it — the same class of hard stop as the missing-ref exit below, and
+# never folded into "failed, carry on". The next firing is blocked by the record
+# that child left next to the lock until that group is gone.
+STATE_UNCONFIRMED_TREE_EXIT=5
+
 if [ "${OTW_CODE_DEPLOYED:-}" != "1" ]; then
-  if .venv/bin/python -m watcher.state_sync bounded \
-      -- git pull --ff-only --quiet origin main; then
+  deploy_status=0
+  .venv/bin/python -m watcher.state_sync bounded \
+    -- git pull --ff-only --quiet origin main || deploy_status=$?
+  if [ "$deploy_status" -eq 0 ]; then
     export OTW_CODE_DEPLOYED=1
     exec /bin/bash "$0" "$@"
+  fi
+  if [ "$deploy_status" -eq "$STATE_UNCONFIRMED_TREE_EXIT" ]; then
+    echo "ERROR: the deployment pull left a Git process group running; stopping" \
+         "this firing rather than starting state work beside it" >&2
+    exit "$deploy_status"
   fi
   echo "ERROR: code deployment from origin/main failed; running installed code" >&2
   status=1
@@ -79,11 +95,18 @@ STATE_BOOTSTRAP_REQUIRED_EXIT=3
 # before the watcher can deliver anything from an unverified history. The owner
 # still learns of it — that sync leaves the durable marker, which the first pass
 # after recovery delivers as one loud alert.
+# A surviving Git group is the other hard stop, for the same reason: it may still
+# be writing, and continuing would run the watcher and a second sync beside it.
 pre_sync_status=0
 sync_state || pre_sync_status=$?
 if [ "$pre_sync_status" -eq "$STATE_BOOTSTRAP_REQUIRED_EXIT" ]; then
   echo "ERROR: shared runtime-state ref is missing; no send may happen until" \
        "'watcher.state_sync init' (new install) or 'recover' (existing one) runs" >&2
+  exit "$pre_sync_status"
+fi
+if [ "$pre_sync_status" -eq "$STATE_UNCONFIRMED_TREE_EXIT" ]; then
+  echo "ERROR: the pre-run state sync left a Git process group running; stopping" \
+       "this firing before the watcher or a second sync runs beside it" >&2
   exit "$pre_sync_status"
 fi
 
@@ -98,6 +121,13 @@ fi
 # and preserves every local receipt before reporting the final run status.
 sync_status=0
 sync_state || sync_status=$?
+if [ "$sync_status" -eq "$STATE_UNCONFIRMED_TREE_EXIT" ]; then
+  # Never let this one be masked by an earlier ordinary failure: it is the status
+  # that says a writer of this firing is still running.
+  echo "ERROR: the post-run state sync left a Git process group running; the next" \
+       "firing stops until that group is gone" >&2
+  exit "$sync_status"
+fi
 if [ "$sync_status" -ne 0 ] && [ "$status" -eq 0 ]; then
   status=$sync_status
 fi

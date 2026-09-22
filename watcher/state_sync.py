@@ -63,18 +63,22 @@ BOOTSTRAP_REQUIRED_EXIT = 3
 # long, network round trips included; a wedged fetch or push is the case that
 # matters and it is reported as a transport failure, never as a new alert path.
 GIT_TIMEOUT_SECONDS = 45.0
-# Cleanup allowance for one Git tree. Deliberately shorter than the supervisor's
-# below: a sync stopped by the overall deadline (or by launchd) has to finish
-# stopping its Git child inside the window before that supervisor escalates to
-# SIGKILL, which would otherwise strand the Git child it can no longer reach.
-GIT_CLEANUP_GRACE_SECONDS = 3.0
 # The wrapper's deployment pull, which can legitimately transfer more than a
 # state blob.  Deployment stays first: exceeding this is a failed deployment, so
 # the firing continues on the installed code exactly as before.
 DEPLOY_TIMEOUT_SECONDS = 90.0
-# SIGTERM → SIGKILL allowance for a stopped tree, and the time a supervisor
-# waits for the group to drain before it releases the overlap lock.
-CLEANUP_GRACE_SECONDS = 10.0
+# Total allowance for stopping one supervised tree: every SIGTERM → SIGKILL
+# round, retry and drain of a single invocation draws from this one window, so a
+# level's whole cleanup takes at most this long. Its first half is spent waiting
+# after SIGTERM, which is the window a level below gets to finish in.
+CLEANUP_BUDGET_SECONDS = 10.0
+# The nested budget for one Git tree, and the headroom for recording a survivor
+# afterwards. Both must fit in half of the outer budget above — the time the
+# supervisor spends after SIGTERM before it escalates to SIGKILL — or a sync
+# stopped from above would be killed mid-cleanup and its sessioned Git group,
+# which no other level can see, would go unrecorded. A test pins the arithmetic.
+GIT_CLEANUP_BUDGET_SECONDS = 3.0
+SURVIVOR_RECORD_ALLOWANCE_SECONDS = 1.0
 # Overall deadline for one local firing: deployment, both syncs and the watcher
 # together.  Two launchd intervals — far more than a healthy pass needs (its own
 # polling budget is 0.8 of one interval) yet finite, so a hung tree costs the
@@ -183,7 +187,34 @@ def _drain_group(pid: int, *, grace: float) -> bool:
         time.sleep(0.05)
 
 
-def _stop_group(pid: int, *, grace: float) -> bool:
+class _CleanupWindow:
+    """One bounded allowance for stopping this invocation's tree.
+
+    Every path that may need cleanup — the deadline, the signal handler, the final
+    confirmation, each retry round — draws from this same window, so their worst
+    cases cannot add up past the allowance the level above grants before its own
+    SIGKILL.  That matters most for a state sync: it has to finish stopping its
+    sessioned Git group *and* record the survivor before the supervisor above it
+    escalates, because that supervisor can neither see nor record that group.
+
+    The window opens on first use, so a healthy invocation never starts a clock,
+    and ``first`` is the SIGTERM half: the part spent waiting before SIGKILL.
+    """
+
+    def __init__(self, budget: float) -> None:
+        self.budget = max(0.1, budget)
+        self._closes_at: float | None = None
+
+    def remaining(self) -> float:
+        if self._closes_at is None:
+            self._closes_at = time.monotonic() + self.budget
+        return max(0.0, self._closes_at - time.monotonic())
+
+    def first(self) -> float:
+        return min(self.remaining(), self.budget / 2)
+
+
+def _stop_group(pid: int, *, window: _CleanupWindow) -> bool:
     """SIGTERM then SIGKILL the owned process group, reporting whether it went.
 
     This is the one escalation every path uses — the deadline, the final
@@ -192,13 +223,15 @@ def _stop_group(pid: int, *, grace: float) -> bool:
     handler cannot deadlock against the wait it interrupts.
     """
     _signal_group(pid, signal.SIGTERM)
-    if _drain_group(pid, grace=grace):
+    if _drain_group(pid, grace=window.first()):
         return True
     _signal_group(pid, signal.SIGKILL)
-    return _drain_group(pid, grace=grace)
+    return _drain_group(pid, grace=window.remaining())
 
 
-def _stop_tree(process: subprocess.Popen, *, grace: float) -> tuple[str | None, str | None]:
+def _stop_tree(
+    process: subprocess.Popen, *, window: _CleanupWindow
+) -> tuple[str | None, str | None]:
     """Stop the owned tree and reap the child, for the main thread only.
 
     Same escalation as ``_stop_group``, plus the reap that only the owner of the
@@ -206,10 +239,13 @@ def _stop_tree(process: subprocess.Popen, *, grace: float) -> tuple[str | None, 
     ``git-remote-https``) go with it, and nothing outside the tree can.
     """
     captured: tuple[str | None, str | None] = (None, None)
-    for signum in (signal.SIGTERM, signal.SIGKILL):
+    for signum, wait in (
+        (signal.SIGTERM, window.first),
+        (signal.SIGKILL, window.remaining),
+    ):
         _signal_group(process.pid, signum)
         try:
-            captured = process.communicate(timeout=max(0.1, grace))
+            captured = process.communicate(timeout=max(0.1, wait()))
             break
         except subprocess.TimeoutExpired:
             continue
@@ -217,42 +253,48 @@ def _stop_tree(process: subprocess.Popen, *, grace: float) -> tuple[str | None, 
         # Something outside the group is holding a pipe open. The child is dead;
         # reap it without waiting on its output.
         try:
-            process.wait(timeout=max(0.1, grace))
+            process.wait(timeout=max(0.1, window.remaining()))
         except subprocess.TimeoutExpired:
             log.error("supervised child %s did not exit after SIGKILL", process.pid)
     return captured
 
 
 def _confirm_stopped(
-    process: subprocess.Popen, *, grace: float, attempts: int = CLEANUP_ATTEMPTS
+    process: subprocess.Popen,
+    *,
+    window: _CleanupWindow,
+    attempts: int = CLEANUP_ATTEMPTS,
 ) -> None:
     """Leave nothing of the owned tree running, whatever ended the wait.
 
     The child is reaped by now, but it may have left part of its own tree behind,
     and a signal may have arrived mid-cleanup.  The escalation therefore runs
     again, up to ``attempts`` times — a process still in uninterruptible I/O can
-    outlive one SIGKILL round without being unkillable.
+    outlive one SIGKILL round without being unkillable — but always inside the one
+    window, never ``attempts`` times its length.
 
     Raising is the point of the last line: the caller holds the overlap lock, and
     returning normally would let it release that lock and report a finished run
     while a writer of this firing is still alive.  Nothing here may be *presumed*
     stopped — only observed stopped.
     """
-    if _drain_group(process.pid, grace=grace):
+    if _drain_group(process.pid, grace=window.first()):
         return
     for _ in range(max(1, attempts)):
-        if _stop_group(process.pid, grace=grace):
+        if _stop_group(process.pid, window=window):
             return
+        if window.remaining() <= 0:
+            break
     raise StateSyncCleanupError(
-        f"process group {process.pid} was still running after {max(1, attempts)} "
-        "rounds of SIGTERM/SIGKILL",
+        f"process group {process.pid} was still running after SIGTERM/SIGKILL "
+        f"within {window.budget:g}s",
         pgid=process.pid,
     )
 
 
 @contextmanager
 def _stop_tree_on_signal(
-    supervised: list[subprocess.Popen], *, grace: float, received: list[int]
+    supervised: list[subprocess.Popen], *, window: _CleanupWindow, received: list[int]
 ) -> Iterator[None]:
     """Take the owned tree down with this supervisor when it is asked to stop.
 
@@ -271,7 +313,7 @@ def _stop_tree_on_signal(
     def handler(signum: int, frame: object) -> None:
         received.append(signum)
         for process in supervised:
-            _stop_group(process.pid, grace=grace)
+            _stop_group(process.pid, window=window)
 
     installed: dict[int, object] = {}
     try:
@@ -303,7 +345,7 @@ def _run_bounded(
     command: Sequence[str],
     *,
     timeout: float,
-    cleanup_grace: float | None = None,
+    cleanup_budget: float | None = None,
     cwd: str | Path | None = None,
     env: dict[str, str] | None = None,
     input_text: str | None = None,
@@ -317,14 +359,16 @@ def _run_bounded(
     re-raised only once the tree is gone.  A supervisor holding the overlap lock
     therefore never releases it while a writer of its own is still alive.
     """
-    grace = CLEANUP_GRACE_SECONDS if cleanup_grace is None else cleanup_grace
+    window = _CleanupWindow(
+        CLEANUP_BUDGET_SECONDS if cleanup_budget is None else cleanup_budget
+    )
     timed_out = False
     interrupted: list[int] = []
     supervised: list[subprocess.Popen] = []
     # Installed for the child's whole lifetime — while it starts, while this waits
     # and while it is cleaned up — so no signal can end this process in a window
     # where part of the tree is still running.
-    with _stop_tree_on_signal(supervised, grace=grace, received=interrupted):
+    with _stop_tree_on_signal(supervised, window=window, received=interrupted):
         process = subprocess.Popen(
             list(command),
             cwd=cwd,
@@ -339,14 +383,14 @@ def _run_bounded(
         if interrupted:
             # Stopped while the child was starting: stop it rather than begin a
             # wait this process has already been told to abandon.
-            stdout, stderr = _stop_tree(process, grace=grace)
+            stdout, stderr = _stop_tree(process, window=window)
         else:
             try:
                 stdout, stderr = process.communicate(input=input_text, timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                stdout, stderr = _stop_tree(process, grace=grace)
-        _confirm_stopped(process, grace=grace)
+                stdout, stderr = _stop_tree(process, window=window)
+        _confirm_stopped(process, window=window)
     if interrupted:
         _die_by_signal(interrupted[0])
     # A tree that survived even SIGKILL leaves no status; report it as killed
@@ -382,7 +426,7 @@ def _git(
         env=env,
         input_text=input_text,
         timeout=limit,
-        cleanup_grace=GIT_CLEANUP_GRACE_SECONDS,
+        cleanup_budget=GIT_CLEANUP_BUDGET_SECONDS,
     )
     if timed_out:
         # A Git child that never answers is a transport condition, not a state
@@ -424,6 +468,12 @@ def _remote_state(
     if advertised.returncode == 2:
         try:
             _git(repo, "update-ref", "-d", FETCHED_STATE_REF, check=False)
+        except StateSyncCleanupError:
+            # A Git child that outlived cleanup must always reach the caller that
+            # records it. Folding it into the absence path would report a missing
+            # ref while leaving that group running and unrecorded, and a later
+            # firing would then run beside it.
+            raise
         except StateSyncError:
             # The absence is already confirmed and the wrappers stop on that
             # condition alone, so dropping a stale fetched ref must never be
@@ -1041,21 +1091,61 @@ def resolve_failure(
 
 
 def _report_unconfirmed_tree(
-    exc: StateSyncCleanupError, marker: str | Path, what: str
+    exc: StateSyncCleanupError,
+    marker: str | Path,
+    what: str,
+    *,
+    hold: float = LOCAL_RUN_DEADLINE_SECONDS,
+    poll: float = 1.0,
 ) -> int:
-    """Record the survivor and refuse, instead of reporting a finished run."""
+    """Record the survivor and refuse, instead of reporting a finished run.
+
+    A marker that was never written cannot stop the next firing, so a failed write
+    is not something to log and move on from.  While it cannot be written, this
+    process stays alive instead: for ``locked`` that keeps the overlap lock held,
+    so the next firing skips as overlapping, and for a sync it keeps the wrapper
+    above waiting on its child, which holds the same lock.  Staying is only useful
+    while the survivor lives, and it is bounded either way, so an undying group
+    plus an unwritable disk still ends in a loud non-zero exit rather than a
+    process that never returns.
+    """
     detail = f"{what} could not stop its own process tree: {exc}"
-    try:
-        record_unconfirmed_tree(marker, exc.pgid, detail)
-    except OSError:
-        # Reporting the condition matters more than remembering it; the caller
-        # still fails loudly rather than continuing as if the tree were gone.
-        log.exception("could not record the surviving process group")
-    print(
-        f"{detail}. The next firing stops until process group {exc.pgid} is gone "
-        f"(marker: {marker})",
-        file=sys.stderr,
-    )
+    deadline = time.monotonic() + max(0.0, hold)
+    recorded = False
+    while True:
+        try:
+            record_unconfirmed_tree(marker, exc.pgid, detail)
+            recorded = True
+            break
+        except OSError:
+            log.exception("could not record surviving process group %s", exc.pgid)
+        if not _signal_group(exc.pgid, 0):
+            # The group finally went while the write kept failing: there is
+            # nothing left for the next firing to run into.
+            break
+        if time.monotonic() >= deadline:
+            break
+        # Holding on *is* the guard while the marker is missing.
+        print(
+            f"{detail}; the survivor record at {marker} cannot be written, so this "
+            "process keeps the overlap lock while process group "
+            f"{exc.pgid} is alive",
+            file=sys.stderr,
+        )
+        time.sleep(max(0.05, poll))
+    if recorded:
+        print(
+            f"{detail}. The next firing stops until process group {exc.pgid} is gone "
+            f"(marker: {marker})",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"{detail}. Process group {exc.pgid} could be neither stopped nor "
+            f"recorded at {marker}; stop it by hand before the next firing "
+            "(`ps -g`), and check why that path is unwritable",
+            file=sys.stderr,
+        )
     return UNCONFIRMED_TREE_EXIT
 
 
@@ -1122,7 +1212,9 @@ def run(argv: list[str] | None = None) -> int:
         default=LOCAL_RUN_DEADLINE_SECONDS,
         help="overall seconds for the whole locked run (deploy, syncs, watcher)",
     )
-    locked.add_argument("--cleanup-grace", type=float, default=CLEANUP_GRACE_SECONDS)
+    locked.add_argument(
+        "--cleanup-budget", type=float, default=CLEANUP_BUDGET_SECONDS
+    )
     locked.add_argument("child", nargs=argparse.REMAINDER)
     bounded = subparsers.add_parser(
         "bounded",
@@ -1130,7 +1222,9 @@ def run(argv: list[str] | None = None) -> int:
     )
     bounded.add_argument("--timeout", type=float, default=DEPLOY_TIMEOUT_SECONDS)
     bounded.add_argument("--lock", default=DEFAULT_LOCK_PATH)
-    bounded.add_argument("--cleanup-grace", type=float, default=CLEANUP_GRACE_SECONDS)
+    bounded.add_argument(
+        "--cleanup-budget", type=float, default=CLEANUP_BUDGET_SECONDS
+    )
     bounded.add_argument("child", nargs=argparse.REMAINDER)
     record = subparsers.add_parser("record")
     record.add_argument("--detail", required=True)
@@ -1238,6 +1332,15 @@ def run(argv: list[str] | None = None) -> int:
                         state_ref=args.ref,
                         extra=args.extra,
                     )
+            except StateSyncCleanupError as exc:
+                # These run in the production clone too, so a Git child they could
+                # not stop has to be recorded here as well: the scheduled firing
+                # that comes next must not start beside it.
+                return _report_unconfirmed_tree(
+                    exc,
+                    _resolve_under(repo, unconfirmed_tree_path(DEFAULT_LOCK_PATH)),
+                    f"state {args.command}",
+                )
             except (OSError, StateSyncError, state_mod.StateError) as exc:
                 print(f"state {args.command} failed: {exc}", file=sys.stderr)
                 return 1
@@ -1282,7 +1385,7 @@ def run(argv: list[str] | None = None) -> int:
                         env=env,
                         capture=False,
                         timeout=args.deadline,
-                        cleanup_grace=args.cleanup_grace,
+                        cleanup_budget=args.cleanup_budget,
                     )
                 except StateSyncCleanupError as exc:
                     return _report_unconfirmed_tree(exc, unconfirmed, "local check")
@@ -1303,7 +1406,7 @@ def run(argv: list[str] | None = None) -> int:
                     child,
                     capture=False,
                     timeout=args.timeout,
-                    cleanup_grace=args.cleanup_grace,
+                    cleanup_budget=args.cleanup_budget,
                 )
             except StateSyncCleanupError as exc:
                 return _report_unconfirmed_tree(exc, unconfirmed, " ".join(child))

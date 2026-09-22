@@ -685,9 +685,19 @@ def install_local_check(repo: Path) -> Path:
     (repo / ".env").write_text("", encoding="utf-8")
     (repo / ".venv" / "bin").mkdir(parents=True)
     stub = repo / ".venv" / "bin" / "python"
+    # OTW_FAKE_SYNC_EXIT[_ON] lets a test give one `sync` call an exit status that
+    # is impractical to provoke for real (a Git group nothing could stop), while
+    # every other state_sync call stays the real thing.
     stub.write_text(
         "#!/bin/sh\n"
         'if [ "$1" = "-m" ] && [ "$2" = "watcher.state_sync" ]; then\n'
+        '  if [ "$3" = "sync" ] && [ -n "${OTW_FAKE_SYNC_EXIT:-}" ]; then\n'
+        '    calls=$(( $(cat sync-calls 2>/dev/null || echo 0) + 1 ))\n'
+        '    printf %s "$calls" > sync-calls\n'
+        '    if [ "$calls" = "${OTW_FAKE_SYNC_EXIT_ON:-1}" ]; then\n'
+        '      exit "$OTW_FAKE_SYNC_EXIT"\n'
+        "    fi\n"
+        "  fi\n"
         '  exec "$REAL_PYTHON" "$@"\n'
         "fi\n"
         "printf '%s\\n' \"$*\" >> watcher-invocations\n",
@@ -789,11 +799,11 @@ def test_local_check_stops_before_the_watcher_even_with_local_receipts(two_clone
 REAL_GIT = shutil.which("git")
 HUNG_SECONDS = 600  # far beyond every bound exercised below
 BOUND = 1.0
-GRACE = 1.0
+BUDGET = 1.0
 # The configured bound plus its cleanup allowance, with generous slack for
 # interpreter startup on a loaded machine. Measured against a child that would
 # otherwise wedge for HUNG_SECONDS, this is what "finite" means here.
-PATIENCE = BOUND + 2 * GRACE + 15.0
+PATIENCE = BOUND + 2 * BUDGET + 15.0
 
 
 def hung_git(directory: Path, *subcommands: str) -> tuple[Path, Path]:
@@ -857,7 +867,7 @@ def assert_tree_stopped(pids: Sequence[int], *, timeout: float = 10.0) -> None:
 def bounded_waits(monkeypatch) -> None:
     """Shrink the in-process bounds; the behavior under test is the timeout."""
     monkeypatch.setattr(state_sync, "GIT_TIMEOUT_SECONDS", BOUND)
-    monkeypatch.setattr(state_sync, "CLEANUP_GRACE_SECONDS", GRACE)
+    monkeypatch.setattr(state_sync, "GIT_CLEANUP_BUDGET_SECONDS", BUDGET)
 
 
 def supervisor(*args: str) -> list[str]:
@@ -882,8 +892,8 @@ def test_deployment_pull_timeout_is_bounded_and_stops_its_whole_tree(tmp_path):
             "bounded",
             "--timeout",
             str(BOUND),
-            "--cleanup-grace",
-            str(GRACE),
+            "--cleanup-budget",
+            str(BUDGET),
             "--",
             str(shim),
             "pull",
@@ -1007,8 +1017,8 @@ def test_overall_deadline_releases_the_lock_only_after_the_tree_stops(tmp_path):
             str(lock),
             "--deadline",
             str(BOUND),
-            "--cleanup-grace",
-            str(GRACE),
+            "--cleanup-budget",
+            str(BUDGET),
             "--",
             "/bin/sh",
             "-c",
@@ -1092,8 +1102,8 @@ def test_a_signal_mid_git_call_stops_the_git_tree_before_the_lock_is_free(
             "locked",
             "--lock",
             str(lock),
-            "--cleanup-grace",
-            str(GRACE),
+            "--cleanup-budget",
+            str(BUDGET),
             "--",
             "/bin/sh",
             "-c",
@@ -1123,3 +1133,57 @@ def test_a_signal_mid_git_call_stops_the_git_tree_before_the_lock_is_free(
     assert "already running" not in followed.stderr
     # The interrupted sync wrote nothing new and left the validated copy in place.
     assert load_state(live_path(local)) == load_state(local / DEFAULT_STORE_PATH / "base.json")
+
+
+def fire_local_check(repo: Path, **extra: str) -> subprocess.CompletedProcess[str]:
+    script = install_local_check(repo)
+    env = child_env()
+    env["REAL_PYTHON"] = sys.executable
+    env.update(extra)
+    return subprocess.run(
+        ["/bin/bash", str(script)],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_a_surviving_group_stops_the_firing_before_the_watcher(two_clones):
+    """Round-2 finding: exit 5 is not an ordinary sync failure to carry on from.
+    A group that nothing could stop may still be writing, so the firing must not
+    stack the watcher and a second sync beside it."""
+    _, local, _ = two_clones
+    synchronize(local)
+
+    fired = fire_local_check(
+        local, OTW_FAKE_SYNC_EXIT=str(state_sync.UNCONFIRMED_TREE_EXIT)
+    )
+
+    assert fired.returncode == state_sync.UNCONFIRMED_TREE_EXIT
+    assert "left a Git process group running" in fired.stderr
+    assert not (local / "watcher-invocations").exists()
+    assert (local / "sync-calls").read_text(encoding="utf-8") == "1"  # no second sync
+
+
+def test_a_surviving_group_after_the_watcher_is_not_masked_by_another_failure(
+    two_clones,
+):
+    """…and the status may not be lost either: an ordinary earlier failure (here a
+    failed deployment) must not hide the one status that says a writer of this
+    firing is still running."""
+    _, local, _ = two_clones
+    synchronize(local)
+    git(local, "remote", "set-url", "origin", str(local.parent / "vanished.git"))
+
+    fired = fire_local_check(
+        local,
+        OTW_FAKE_SYNC_EXIT=str(state_sync.UNCONFIRMED_TREE_EXIT),
+        OTW_FAKE_SYNC_EXIT_ON="2",
+    )
+
+    assert "code deployment from origin/main failed" in fired.stderr  # ordinary, 1
+    assert (local / "watcher-invocations").exists()  # the pass itself ran
+    assert fired.returncode == state_sync.UNCONFIRMED_TREE_EXIT
+    assert "the next firing stops until that group is gone" in fired.stderr
