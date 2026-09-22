@@ -12,16 +12,21 @@ from pathlib import Path
 
 import pytest
 
+from watcher import state_sync
 from watcher.state import DEFAULT_STATE, load_state, save_state
 from watcher.state_sync import (
+    BOOTSTRAP_REQUIRED_EXIT,
     DEFAULT_MARKER_PATH,
     DEFAULT_STATE_REF,
     DEFAULT_STORE_PATH,
     TRANSPORT_FAILURE_FILE,
     TRANSPORT_FAILURE_THRESHOLD,
     StateSyncError,
+    StateSyncRefAbsentError,
     failure_key,
+    initialize,
     load_failure,
+    load_transport_failure,
     run,
     synchronize,
 )
@@ -49,13 +54,10 @@ def configure_git(repo: Path) -> None:
     git(repo, "config", "user.email", "otw-test@example.invalid")
 
 
-@pytest.fixture
-def two_clones(tmp_path):
-    """A bare origin plus independent local-Mac and cloud working clones."""
+def bootstrap_origin(tmp_path: Path) -> Path:
+    """A bare origin carrying code and the tracked seed, but no state ref."""
     origin = tmp_path / "origin.git"
     bootstrap = tmp_path / "bootstrap"
-    local = tmp_path / "local"
-    cloud = tmp_path / "cloud"
     origin.mkdir()
     bootstrap.mkdir()
     git(origin, "init", "--bare")
@@ -70,10 +72,43 @@ def two_clones(tmp_path):
     git(bootstrap, "remote", "add", "origin", str(origin))
     git(bootstrap, "push", "-u", "origin", "main")
     git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
-    git(tmp_path, "clone", str(origin), str(local))
-    git(tmp_path, "clone", str(origin), str(cloud))
-    configure_git(local)
-    configure_git(cloud)
+    return origin
+
+
+def clone_of(tmp_path: Path, origin: Path, name: str) -> Path:
+    clone = tmp_path / name
+    git(tmp_path, "clone", str(origin), str(clone))
+    configure_git(clone)
+    return clone
+
+
+def remote_state_commit(origin: Path) -> str | None:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", DEFAULT_STATE_REF],
+        cwd=origin,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+@pytest.fixture
+def uninitialized(tmp_path):
+    """A first clone of an installation whose shared state ref does not exist."""
+    origin = bootstrap_origin(tmp_path)
+    return origin, clone_of(tmp_path, origin, "first")
+
+
+@pytest.fixture
+def two_clones(tmp_path):
+    """A bare origin plus independent local-Mac and cloud working clones."""
+    origin = bootstrap_origin(tmp_path)
+    local = clone_of(tmp_path, origin, "local")
+    cloud = clone_of(tmp_path, origin, "cloud")
+    # The shared ref only ever comes from an explicit first-run initialization
+    # (OTW-30), so ordinary syncs below always face an existing ref.
+    initialize(local)
     return origin, local, cloud
 
 
@@ -327,3 +362,418 @@ def test_merge_is_reconciliation_not_a_delivery_claim(two_clones):
     synchronize(local)
     synchronize(cloud)
     assert load_state(live_path(cloud))["alerts"]["same-key"] == STAMP
+
+
+# ---------------------------------------------------------------------------
+# OTW-30: creating the shared ref is an explicit operation, never ordinary work
+# ---------------------------------------------------------------------------
+
+HISTORIC_ALERT = "sale:dune-troisieme-partie:2026-11-02T10:00:00+01:00"
+IN_FLIGHT_ID = "telegram:news-leak-42"
+IN_FLIGHT = {
+    "keys": ["news:leak-42"],
+    "kinds": ["NEWS_LEAD"],
+    "text": "Dune : Troisième partie · Pathé Odysseum — press lead",
+    "silent": True,
+    "force": False,
+    "created_at": STAMP,
+    "topics": ["news"],
+    "status": "sending",
+    "ack": {"type": "alerts", "keys": ["news:leak-42"]},
+    "claim": {"owner": "local", "token": "abc123", "at": STAMP},
+}
+
+
+def deliver(repo: Path, key: str, attempt: str) -> None:
+    """Record one confirmed Telegram delivery the way a real pass would."""
+
+    def update(state: dict) -> None:
+        state["alerts"][key] = STAMP
+        state["delivery_receipts"][attempt] = {
+            "delivery_id": f"telegram:{key}",
+            "keys": [key],
+            "delivered_at": STAMP,
+            "telegram_message_id": 4242,
+        }
+
+    change_state(repo, update)
+
+
+def delete_state_ref(origin: Path) -> None:
+    git(origin, "update-ref", "-d", DEFAULT_STATE_REF)
+
+
+def test_fresh_clone_cannot_reseed_a_deleted_state_ref(tmp_path, two_clones):
+    """The reproduced OTW-30 hazard: a new runner must not resurrect the ref
+    from the frozen seed, which would make every past alert eligible again."""
+    origin, local, _ = two_clones
+    deliver(local, HISTORIC_ALERT, "attempt-historic")
+    synchronize(local)
+    delete_state_ref(origin)
+
+    fresh = clone_of(tmp_path, origin, "fresh")
+    assert (fresh / "state" / "state.json").exists()  # the seed is right there
+    assert run(["sync", "--repo", str(fresh)]) == BOOTSTRAP_REQUIRED_EXIT
+
+    # Nothing to deliver from, nothing pushed: no live file materializes, and
+    # the absent ref stays absent until an operator acts.
+    assert not live_path(fresh).exists()
+    assert not (fresh / DEFAULT_STORE_PATH / "base.json").exists()
+    assert remote_state_commit(origin) is None
+    assert load_failure(fresh / DEFAULT_MARKER_PATH) is None
+
+
+def test_existing_clone_preserves_live_and_base_when_the_ref_disappears(two_clones):
+    origin, local, _ = two_clones
+    deliver(local, HISTORIC_ALERT, "attempt-historic")
+    synchronize(local)
+    live_before = live_path(local).read_bytes()
+    base_before = (local / DEFAULT_STORE_PATH / "base.json").read_bytes()
+    delete_state_ref(origin)
+
+    with pytest.raises(StateSyncRefAbsentError) as absent:
+        synchronize(local)
+    assert absent.value.established is True
+
+    # Local receipts are not permission to keep sending: a reminder the cloud
+    # delivered while this Mac slept lived only in the ref. Delivery stops here
+    # too, and the ref is not recreated behind the owner's back.
+    assert run(["sync", "--repo", str(local)]) == BOOTSTRAP_REQUIRED_EXIT
+    assert live_path(local).read_bytes() == live_before
+    assert (local / DEFAULT_STORE_PATH / "base.json").read_bytes() == base_before
+    assert remote_state_commit(origin) is None
+    marker = load_failure(local / DEFAULT_MARKER_PATH)
+    assert marker is not None
+    assert "is missing" in marker["detail"]
+    # A working transport that answers "no such ref" is not an outage streak.
+    assert not (local / DEFAULT_STORE_PATH / TRANSPORT_FAILURE_FILE).exists()
+
+
+def test_transport_outage_stays_distinct_from_a_confirmed_absence(tmp_path):
+    origin = bootstrap_origin(tmp_path)
+    offline = clone_of(tmp_path, origin, "offline")
+    git(offline, "remote", "set-url", "origin", str(tmp_path / "vanished.git"))
+
+    assert run(["sync", "--repo", str(offline)]) == 1
+    streak = load_transport_failure(offline / DEFAULT_STORE_PATH / TRANSPORT_FAILURE_FILE)
+    assert streak is not None and streak["count"] == 1
+    assert load_failure(offline / DEFAULT_MARKER_PATH) is None
+    assert not live_path(offline).exists()
+
+
+def test_explicit_initialization_creates_the_shared_ref_once(tmp_path, uninitialized):
+    origin, first = uninitialized
+    assert run(["sync", "--repo", str(first)]) == BOOTSTRAP_REQUIRED_EXIT
+
+    assert run(["init", "--repo", str(first)]) == 0
+    created = remote_state_commit(origin)
+    assert created is not None
+    assert load_state(live_path(first)) == DEFAULT_STATE
+
+    # Ordinary syncs now work and neither rewrite nor re-create that history.
+    assert run(["sync", "--repo", str(first)]) == 0
+    assert remote_state_commit(origin) == created
+
+    # A second host joins through ordinary sync, with no init of its own.
+    second = clone_of(tmp_path, origin, "second")
+    assert run(["sync", "--repo", str(second)]) == 0
+    assert load_state(live_path(second)) == DEFAULT_STATE
+
+
+def test_initialization_refuses_an_installation_with_delivery_history(two_clones):
+    origin, local, _ = two_clones
+    deliver(local, HISTORIC_ALERT, "attempt-historic")
+    synchronize(local)
+    delete_state_ref(origin)
+
+    assert run(["init", "--repo", str(local)]) == 1
+    assert remote_state_commit(origin) is None
+    assert HISTORIC_ALERT in load_state(live_path(local))["alerts"]
+
+
+def test_concurrent_initialization_leaves_the_independent_ref_intact(
+    tmp_path, uninitialized, monkeypatch
+):
+    origin, first = uninitialized
+    second = clone_of(tmp_path, origin, "second")
+    assert run(["init", "--repo", str(first)]) == 0
+    deliver(first, "first-host-delivery", "attempt-first")
+    synchronize(first)
+    created = remote_state_commit(origin)
+
+    # `second` looked before `first` pushed, so its own creating push loses the
+    # race. The independently created history must survive untouched, and the
+    # loser must adopt it rather than keep an unverified seed.
+    real_remote_state = state_sync._remote_state
+    calls = {"count": 0}
+
+    def racing_remote_state(repo, remote, state_ref):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return None, None
+        return real_remote_state(repo, remote, state_ref)
+
+    monkeypatch.setattr(state_sync, "_remote_state", racing_remote_state)
+    assert run(["init", "--repo", str(second)]) == 0
+    assert calls["count"] >= 2
+    assert remote_state_commit(origin) == created
+    assert "first-host-delivery" in load_state(live_path(second))["alerts"]
+
+
+def test_recovery_preserves_confirmed_receipts_and_quarantines_uncertainty(
+    tmp_path, two_clones
+):
+    origin, local, cloud = two_clones
+    synchronize(cloud)
+    # The cloud delivered an alert and a reminder rung but never pushed them;
+    # its live file is the only surviving proof, taken here as a backup.
+    def cloud_work(state: dict) -> None:
+        state["alerts"]["cloud-delivery"] = STAMP
+        state["delivery_receipts"]["attempt-cloud"] = {
+            "delivery_id": "telegram:cloud-delivery",
+            "keys": ["cloud-delivery"],
+            "delivered_at": STAMP,
+            "telegram_message_id": 102,
+        }
+        state["reminders_sent"][TARGET] = ["120"]
+
+    change_state(cloud, cloud_work)
+    backup = tmp_path / "cloud-backup-state.json"
+    backup.write_bytes(live_path(cloud).read_bytes())
+
+    def local_work(state: dict) -> None:
+        state["alerts"]["local-delivery"] = STAMP
+        state["delivery_receipts"]["attempt-local"] = {
+            "delivery_id": "telegram:local-delivery",
+            "keys": ["local-delivery"],
+            "delivered_at": STAMP,
+            "telegram_message_id": 101,
+        }
+        state["reminders_sent"][TARGET] = ["15"]
+        state["outbox"][IN_FLIGHT_ID] = deepcopy(IN_FLIGHT)
+
+    change_state(local, local_work)
+    delete_state_ref(origin)
+    # Ordinary sync refuses and blocks delivery until the owner recovers.
+    assert run(["sync", "--repo", str(local)]) == BOOTSTRAP_REQUIRED_EXIT
+
+    assert run(["recover", "--repo", str(local), "--from", str(backup)]) == 0
+    recovered = load_state(live_path(local))
+    assert set(recovered["alerts"]) == {"cloud-delivery", "local-delivery"}
+    assert set(recovered["delivery_receipts"]) == {"attempt-cloud", "attempt-local"}
+    assert recovered["reminders_sent"][TARGET] == ["120", "15"]
+    # The interrupted attempt stays quarantined: recovery may not turn an
+    # unknown Telegram outcome into a replay.
+    assert recovered["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+    assert recovered["outbox"][IN_FLIGHT_ID]["claim"] == IN_FLIGHT["claim"]
+
+    # Normal delivery resumes on the reconciled history, so a runner that
+    # joins afterwards can re-send none of it.
+    joined = clone_of(tmp_path, origin, "joined")
+    assert run(["sync", "--repo", str(joined)]) == 0
+    rejoined = load_state(live_path(joined))
+    assert set(rejoined["alerts"]) == {"cloud-delivery", "local-delivery"}
+    assert rejoined["reminders_sent"][TARGET] == ["120", "15"]
+    assert rejoined["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+
+
+def test_recovery_refuses_the_tracked_seed_as_evidence(uninitialized):
+    origin, first = uninitialized
+    assert not live_path(first).exists()
+
+    assert run(["recover", "--repo", str(first)]) == 1
+    assert remote_state_commit(origin) is None
+    assert not live_path(first).exists()
+
+
+def test_recovery_folds_a_concurrently_recreated_ref_without_rewriting_it(
+    tmp_path, two_clones
+):
+    """The racing host may be the *only* place an uncertain attempt is recorded.
+    Recovery must fold whatever the ref holds when it writes, and record it as
+    the incorporated base: otherwise the next sync reads that remote-only work
+    as locally deleted, drops the quarantine, and the message can go out twice."""
+    origin, local, cloud = two_clones
+    synchronize(cloud)
+    deliver(local, "local-delivery", "attempt-local")
+    delete_state_ref(origin)
+    # Another host recreated the ref from its own surviving store first, carrying
+    # a delivery whose Telegram outcome it never learned.
+    def cloud_work(state: dict) -> None:
+        state["alerts"]["cloud-delivery"] = STAMP
+        state["delivery_receipts"]["attempt-cloud"] = {
+            "delivery_id": "telegram:cloud-delivery",
+            "keys": ["cloud-delivery"],
+            "delivered_at": STAMP,
+            "telegram_message_id": 102,
+        }
+        state["outbox"][IN_FLIGHT_ID] = deepcopy(IN_FLIGHT)
+
+    change_state(cloud, cloud_work)
+    assert run(["recover", "--repo", str(cloud)]) == 0
+    recreated = remote_state_commit(origin)
+    assert IN_FLIGHT_ID in load_state(live_path(cloud))["outbox"]
+
+    assert run(["recover", "--repo", str(local)]) == 0
+    assert remote_state_commit(origin) == recreated  # history left intact
+    recovered = load_state(live_path(local))
+    assert "local-delivery" in recovered["alerts"]  # its own evidence survives
+    assert recovered["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+
+    assert run(["sync", "--repo", str(local)]) == 0
+    unioned = load_state(live_path(local))
+    assert {"local-delivery", "cloud-delivery"} <= set(unioned["alerts"])
+    # Still quarantined, and its key is still unsent — so nothing re-derives it
+    # into a second send.
+    assert unioned["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+    assert "news:leak-42" not in unioned["alerts"]
+    synchronize(cloud)
+    shared = load_state(live_path(cloud))
+    assert {"local-delivery", "cloud-delivery"} <= set(shared["alerts"])
+    assert shared["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+
+
+def test_recovery_losing_the_push_race_folds_the_ref_that_won(
+    tmp_path, two_clones, monkeypatch
+):
+    """Same guarantee through the other door: the pre-check saw no ref, the
+    creating push lost, and only the re-read tells the truth."""
+    origin, local, cloud = two_clones
+    synchronize(cloud)
+    deliver(local, "local-delivery", "attempt-local")
+    delete_state_ref(origin)
+    change_state(cloud, lambda state: state["outbox"].__setitem__(
+        IN_FLIGHT_ID, deepcopy(IN_FLIGHT)
+    ))
+    assert run(["recover", "--repo", str(cloud)]) == 0
+    recreated = remote_state_commit(origin)
+
+    real_remote_state = state_sync._remote_state
+    calls = {"count": 0}
+
+    def racing_remote_state(repo, remote, state_ref):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return None, None
+        return real_remote_state(repo, remote, state_ref)
+
+    monkeypatch.setattr(state_sync, "_remote_state", racing_remote_state)
+    assert run(["recover", "--repo", str(local)]) == 0
+    assert calls["count"] >= 2
+    assert remote_state_commit(origin) == recreated
+    monkeypatch.undo()
+
+    recovered = load_state(live_path(local))
+    assert recovered["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+    assert "local-delivery" in recovered["alerts"]
+    assert run(["sync", "--repo", str(local)]) == 0
+    assert load_state(live_path(local))["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+
+
+def install_local_check(repo: Path) -> Path:
+    """The shipped launchd script, with a Python stub that records a watcher run."""
+    (repo / "scripts").mkdir(exist_ok=True)
+    script = repo / "scripts" / "local-check.sh"
+    script.write_text(
+        (ROOT / "scripts" / "local-check.sh").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    (repo / ".env").write_text("", encoding="utf-8")
+    (repo / ".venv" / "bin").mkdir(parents=True)
+    stub = repo / ".venv" / "bin" / "python"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-m" ] && [ "$2" = "watcher.state_sync" ]; then\n'
+        '  exec "$REAL_PYTHON" "$@"\n'
+        "fi\n"
+        "printf '%s\\n' \"$*\" >> watcher-invocations\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return script
+
+
+def test_local_check_stops_before_the_watcher_when_the_ref_is_missing(
+    tmp_path, two_clones
+):
+    """The pre-run sync tolerates transport failures and runs the watcher anyway.
+    A confirmed absence is the exception: this clone would otherwise deliver
+    from the tracked seed, re-sending history nobody has receipts for here."""
+    origin, local, _ = two_clones
+    deliver(local, HISTORIC_ALERT, "attempt-historic")
+    synchronize(local)
+    delete_state_ref(origin)
+
+    fresh = clone_of(tmp_path, origin, "fresh")
+    script = install_local_check(fresh)
+    env = os.environ.copy()
+    env.update({"PYTHONPATH": str(ROOT), "REAL_PYTHON": sys.executable})
+    fired = subprocess.run(
+        ["/bin/bash", str(script)],
+        cwd=fresh,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert fired.returncode == BOOTSTRAP_REQUIRED_EXIT
+    assert "missing" in fired.stderr
+    assert not (fresh / "watcher-invocations").exists()
+    assert not live_path(fresh).exists()
+    assert remote_state_commit(origin) is None
+
+
+def test_a_surviving_base_alone_still_proves_an_existing_installation(two_clones):
+    """The live file can be lost on its own — a wiped `.cache` entry, a failed
+    write — while `base.json` still records what was delivered. Seeding over
+    that would make every alert it holds eligible again, so `init` must refuse
+    and point at recovery, which reads that base as a store."""
+    origin, local, _ = two_clones
+    deliver(local, HISTORIC_ALERT, "attempt-historic")
+    synchronize(local)
+    base = local / DEFAULT_STORE_PATH / "base.json"
+    assert HISTORIC_ALERT in load_state(base)["alerts"]
+    live_path(local).unlink()
+    delete_state_ref(origin)
+
+    assert run(["sync", "--repo", str(local)]) == BOOTSTRAP_REQUIRED_EXIT
+    assert run(["init", "--repo", str(local)]) == 1
+    assert remote_state_commit(origin) is None
+    assert not live_path(local).exists()  # no seed materialized behind the owner
+
+    assert run(["recover", "--repo", str(local)]) == 0
+    assert HISTORIC_ALERT in load_state(live_path(local))["alerts"]
+    joined = clone_of(local.parent, origin, "joined-after-base-recovery")
+    assert run(["sync", "--repo", str(joined)]) == 0
+    assert HISTORIC_ALERT in load_state(live_path(joined))["alerts"]
+
+
+def test_local_check_stops_before_the_watcher_even_with_local_receipts(two_clones):
+    """The established clone is blocked at the wrapper too. Its own receipts say
+    nothing about what the other half delivered into the ref, so continuing
+    would re-send exactly the reminder the cloud already sent."""
+    origin, local, _ = two_clones
+    deliver(local, HISTORIC_ALERT, "attempt-historic")
+    synchronize(local)
+    delete_state_ref(origin)
+
+    script = install_local_check(local)
+    env = os.environ.copy()
+    env.update({"PYTHONPATH": str(ROOT), "REAL_PYTHON": sys.executable})
+    fired = subprocess.run(
+        ["/bin/bash", str(script)],
+        cwd=local,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert fired.returncode == BOOTSTRAP_REQUIRED_EXIT
+    assert not (local / "watcher-invocations").exists()
+    assert HISTORIC_ALERT in load_state(live_path(local))["alerts"]
+    # The owner still learns about it: one durable marker, delivered as a loud
+    # alert by the first pass that runs after recovery.
+    assert load_failure(local / DEFAULT_MARKER_PATH) is not None
