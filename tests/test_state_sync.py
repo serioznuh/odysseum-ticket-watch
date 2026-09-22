@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +14,7 @@ import pytest
 
 from watcher import jobs, notify, state_sync
 from watcher.detect import TZ_PARIS
-from watcher.state import DEFAULT_STATE, save_state
+from watcher.state import DEFAULT_STATE, LOCAL_FIRING_INTERVAL_MINUTES, save_state
 
 NOW = datetime(2026, 9, 17, 12, 0, tzinfo=TZ_PARIS)
 
@@ -392,3 +393,60 @@ def test_reconciliation_keeps_work_a_later_store_never_knew_about():
     assert set(merged["outbox"]) == {"telegram:queued", IN_FLIGHT_ID}
     assert merged["outbox"]["telegram:queued"]["status"] == "pending"
     assert merged["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+
+
+# ---------------------------------------------------------------------------
+# OTW-29: nothing in a local firing waits forever
+# ---------------------------------------------------------------------------
+
+
+def test_local_run_deadline_is_finite_and_leaves_room_for_every_bounded_step():
+    """The overall watchdog is a backstop, never a competitor: a healthy pass —
+    its whole polling budget plus a bounded deployment pull and both syncs' first
+    network waits — has to finish well inside it, and it still has to be finite
+    so a wedged tree cannot hold the lock across every later firing."""
+    assert state_sync.LOCAL_RUN_DEADLINE_SECONDS == (
+        2 * LOCAL_FIRING_INTERVAL_MINUTES * 60
+    )
+    assert state_sync.LOCAL_RUN_DEADLINE_SECONDS >= (
+        jobs.POLLING_BUDGET_SECONDS
+        + state_sync.DEPLOY_TIMEOUT_SECONDS
+        + 2 * state_sync.GIT_TIMEOUT_SECONDS
+    )
+    # A timeout must stay tellable apart from the missing-ref block and success.
+    assert state_sync.LOCAL_RUN_TIMEOUT_EXIT not in {
+        0,
+        state_sync.BOOTSTRAP_REQUIRED_EXIT,
+    }
+
+
+def test_git_timeout_is_reported_as_a_transport_failure(tmp_path, monkeypatch):
+    """A Git child that never answers gets the existing capped streak, not a new
+    loud alert path — and never the confirmed-absence block, because a timeout is
+    no answer about what the shared ref holds."""
+    def timed_out(command, **kwargs):
+        return subprocess.CompletedProcess(list(command), 0, "", ""), True
+
+    monkeypatch.setattr(state_sync, "_run_bounded", timed_out)
+    with pytest.raises(state_sync.StateSyncTransportError, match="did not answer"):
+        state_sync._git(tmp_path, "ls-remote", "--exit-code", "origin", "refs/x")
+    # check=False callers are not exempt: a timeout is not a returncode.
+    with pytest.raises(state_sync.StateSyncTransportError):
+        state_sync._git(tmp_path, "push", "origin", "x", check=False)
+
+
+def test_local_check_bounds_the_deployment_pull_and_the_whole_firing():
+    """The wrapper holds one overlap lock across deployment, both syncs and the
+    watcher, so an unbounded Git child there costs every later firing too."""
+    root = Path(__file__).resolve().parent.parent
+    lines = (root / "scripts" / "local-check.sh").read_text(encoding="utf-8").splitlines()
+
+    def line_of(needle: str) -> int:
+        return next(index for index, line in enumerate(lines) if needle in line)
+
+    locked = line_of("state_sync locked")
+    pull = line_of("git pull --ff-only")
+    pre_sync = line_of("sync_state || pre_sync_status")
+    # The pull runs through the stdlib boundary, and deployment still comes first.
+    assert "state_sync bounded" in "".join(lines[pull - 1 : pull + 1])
+    assert locked < pull < pre_sync

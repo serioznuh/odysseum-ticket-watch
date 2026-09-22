@@ -17,6 +17,14 @@ cd "$(dirname "$0")/.."
 # launchd normally serializes firings, but a manual run can overlap it. Hold
 # one process lock across deploy, both state syncs and the watcher itself so two
 # local owners can never read and write the live JSON concurrently.
+#
+# `locked` also supervises the whole firing under its documented overall
+# deadline (state_sync.LOCAL_RUN_DEADLINE_SECONDS, two launchd intervals) plus a
+# cleanup allowance. On that deadline it stops and reaps this run's own process
+# tree before releasing the lock, then exits non-zero — so a hung Git child
+# costs the reminder ladder two firings instead of every later one, and the next
+# firing never races a writer that is still alive. The lock file is never
+# deleted to break a lock.
 if [ "${OTW_LOCAL_CHECK_LOCKED:-}" != "1" ]; then
   exec .venv/bin/python -m watcher.state_sync locked \
     --lock .cache/local-check.lock -- /bin/bash "$0" "$@"
@@ -30,8 +38,15 @@ status=0
 # can therefore neither block this fast-forward nor roll it back. Re-exec the
 # newly deployed script once so script changes take effect in this firing; the
 # parent Python process continues holding the overlap lock across the exec.
+#
+# The pull runs under `state_sync bounded`, the same stdlib boundary the state
+# syncs use (macOS ships no `timeout` binary). A pull that never answers is
+# stopped with its whole process tree and counts as a failed deployment, so this
+# firing continues on the installed code instead of hanging until the overall
+# deadline and losing the reminder check entirely.
 if [ "${OTW_CODE_DEPLOYED:-}" != "1" ]; then
-  if git pull --ff-only --quiet origin main; then
+  if .venv/bin/python -m watcher.state_sync bounded \
+      -- git pull --ff-only --quiet origin main; then
     export OTW_CODE_DEPLOYED=1
     exec /bin/bash "$0" "$@"
   fi
@@ -39,6 +54,9 @@ if [ "${OTW_CODE_DEPLOYED:-}" != "1" ]; then
   status=1
 fi
 
+# Every Git invocation inside a sync waits a bounded time
+# (state_sync.GIT_TIMEOUT_SECONDS) and a timeout stops that Git process tree and
+# counts as a transport failure — the existing capped streak, no new alert path.
 sync_state() {
   .venv/bin/python -m watcher.state_sync sync --store .cache/state-sync
 }

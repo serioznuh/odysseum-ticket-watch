@@ -14,6 +14,12 @@ Creating the shared ref is never ordinary work (OTW-30).  A confirmed absence
 cannot be told apart from deletion of an established ref, so ``synchronize``
 refuses it and the operator runs ``init`` (a genuinely new installation) or
 ``recover`` (an existing one, reconciling every surviving store first).
+
+Every child process started here waits for a bounded time (OTW-29).  The local
+wrapper holds one overlap lock across deployment, both state syncs and the
+watcher, so a Git child that never answers used to silence the reminder ladder
+for every later firing too.  ``bounded`` and ``locked`` supply that boundary to
+the shell wrapper, which is why no platform ``timeout`` binary is required.
 """
 
 from __future__ import annotations
@@ -23,8 +29,10 @@ import fcntl
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
@@ -50,6 +58,27 @@ DEFAULT_SEED_PATH = "state/state.json"
 # must stop rather than let the watcher deliver from an unverified history.
 # Mirrored by scripts/local-check.sh and .github/workflows/watch.yml; a test pins them.
 BOOTSTRAP_REQUIRED_EXIT = 3
+
+# OTW-29 bounds every child this module starts.  One Git invocation gets this
+# long, network round trips included; a wedged fetch or push is the case that
+# matters and it is reported as a transport failure, never as a new alert path.
+GIT_TIMEOUT_SECONDS = 45.0
+# The wrapper's deployment pull, which can legitimately transfer more than a
+# state blob.  Deployment stays first: exceeding this is a failed deployment, so
+# the firing continues on the installed code exactly as before.
+DEPLOY_TIMEOUT_SECONDS = 90.0
+# SIGTERM → SIGKILL allowance for a stopped tree, and the time a supervisor
+# waits for the group to drain before it releases the overlap lock.
+CLEANUP_GRACE_SECONDS = 10.0
+# Overall deadline for one local firing: deployment, both syncs and the watcher
+# together.  Two launchd intervals — far more than a healthy pass needs (its own
+# polling budget is 0.8 of one interval) yet finite, so a hung tree costs the
+# reminder ladder two firings instead of every firing until someone notices.
+LOCAL_RUN_DEADLINE_SECONDS = 2 * state_mod.LOCAL_FIRING_INTERVAL_MINUTES * 60
+# `locked`/`bounded` exit with this when a deadline, not the child, ended the
+# run.  Distinct from BOOTSTRAP_REQUIRED_EXIT so the wrappers' blocking
+# condition stays unambiguous, and non-zero so the launchd log is actionable.
+LOCAL_RUN_TIMEOUT_EXIT = 4
 
 # Any of these proves this installation already notified the user: receipts and
 # the reminder ladder directly, and the baselines that only advance once their
@@ -99,23 +128,171 @@ def _resolve_under(repo: Path, path: str | Path) -> Path:
     return candidate if candidate.is_absolute() else repo / candidate
 
 
+def _signal_group(pid: int, signum: int) -> bool:
+    """Signal one process group, reporting whether anything was still in it."""
+    try:
+        os.killpg(pid, signum)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def _drain_group(pid: int, *, grace: float) -> bool:
+    """True once the supervised process group holds no process any more."""
+    deadline = time.monotonic() + max(0.0, grace)
+    while True:
+        if not _signal_group(pid, 0):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _stop_tree(process: subprocess.Popen, *, grace: float) -> tuple[str | None, str | None]:
+    """Stop the child and everything it started, then reap the child itself.
+
+    The child leads its own session, so its process group is exactly the tree
+    this invocation owns: the grandchildren a hung Git leaves behind (``ssh``,
+    ``git-remote-https``) are reached, and nothing else can be.  SIGTERM first,
+    SIGKILL after the documented cleanup allowance.
+    """
+    captured: tuple[str | None, str | None] = (None, None)
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        _signal_group(process.pid, signum)
+        try:
+            captured = process.communicate(timeout=max(0.1, grace))
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    if process.poll() is None:
+        # Something outside the group is holding a pipe open. The child is dead;
+        # reap it without waiting on its output.
+        try:
+            process.wait(timeout=max(0.1, grace))
+        except subprocess.TimeoutExpired:
+            log.error("supervised child %s did not exit after SIGKILL", process.pid)
+    return captured
+
+
+@contextmanager
+def _stop_tree_on_signal(process: subprocess.Popen, *, grace: float) -> Iterator[None]:
+    """Take the supervised tree down with this supervisor when it is stopped.
+
+    launchd stops a job with SIGTERM and a manual run ends with Ctrl-C; neither
+    reaches the child any more, because it leads its own session.  Without this
+    the supervisor would exit and release the overlap lock while its writer is
+    still alive — the one race that lock exists to prevent.  The handler only
+    signals the group, so it stays safe to run while the main thread waits.
+    """
+
+    def handler(signum: int, frame: object) -> None:
+        _signal_group(process.pid, signal.SIGTERM)
+        if not _drain_group(process.pid, grace=grace):
+            _signal_group(process.pid, signal.SIGKILL)
+
+    installed: dict[int, object] = {}
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            installed[signum] = signal.signal(signum, handler)
+    except ValueError:
+        # Not the main thread: the caller keeps whatever handling it has.
+        pass
+    try:
+        yield
+    finally:
+        for signum, previous in installed.items():
+            signal.signal(signum, previous)
+
+
+def _run_bounded(
+    command: Sequence[str],
+    *,
+    timeout: float,
+    cleanup_grace: float | None = None,
+    cwd: str | Path | None = None,
+    env: dict[str, str] | None = None,
+    input_text: str | None = None,
+    capture: bool = True,
+    adopt_signals: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], bool]:
+    """Run a child under a finite wait, owning the whole tree it starts.
+
+    Returns the completed process and whether the deadline — rather than the
+    child — ended it.  The caller only continues once that tree has stopped, so
+    a supervisor holding the overlap lock never releases it to a second writer
+    while the first one is still alive.
+    """
+    grace = CLEANUP_GRACE_SECONDS if cleanup_grace is None else cleanup_grace
+    process = subprocess.Popen(
+        list(command),
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        start_new_session=True,
+    )
+    timed_out = False
+    try:
+        if adopt_signals:
+            with _stop_tree_on_signal(process, grace=grace):
+                stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+        else:
+            stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        stdout, stderr = _stop_tree(process, grace=grace)
+    if not _drain_group(process.pid, grace=grace):
+        # The child is reaped but left part of its own tree behind. Stop that too
+        # rather than let it outlive the lock this invocation holds.
+        _signal_group(process.pid, signal.SIGTERM)
+        if not _drain_group(process.pid, grace=grace):
+            _signal_group(process.pid, signal.SIGKILL)
+            _drain_group(process.pid, grace=grace)
+    # A tree that survived even SIGKILL leaves no status; report it as killed
+    # rather than let None reach a caller that expects an exit code.
+    returncode = -signal.SIGKILL if process.returncode is None else process.returncode
+    completed = subprocess.CompletedProcess(
+        list(command), returncode, stdout or "", stderr or ""
+    )
+    return completed, timed_out
+
+
+def _exit_code(returncode: int) -> int:
+    """A shell-style status, so a child killed by a signal stays non-zero."""
+    return returncode if returncode >= 0 else 128 - returncode
+
+
 def _git(
     repo: Path,
     *args: str,
     input_text: str | None = None,
     check: bool = True,
+    env_extra: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.setdefault("GIT_TERMINAL_PROMPT", "0")
-    result = subprocess.run(
+    if env_extra:
+        env.update(env_extra)
+    limit = GIT_TIMEOUT_SECONDS if timeout is None else timeout
+    result, timed_out = _run_bounded(
         ["git", *args],
         cwd=repo,
         env=env,
-        input=input_text,
-        capture_output=True,
-        text=True,
-        check=False,
+        input_text=input_text,
+        timeout=limit,
     )
+    if timed_out:
+        # A Git child that never answers is a transport condition, not a state
+        # integrity one, so the existing capped streak covers it and a flaky
+        # network invents no new loud alert. `check=False` callers are not
+        # exempt: a timeout is no answer about what the shared ref holds.
+        raise StateSyncTransportError(
+            f"git {' '.join(args[:2])} did not answer within {limit:g}s; "
+            "its process tree was stopped"
+        )
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout).strip() or "unknown git error"
         raise StateSyncError(f"git {' '.join(args[:2])} failed: {detail}")
@@ -145,7 +322,13 @@ def _remote_state(
 ) -> tuple[str | None, dict | None]:
     advertised = _git(repo, "ls-remote", "--exit-code", remote, state_ref, check=False)
     if advertised.returncode == 2:
-        _git(repo, "update-ref", "-d", FETCHED_STATE_REF, check=False)
+        try:
+            _git(repo, "update-ref", "-d", FETCHED_STATE_REF, check=False)
+        except StateSyncError:
+            # The absence is already confirmed and the wrappers stop on that
+            # condition alone, so dropping a stale fetched ref must never be
+            # able to downgrade it into a mere transport failure.
+            log.exception("could not drop the stale fetched state ref")
         return None, None
     if advertised.returncode != 0:
         detail = (advertised.stderr or advertised.stdout).strip()
@@ -180,22 +363,16 @@ def _state_commit(repo: Path, state: dict, parent: str | None) -> str:
         args.extend(["-p", parent])
     now = datetime.now(timezone.utc)
     args.extend(["-m", f"state: sync {now:%Y-%m-%dT%H:%M:%SZ} [skip ci]"])
-    env = os.environ.copy()
-    env.update(
-        {
+    result = _git(
+        repo,
+        *args,
+        check=False,
+        env_extra={
             "GIT_AUTHOR_NAME": "ticket-watch-state-sync",
             "GIT_AUTHOR_EMAIL": "state-sync@localhost",
             "GIT_COMMITTER_NAME": "ticket-watch-state-sync",
             "GIT_COMMITTER_EMAIL": "state-sync@localhost",
-        }
-    )
-    result = subprocess.run(
-        ["git", *args],
-        cwd=repo,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
+        },
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
@@ -703,6 +880,16 @@ def resolve_failure(
     return True
 
 
+def _child_command(
+    child: Sequence[str], parser: argparse.ArgumentParser, command: str
+) -> list[str]:
+    if child and child[0] == "--":
+        child = child[1:]
+    if not child:
+        parser.error(f"{command} requires a child command after --")
+    return list(child)
+
+
 def run(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -744,7 +931,21 @@ def run(argv: list[str] | None = None) -> int:
     )
     locked = subparsers.add_parser("locked")
     locked.add_argument("--lock", default=".cache/local-check.lock")
+    locked.add_argument(
+        "--deadline",
+        type=float,
+        default=LOCAL_RUN_DEADLINE_SECONDS,
+        help="overall seconds for the whole locked run (deploy, syncs, watcher)",
+    )
+    locked.add_argument("--cleanup-grace", type=float, default=CLEANUP_GRACE_SECONDS)
     locked.add_argument("child", nargs=argparse.REMAINDER)
+    bounded = subparsers.add_parser(
+        "bounded",
+        help="run one child under a finite wait, stopping its whole tree on timeout",
+    )
+    bounded.add_argument("--timeout", type=float, default=DEPLOY_TIMEOUT_SECONDS)
+    bounded.add_argument("--cleanup-grace", type=float, default=CLEANUP_GRACE_SECONDS)
+    bounded.add_argument("child", nargs=argparse.REMAINDER)
     record = subparsers.add_parser("record")
     record.add_argument("--detail", required=True)
     record.add_argument("--path", default=DEFAULT_MARKER_PATH)
@@ -844,18 +1045,50 @@ def run(argv: list[str] | None = None) -> int:
             else:
                 print(f"created shared state ref {args.ref} from {live_path}")
         elif args.command == "locked":
-            child: Sequence[str] = args.child
-            if child and child[0] == "--":
-                child = child[1:]
-            if not child:
-                parser.error("locked requires a child command after --")
+            child = _child_command(args.child, parser, "locked")
             with file_lock(args.lock, blocking=False) as acquired:
                 if not acquired:
                     print("local check already running; skipping overlapping firing", file=sys.stderr)
                     return 0
                 env = os.environ.copy()
                 env["OTW_LOCAL_CHECK_LOCKED"] = "1"
-                return subprocess.run(list(child), env=env, check=False).returncode
+                # The lock is released only after _run_bounded has stopped and
+                # drained this run's own tree, so the next firing can never
+                # acquire it while an earlier writer is still alive.
+                result, timed_out = _run_bounded(
+                    child,
+                    env=env,
+                    capture=False,
+                    timeout=args.deadline,
+                    cleanup_grace=args.cleanup_grace,
+                    adopt_signals=True,
+                )
+                if timed_out:
+                    print(
+                        f"local check exceeded its {args.deadline:g}s deadline; the run's "
+                        "process tree was stopped. Saved state and receipts are intact; "
+                        "check the Git remote and the launchd log",
+                        file=sys.stderr,
+                    )
+                    return LOCAL_RUN_TIMEOUT_EXIT
+                return _exit_code(result.returncode)
+        elif args.command == "bounded":
+            child = _child_command(args.child, parser, "bounded")
+            result, timed_out = _run_bounded(
+                child,
+                capture=False,
+                timeout=args.timeout,
+                cleanup_grace=args.cleanup_grace,
+                adopt_signals=True,
+            )
+            if timed_out:
+                print(
+                    f"`{' '.join(child)}` did not finish within {args.timeout:g}s; "
+                    "its process tree was stopped",
+                    file=sys.stderr,
+                )
+                return LOCAL_RUN_TIMEOUT_EXIT
+            return _exit_code(result.returncode)
         elif args.command == "record":
             record_failure(args.detail, args.path)
         else:

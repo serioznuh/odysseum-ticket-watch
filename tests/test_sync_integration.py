@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from copy import deepcopy
 from pathlib import Path
 
@@ -777,3 +779,289 @@ def test_local_check_stops_before_the_watcher_even_with_local_receipts(two_clone
     # The owner still learns about it: one durable marker, delivered as a loud
     # alert by the first pass that runs after recovery.
     assert load_failure(local / DEFAULT_MARKER_PATH) is not None
+
+
+# ---------------------------------------------------------------------------
+# OTW-29: bounded Git waits and a bounded local run
+# ---------------------------------------------------------------------------
+
+REAL_GIT = shutil.which("git")
+HUNG_SECONDS = 600  # far beyond every bound exercised below
+BOUND = 1.0
+GRACE = 1.0
+# The configured bound plus its cleanup allowance, with generous slack for
+# interpreter startup on a loaded machine. Measured against a child that would
+# otherwise wedge for HUNG_SECONDS, this is what "finite" means here.
+PATIENCE = BOUND + 2 * GRACE + 15.0
+
+
+def hung_git(directory: Path, *subcommands: str) -> tuple[Path, Path]:
+    """A `git` that wedges on the named subcommands instead of answering.
+
+    It leaves a grandchild of its own behind — what a stalled transfer really
+    looks like, an `ssh` or `git-remote-https` still holding the socket — and
+    records both pids, so a test can prove the whole owned tree was stopped and
+    not merely the process Python spawned directly.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    pids = directory / "hung-pids"
+    shim = directory / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'case "$1" in\n  {"|".join(subcommands)})\n'
+        f"    sleep {HUNG_SECONDS} &\n"
+        f'    printf "%s\\n%s\\n" "$$" "$!" >> "{pids}"\n'
+        "    wait\n"
+        "    ;;\n"
+        "esac\n"
+        f'exec "{REAL_GIT}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim, pids
+
+
+def hung_pids(path: Path, *, timeout: float = 10.0) -> list[int]:
+    """The child and grandchild pids the wedged shim recorded."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            found = [int(line) for line in path.read_text(encoding="utf-8").split()]
+            if len(found) >= 2:
+                return found
+        time.sleep(0.05)
+    raise AssertionError(f"the hung child never recorded its pids in {path}")
+
+
+def is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def assert_tree_stopped(pids: Sequence[int], *, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        alive = [pid for pid in pids if is_alive(pid)]
+        if not alive:
+            return
+        assert time.monotonic() < deadline, f"owned processes still running: {alive}"
+        time.sleep(0.05)
+
+
+def bounded_waits(monkeypatch) -> None:
+    """Shrink the in-process bounds; the behavior under test is the timeout."""
+    monkeypatch.setattr(state_sync, "GIT_TIMEOUT_SECONDS", BOUND)
+    monkeypatch.setattr(state_sync, "CLEANUP_GRACE_SECONDS", GRACE)
+
+
+def supervisor(*args: str) -> list[str]:
+    return [sys.executable, "-m", "watcher.state_sync", *args]
+
+
+def child_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT)
+    return env
+
+
+def test_deployment_pull_timeout_is_bounded_and_stops_its_whole_tree(tmp_path):
+    """The wrapper's `git pull` runs under this boundary. A pull that never
+    answers must not hold the overlap lock: it is stopped with its grandchildren
+    and reported as a failed deployment, which the wrapper already survives by
+    running the installed code."""
+    shim, pids = hung_git(tmp_path / "hung-deploy", "pull")
+    started = time.monotonic()
+    fired = subprocess.run(
+        supervisor(
+            "bounded",
+            "--timeout",
+            str(BOUND),
+            "--cleanup-grace",
+            str(GRACE),
+            "--",
+            str(shim),
+            "pull",
+            "--ff-only",
+            "--quiet",
+            "origin",
+            "main",
+        ),
+        cwd=ROOT,
+        env=child_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert time.monotonic() - started < PATIENCE
+    assert fired.returncode == state_sync.LOCAL_RUN_TIMEOUT_EXIT
+    assert fired.returncode != BOOTSTRAP_REQUIRED_EXIT  # never the missing-ref block
+    assert "did not finish within" in fired.stderr
+    assert_tree_stopped(hung_pids(pids))
+
+
+def test_pre_run_sync_timeout_is_a_bounded_transport_failure(
+    tmp_path, two_clones, monkeypatch
+):
+    """The mandatory pre-run sync stays mandatory, but it cannot hang. A Git
+    child that never answers is the existing transport condition: no new alert
+    path, no confirmed-absence block, and the last validated copy untouched."""
+    _, local, _ = two_clones
+    synchronize(local)
+    deliver(local, HISTORIC_ALERT, "attempt-historic")
+    synchronize(local)
+    live_before = live_path(local).read_bytes()
+    base_before = (local / DEFAULT_STORE_PATH / "base.json").read_bytes()
+
+    shim, pids = hung_git(tmp_path / "hung-presync", "ls-remote")
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
+    bounded_waits(monkeypatch)
+
+    started = time.monotonic()
+    assert run(["sync", "--repo", str(local), "--push-attempts", "1"]) == 1
+    assert time.monotonic() - started < PATIENCE
+    assert_tree_stopped(hung_pids(pids))
+
+    # Gating is unchanged: one transient timeout only advances the capped streak.
+    streak = load_transport_failure(local / DEFAULT_STORE_PATH / TRANSPORT_FAILURE_FILE)
+    assert streak is not None and streak["count"] == 1
+    assert load_failure(local / DEFAULT_MARKER_PATH) is None
+    assert live_path(local).read_bytes() == live_before
+    assert (local / DEFAULT_STORE_PATH / "base.json").read_bytes() == base_before
+
+    monkeypatch.undo()
+    assert run(["sync", "--repo", str(local)]) == 0
+    assert not (local / DEFAULT_STORE_PATH / TRANSPORT_FAILURE_FILE).exists()
+
+
+def test_post_run_sync_stall_retains_receipts_and_quarantined_work(
+    tmp_path, two_clones, monkeypatch
+):
+    """The post-run sync carries the just-finished pass's receipts. A stalled
+    push must lose none of them, must leave an interrupted send `uncertain`
+    rather than retry it, and must stay retryable on the next firing."""
+    _, local, cloud = two_clones
+    synchronize(local)
+    synchronize(cloud)
+
+    def saved_by_the_pass(state: dict) -> None:
+        state["alerts"]["receipt-before-stall"] = STAMP
+        state["delivery_receipts"]["attempt-before-stall"] = {
+            "delivery_id": "telegram:receipt-before-stall",
+            "keys": ["receipt-before-stall"],
+            "delivered_at": STAMP,
+            "telegram_message_id": 909,
+        }
+        interrupted = deepcopy(IN_FLIGHT)
+        interrupted["status"] = "uncertain"
+        state["outbox"][IN_FLIGHT_ID] = interrupted
+
+    change_state(local, saved_by_the_pass)
+
+    shim, pids = hung_git(tmp_path / "hung-push", "push")
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
+    bounded_waits(monkeypatch)
+
+    started = time.monotonic()
+    assert run(["sync", "--repo", str(local), "--push-attempts", "1"]) == 1
+    assert time.monotonic() - started < PATIENCE
+    assert_tree_stopped(hung_pids(pids))
+
+    stalled = load_state(live_path(local))
+    assert "receipt-before-stall" in stalled["alerts"]
+    assert "attempt-before-stall" in stalled["delivery_receipts"]
+    assert stalled["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+    streak = load_transport_failure(local / DEFAULT_STORE_PATH / TRANSPORT_FAILURE_FILE)
+    assert streak is not None and streak["count"] == 1
+    assert load_failure(local / DEFAULT_MARKER_PATH) is None
+
+    monkeypatch.undo()
+    assert run(["sync", "--repo", str(local)]) == 0
+    synchronize(cloud)
+    shared = load_state(live_path(cloud))
+    assert "receipt-before-stall" in shared["alerts"]
+    assert shared["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+
+
+def test_overall_deadline_releases_the_lock_only_after_the_tree_stops(tmp_path):
+    """The watchdog for a firing that wedges anywhere — pull, sync or watcher.
+    It must end the run, stop the tree it owns, and leave the lock usable; the
+    lock file itself is never deleted to let a second writer in early."""
+    lock = tmp_path / "local-check.lock"
+    pids_file = tmp_path / "wedged-pids"
+    wedged = (
+        f"sleep {HUNG_SECONDS} & "
+        f'printf "%s\\n%s\\n" "$$" "$!" > "{pids_file}"; wait'
+    )
+    started = time.monotonic()
+    fired = subprocess.run(
+        supervisor(
+            "locked",
+            "--lock",
+            str(lock),
+            "--deadline",
+            str(BOUND),
+            "--cleanup-grace",
+            str(GRACE),
+            "--",
+            "/bin/sh",
+            "-c",
+            wedged,
+        ),
+        cwd=ROOT,
+        env=child_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert time.monotonic() - started < PATIENCE
+    assert fired.returncode == state_sync.LOCAL_RUN_TIMEOUT_EXIT
+    assert "deadline" in fired.stderr
+    assert_tree_stopped(hung_pids(pids_file))
+    assert lock.exists()  # released, not removed
+
+    # Only now may the next firing run, and it must not report an overlap.
+    followed = subprocess.run(
+        supervisor("locked", "--lock", str(lock), "--", "/bin/echo", "next firing"),
+        cwd=ROOT,
+        env=child_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert followed.returncode == 0
+    assert "already running" not in followed.stderr
+    assert "next firing" in followed.stdout
+
+
+def test_failed_deployment_still_runs_the_watcher_on_installed_code(two_clones):
+    """The fallback a bounded pull reuses: deployment reports and the firing
+    continues, so a Git problem never costs the reminder check."""
+    _, local, _ = two_clones
+    synchronize(local)
+    git(local, "remote", "set-url", "origin", str(local.parent / "vanished.git"))
+    script = install_local_check(local)
+    env = child_env()
+    env["REAL_PYTHON"] = sys.executable
+
+    fired = subprocess.run(
+        ["/bin/bash", str(script)],
+        cwd=local,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert fired.returncode != 0
+    assert fired.returncode != BOOTSTRAP_REQUIRED_EXIT
+    assert "code deployment from origin/main failed" in fired.stderr
+    # The watcher ran anyway, on the installed code, with the last validated state.
+    assert (local / "watcher-invocations").exists()
+    assert HISTORIC_ALERT not in load_state(live_path(local))["alerts"]

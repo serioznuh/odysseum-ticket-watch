@@ -47,6 +47,11 @@ Core facts agents need before editing:
   state **both before and after** the watcher run. The pre-run sync is not
   redundant: without it the Mac cannot see a reminder the cloud failover sent
   while it slept and can re-send it.
+- Every Git child there and in `state_sync` is bounded, and `locked` caps the
+  whole firing. A timeout is a **transport** failure (the existing capped streak,
+  no new alert path), never a confirmed absence; a supervisor releases the
+  overlap lock only after stopping and reaping its own process tree, never by
+  deleting the lock file.
 
 ### Cinesa half (second target)
 
