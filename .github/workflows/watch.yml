@@ -91,6 +91,17 @@ jobs:
           echo "::error::shared runtime-state ref is missing; no send may happen until 'python -m watcher.state_sync init' (new install) or 'recover' (existing one) runs"
           exit 1
 
+      # Exit 5 (state_sync.UNCONFIRMED_TREE_EXIT — a test pins the number) blocks
+      # the same way: the pre-run sync left a Git process group it could not stop.
+      # That group may still be pushing the shared ref, so this job stops before
+      # any send and before a second Git writer of its own, exactly as
+      # scripts/local-check.sh does on the host.
+      - name: Stop on an unconfirmed Git process group
+        if: ${{ steps.presync.outputs.code == '5' }}
+        run: |
+          echo "::error::the pre-run state sync left a Git process group running; stopping before any send or a second Git writer"
+          exit 1
+
       - name: Run watcher (${{ steps.mode.outputs.mode }})
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -120,12 +131,12 @@ jobs:
       # probe after failover work so a transient Telegram/API failure cannot
       # cost a due reminder; `always()` still makes a bad probe fail the run.
       - name: Validate Telegram credentials (no message)
-        if: ${{ always() && steps.presync.outputs.code != '3' }}
+        if: ${{ always() && steps.presync.outputs.code != '3' && steps.presync.outputs.code != '5' }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python -m watcher --state .cache/state-sync/state.json --check-telegram
 
       - name: Synchronize runtime state (after)
-        if: ${{ always() && inputs.dry_run != true && steps.presync.outputs.code != '3' }}
+        if: ${{ always() && inputs.dry_run != true && steps.presync.outputs.code != '3' && steps.presync.outputs.code != '5' }}
         run: python -m watcher.state_sync sync

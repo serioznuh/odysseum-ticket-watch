@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import signal
 import subprocess
@@ -738,3 +739,97 @@ def test_an_operator_command_also_records_a_surviving_git_child(tmp_path, monkey
         .read_text(encoding="utf-8")
     )
     assert survivor["pgid"] == 4243
+
+
+def kill_this_process_after(delay: float) -> subprocess.Popen:
+    """A helper that delivers a real SIGTERM to this process, once."""
+    return subprocess.Popen(
+        ["/bin/sh", "-c", f"sleep {delay}; kill -TERM {os.getpid()}"]
+    )
+
+
+def test_a_signal_that_cannot_stop_the_tree_records_it_before_giving_up(
+    tmp_path, monkeypatch
+):
+    """Round-1 finding: when the stop a signal asks for does not take, waiting on
+    is exactly wrong — a surviving Git child holding a captured pipe keeps the
+    wait blocked until the level above SIGKILLs this process, and nothing would be
+    recorded. The handler records the survivor itself and ends the wait."""
+    marker = tmp_path / "survivor.json"
+    never_drains(monkeypatch)
+    killer = kill_this_process_after(0.4)
+    try:
+        with pytest.raises(state_sync.StateSyncCleanupError) as failure:
+            state_sync._run_bounded(
+                ["/bin/sh", "-c", "trap '' TERM; sleep 20"],
+                timeout=20,
+                cleanup_budget=0.2,
+                survivor_marker=marker,
+            )
+    finally:
+        killer.wait()
+
+    recorded = json.loads(marker.read_text(encoding="utf-8"))
+    assert recorded["pgid"] == failure.value.pgid
+    assert "could not stop" in recorded["detail"]
+    try:  # the tree was SIGKILLed on the way out; do not leave it unreaped
+        os.waitpid(failure.value.pgid, 0)
+    except (ChildProcessError, OSError):
+        pass
+
+
+def test_the_survivor_retry_keeps_signals_handled(tmp_path, capsys):
+    """Round-1 finding: that retry loop used to run with default signal handling,
+    so a SIGTERM there ended the only guard in place. It is deferred instead —
+    this test process would not survive the signal otherwise."""
+    original = signal.getsignal(signal.SIGTERM)
+    survivor = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    exc = state_sync.StateSyncCleanupError("still running", pgid=survivor.pid)
+
+    with pytest.MonkeyPatch.context() as patch:
+        def unwritable(*args, **kwargs):
+            raise OSError("read-only file system")
+
+        patch.setattr(state_sync, "record_unconfirmed_tree", unwritable)
+        killer = kill_this_process_after(0.2)
+        try:
+            started = time.monotonic()
+            code = state_sync._report_unconfirmed_tree(
+                exc, tmp_path / "survivor.json", "local check", hold=0.6, poll=0.05
+            )
+            held = time.monotonic() - started
+        finally:
+            killer.wait()
+            survivor.kill()
+            survivor.wait()
+
+    assert code == state_sync.UNCONFIRMED_TREE_EXIT
+    assert held >= 0.6, "the signal cut the hold short"
+    assert "deferred signal" in capsys.readouterr().err
+    assert signal.getsignal(signal.SIGTERM) is original
+
+
+def test_both_wrappers_block_on_every_blocking_exit_code():
+    """Round-1 finding: the cloud wrapper blocked only on the missing ref, so a
+    pre-sync that left a live Git group fell through to sending and to a second
+    Git writer. Both wrappers must stop on the whole set."""
+    root = Path(__file__).resolve().parent.parent
+    script = (root / "scripts" / "local-check.sh").read_text(encoding="utf-8")
+    workflow = (root / ".github" / "workflows" / "watch.yml").read_text(encoding="utf-8")
+    assert state_sync.WRAPPER_BLOCKING_EXITS == (
+        state_sync.BOOTSTRAP_REQUIRED_EXIT,
+        state_sync.UNCONFIRMED_TREE_EXIT,
+    )
+
+    for code in state_sync.WRAPPER_BLOCKING_EXITS:
+        assert re.search(rf"^STATE_[A-Z_]+={code}$", script, re.MULTILINE), (
+            f"local-check.sh no longer mirrors blocking exit {code}"
+        )
+        assert f'steps.presync.outputs.code == \'{code}\'' in workflow, (
+            f"the cloud wrapper has no step that stops the job on exit {code}"
+        )
+        for gated in ("Validate Telegram credentials", "Synchronize runtime state (after)"):
+            section = workflow[workflow.index(gated) :]
+            assert f"steps.presync.outputs.code != '{code}'" in section[
+                : section.index("run:")
+            ], f"{gated} must be skipped on exit {code}"
