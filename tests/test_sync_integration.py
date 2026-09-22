@@ -586,25 +586,88 @@ def test_recovery_refuses_the_tracked_seed_as_evidence(uninitialized):
     assert not live_path(first).exists()
 
 
-def test_recovery_leaves_a_concurrently_recreated_ref_intact(tmp_path, two_clones):
+def test_recovery_folds_a_concurrently_recreated_ref_without_rewriting_it(
+    tmp_path, two_clones
+):
+    """The racing host may be the *only* place an uncertain attempt is recorded.
+    Recovery must fold whatever the ref holds when it writes, and record it as
+    the incorporated base: otherwise the next sync reads that remote-only work
+    as locally deleted, drops the quarantine, and the message can go out twice."""
     origin, local, cloud = two_clones
     synchronize(cloud)
     deliver(local, "local-delivery", "attempt-local")
     delete_state_ref(origin)
-    # Another host recreated the ref from its own surviving store first.
-    deliver(cloud, "cloud-delivery", "attempt-cloud")
+    # Another host recreated the ref from its own surviving store first, carrying
+    # a delivery whose Telegram outcome it never learned.
+    def cloud_work(state: dict) -> None:
+        state["alerts"]["cloud-delivery"] = STAMP
+        state["delivery_receipts"]["attempt-cloud"] = {
+            "delivery_id": "telegram:cloud-delivery",
+            "keys": ["cloud-delivery"],
+            "delivered_at": STAMP,
+            "telegram_message_id": 102,
+        }
+        state["outbox"][IN_FLIGHT_ID] = deepcopy(IN_FLIGHT)
+
+    change_state(cloud, cloud_work)
     assert run(["recover", "--repo", str(cloud)]) == 0
     recreated = remote_state_commit(origin)
+    assert IN_FLIGHT_ID in load_state(live_path(cloud))["outbox"]
 
     assert run(["recover", "--repo", str(local)]) == 0
-    assert remote_state_commit(origin) == recreated
-    # The loser keeps its own evidence and unions it upstream on the next sync.
-    assert "local-delivery" in load_state(live_path(local))["alerts"]
+    assert remote_state_commit(origin) == recreated  # history left intact
+    recovered = load_state(live_path(local))
+    assert "local-delivery" in recovered["alerts"]  # its own evidence survives
+    assert recovered["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+
     assert run(["sync", "--repo", str(local)]) == 0
     unioned = load_state(live_path(local))
     assert {"local-delivery", "cloud-delivery"} <= set(unioned["alerts"])
+    # Still quarantined, and its key is still unsent — so nothing re-derives it
+    # into a second send.
+    assert unioned["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+    assert "news:leak-42" not in unioned["alerts"]
     synchronize(cloud)
-    assert {"local-delivery", "cloud-delivery"} <= set(load_state(live_path(cloud))["alerts"])
+    shared = load_state(live_path(cloud))
+    assert {"local-delivery", "cloud-delivery"} <= set(shared["alerts"])
+    assert shared["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+
+
+def test_recovery_losing_the_push_race_folds_the_ref_that_won(
+    tmp_path, two_clones, monkeypatch
+):
+    """Same guarantee through the other door: the pre-check saw no ref, the
+    creating push lost, and only the re-read tells the truth."""
+    origin, local, cloud = two_clones
+    synchronize(cloud)
+    deliver(local, "local-delivery", "attempt-local")
+    delete_state_ref(origin)
+    change_state(cloud, lambda state: state["outbox"].__setitem__(
+        IN_FLIGHT_ID, deepcopy(IN_FLIGHT)
+    ))
+    assert run(["recover", "--repo", str(cloud)]) == 0
+    recreated = remote_state_commit(origin)
+
+    real_remote_state = state_sync._remote_state
+    calls = {"count": 0}
+
+    def racing_remote_state(repo, remote, state_ref):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return None, None
+        return real_remote_state(repo, remote, state_ref)
+
+    monkeypatch.setattr(state_sync, "_remote_state", racing_remote_state)
+    assert run(["recover", "--repo", str(local)]) == 0
+    assert calls["count"] >= 2
+    assert remote_state_commit(origin) == recreated
+    monkeypatch.undo()
+
+    recovered = load_state(live_path(local))
+    assert recovered["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+    assert "local-delivery" in recovered["alerts"]
+    assert run(["sync", "--repo", str(local)]) == 0
+    assert load_state(live_path(local))["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
 
 
 def install_local_check(repo: Path) -> Path:

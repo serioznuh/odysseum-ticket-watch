@@ -340,3 +340,55 @@ def test_startup_wrappers_stop_on_the_missing_ref_exit_code():
             f"steps.presync.outputs.code != '{state_sync.BOOTSTRAP_REQUIRED_EXIT}'"
             in section[: section.index("run:")]
         ), f"{gated} must be skipped when initialization is required"
+
+
+def test_blocked_exit_survives_a_failing_transport_streak_cleanup(
+    tmp_path, monkeypatch
+):
+    """Both wrappers stop on this exit status alone. Incidental bookkeeping
+    failure must not turn the block into "continue and deliver"."""
+    monkeypatch.setattr(state_sync, "synchronize", ref_absent(established=True))
+
+    def fail_cleanup(path):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(state_sync, "clear_transport_failure", fail_cleanup)
+
+    assert state_sync.run(["sync", "--repo", str(tmp_path)]) == (
+        state_sync.BOOTSTRAP_REQUIRED_EXIT
+    )
+
+
+def test_blocked_exit_survives_a_failing_marker_write(tmp_path, monkeypatch):
+    monkeypatch.setattr(state_sync, "synchronize", ref_absent(established=True))
+
+    def fail_marker(detail, path=state_sync.DEFAULT_MARKER_PATH, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(state_sync, "record_failure", fail_marker)
+
+    assert state_sync.run(["sync", "--repo", str(tmp_path)]) == (
+        state_sync.BOOTSTRAP_REQUIRED_EXIT
+    )
+
+
+def test_reconciliation_keeps_work_a_later_store_never_knew_about():
+    """These stores share no base, so a store that lacks a record is not saying
+    it was retired. A `pending` item only one store holds must survive too: it
+    is real queued work, and only a receipt or satisfied ack retires it."""
+    holder = deepcopy(DEFAULT_STATE)
+    holder["outbox"]["telegram:queued"] = in_flight_record("pending")
+    holder["outbox"]["telegram:queued"]["keys"] = ["news:queued"]
+    holder["outbox"]["telegram:queued"]["ack"] = {
+        "type": "alerts",
+        "keys": ["news:queued"],
+    }
+    holder["outbox"][IN_FLIGHT_ID] = in_flight_record("uncertain")
+    unaware = deepcopy(DEFAULT_STATE)
+    unaware["last_check_ok"] = NOW.isoformat()
+
+    merged = state_sync.reconcile_stores([holder, unaware])
+
+    assert set(merged["outbox"]) == {"telegram:queued", IN_FLIGHT_ID}
+    assert merged["outbox"]["telegram:queued"]["status"] == "pending"
+    assert merged["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"

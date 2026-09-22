@@ -295,26 +295,39 @@ def reconcile_stores(stores: Sequence[dict]) -> dict:
         raise StateSyncError(
             f"surviving runtime-state stores could not be reconciled: {exc}"
         ) from exc
-    # The fold treats work a later store never knew about as retired, which is
-    # right for a real base and wrong here: an attempt one surviving store left
-    # in flight is unknown, not finished. Re-add every such attempt and mark it
-    # uncertain, unless this reconciliation itself proves it was delivered.
+    merged["outbox"] = _reconcile_outbox(snapshots, merged)
+    return state_mod.migrate_state(merged)
+
+
+def _reconcile_outbox(snapshots: Sequence[dict], merged: dict) -> dict:
+    """Rebuild the outbox from every store rather than fold it.
+
+    The fold reads a record a later store never knew about as retired, which is
+    right against a real base and wrong here: these stores share none.  Only a
+    receipt or a satisfied acknowledgement retires work, so the union is the
+    honest answer, and any store that left an attempt in flight makes the result
+    ``uncertain``.  Record bodies come from the last store that carries them,
+    matching the plain-field rule above.
+    """
+    rebuilt: dict[str, dict] = {}
     in_flight: dict[str, dict] = {}
     for snapshot in snapshots:
         for delivery_id, record in snapshot["outbox"].items():
+            rebuilt[delivery_id] = deepcopy(record)
             if record["status"] in {"sending", "uncertain"}:
                 in_flight.setdefault(delivery_id, record)
-    for delivery_id, record in in_flight.items():
-        current = merged["outbox"].get(delivery_id)
-        if current is None:
-            if _delivery_settled(merged, delivery_id, record):
-                continue
-            current = deepcopy(record)
-            merged["outbox"][delivery_id] = current
-        current["status"] = "uncertain"
-        if "claim" not in current and "claim" in record:
-            current["claim"] = deepcopy(record["claim"])
-    return state_mod.migrate_state(merged)
+    for delivery_id, record in rebuilt.items():
+        source = in_flight.get(delivery_id)
+        if source is None:
+            continue
+        record["status"] = "uncertain"
+        if "claim" not in record and "claim" in source:
+            record["claim"] = deepcopy(source["claim"])
+    return {
+        delivery_id: record
+        for delivery_id, record in rebuilt.items()
+        if not _delivery_settled(merged, delivery_id, record)
+    }
 
 
 def _delivery_settled(merged: dict, delivery_id: str, record: dict) -> bool:
@@ -392,31 +405,43 @@ def recover(
 ) -> tuple[Path, bool]:
     """Rebuild the shared ref for an existing installation, owner-approved.
 
-    Every surviving store is reconciled first — the live file, the last
-    incorporated base, and any backup given in ``extra`` — so confirmed
-    receipts survive and in-flight attempts stay quarantined.  The tracked seed
-    is never a store: it would look like proof that nothing was ever sent.
+    Every surviving store is reconciled — the live file, the last incorporated
+    base, and any backup given in ``extra`` — so confirmed receipts survive and
+    in-flight attempts stay quarantined.  The tracked seed is never a store: it
+    would look like proof that nothing was ever sent.
+
+    A ref that exists when the write happens is folded in as another store, at
+    whatever content it holds *then*: a host that recreated the ref meanwhile
+    may be the only place an uncertain attempt is recorded, and its history is
+    left exactly as it is.  Local stores still own the plain health fields, so a
+    racing seed cannot drop a live reminder ladder.
     """
     paths = _Store(repo, store)
     with file_lock(paths.lock, blocking=True):
-        stores: list[dict] = []
+        older: list[dict] = []
         for item in extra:
             path = _resolve_under(paths.repo, item)
-            stores.append(_load_file(path, f"recovery store {path}"))
+            older.append(_load_file(path, f"recovery store {path}"))
         if paths.base.exists():
-            stores.append(_load_file(paths.base, "state sync base"))
-        if paths.live.exists():
-            stores.append(_load_file(paths.live, "local live state"))
-        if not stores:
+            older.append(_load_file(paths.base, "state sync base"))
+        live = (
+            _load_file(paths.live, "local live state") if paths.live.exists() else None
+        )
+        if not older and live is None:
             raise StateSyncError(
                 "no surviving runtime-state store to recover from; the tracked seed is "
                 "not proof that an alert was never sent. Supply a backup with --from, "
                 "or use `init` for a genuinely new installation"
             )
-        recovered = reconcile_stores(stores)
+
+        def reconcile(upstream: dict | None) -> dict:
+            shared = [] if upstream is None else [upstream]
+            local = [] if live is None else [live]
+            return reconcile_stores([*older, *shared, *local])
 
         _, upstream = _remote_state(paths.repo, remote, state_ref)
         if upstream is None:
+            recovered = reconcile(None)
             state_mod.save_state(paths.live, recovered)
             commit = _state_commit(paths.repo, recovered, None)
             pushed = _git(
@@ -425,6 +450,8 @@ def recover(
             if pushed.returncode == 0:
                 state_mod.save_state(paths.base, recovered)
                 return paths.live, False
+            # The push lost a race or failed outright. Re-read the ref: only what
+            # is there now may be treated as the shared history.
             _, upstream = _remote_state(paths.repo, remote, state_ref)
             if upstream is None:
                 detail = (pushed.stderr or pushed.stdout).strip() or "push was rejected"
@@ -432,16 +459,13 @@ def recover(
                     f"could not restore shared state ref {state_ref}: {detail}"
                 )
 
-        # The ref exists after all — created concurrently by another host, or
-        # never lost. Keep the reconciled evidence locally and leave that
-        # history untouched: dropping the stale base makes the next ordinary
-        # sync treat the remote as the base and union this clone's receipts
-        # into it instead of overwriting them.
+        # The ref exists — created concurrently by another host, or never lost.
+        # Reconcile against it and record it as the incorporated base, so the
+        # next ordinary sync reads nothing it holds as locally deleted and its
+        # quarantined work cannot be dropped. Its history is not rewritten.
+        recovered = reconcile(upstream)
         state_mod.save_state(paths.live, recovered)
-        try:
-            paths.base.unlink()
-        except FileNotFoundError:
-            pass
+        state_mod.save_state(paths.base, upstream)
         return paths.live, True
 
 
@@ -742,21 +766,27 @@ def run(argv: list[str] | None = None) -> int:
                     push_attempts=args.push_attempts,
                 )
             except StateSyncRefAbsentError as exc:
-                # The transport answered, so this is not an outage streak.
-                clear_transport_failure(transport_streak)
-                if exc.established:
-                    # An existing installation is blocked: keep a durable marker
-                    # so the owner gets one loud alert as soon as recovery lets a
-                    # pass run again. The marker detail is capped at 200
-                    # characters, so it carries the action rather than the full
-                    # diagnostic, which goes to stderr below either way.
-                    record_failure(
-                        f"shared runtime-state ref {args.ref} is missing; run "
-                        "`watcher.state_sync recover` after reconciling every "
-                        "surviving store",
-                        marker,
-                    )
+                # Report and return the blocking code whatever else happens: both
+                # wrappers key their stop on this exit status alone, so a failed
+                # bookkeeping write must never downgrade it into "continue".
                 print(f"state synchronization blocked: {exc}", file=sys.stderr)
+                try:
+                    # The transport answered, so this is not an outage streak.
+                    clear_transport_failure(transport_streak)
+                    if exc.established:
+                        # An existing installation is blocked: keep a durable
+                        # marker so the owner gets one loud alert as soon as
+                        # recovery lets a pass run again. The marker detail is
+                        # capped at 200 characters, so it carries the action
+                        # rather than the full diagnostic printed above.
+                        record_failure(
+                            f"shared runtime-state ref {args.ref} is missing; run "
+                            "`watcher.state_sync recover` after reconciling every "
+                            "surviving store",
+                            marker,
+                        )
+                except OSError:
+                    log.exception("could not record the blocked state-sync condition")
                 return BOOTSTRAP_REQUIRED_EXIT
             except StateSyncTransportError as exc:
                 streak = record_transport_failure(
