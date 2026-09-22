@@ -48,12 +48,13 @@ Core facts agents need before editing:
   redundant: without it the Mac cannot see a reminder the cloud failover sent
   while it slept and can re-send it.
 - Every Git child there and in `state_sync` is bounded, and `locked` caps the
-  whole firing. A timeout is a **transport** failure (the existing capped streak,
-  no new alert path), never a confirmed absence; a supervisor releases the
-  overlap lock only after stopping and reaping its own process tree, never by
-  deleting the lock file. Each level forwards a stop it receives down to the tree
-  it owns — a sessioned Git child is unreachable from above — and its cleanup
-  allowance must fit inside the level above's.
+  whole firing. A timeout is a **transport** failure (existing capped streak, no
+  new alert path), never a confirmed absence. A supervisor releases the overlap
+  lock only after stopping and reaping its own tree, never by deleting the lock
+  file; each level forwards a stop down to the tree it owns (a sessioned Git
+  child is unreachable from above) with a cleanup allowance inside the level
+  above's. A tree that survives escalation is recorded next to the lock, never
+  presumed gone: the next firing stops until that group is, then clears it.
 
 ### Cinesa half (second target)
 

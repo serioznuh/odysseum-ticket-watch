@@ -485,3 +485,115 @@ def test_a_git_tree_is_cleaned_up_inside_its_supervisors_allowance():
     child before the supervisor above it escalates to SIGKILL, which that Git
     child would otherwise outlive."""
     assert state_sync.GIT_CLEANUP_GRACE_SECONDS < state_sync.CLEANUP_GRACE_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# OTW-29: a tree that outlives cleanup is reported, never presumed gone
+# ---------------------------------------------------------------------------
+
+
+def unstoppable(monkeypatch) -> None:
+    """Make every escalation report that the group is still running."""
+    monkeypatch.setattr(state_sync, "_drain_group", lambda pid, *, grace: False)
+
+
+def test_cleanup_that_cannot_confirm_a_stop_raises_instead_of_returning(
+    monkeypatch,
+):
+    unstoppable(monkeypatch)
+    with pytest.raises(state_sync.StateSyncCleanupError, match="still running"):
+        state_sync._run_bounded(
+            ["/bin/echo", "done"], timeout=5, cleanup_grace=0.05, capture=False
+        )
+
+
+def test_a_tree_that_outlives_cleanup_blocks_the_next_firing(tmp_path, monkeypatch):
+    """The lock cannot be held past this process's own life, so the refusal has
+    to outlive it: the firing records what survived instead of reporting a clean
+    finish, and the next one stops on that rather than joining a live writer."""
+    lock = tmp_path / "local-check.lock"
+    marker = state_sync.unconfirmed_tree_path(lock)
+    unstoppable(monkeypatch)
+
+    assert state_sync.run(
+        ["locked", "--lock", str(lock), "--cleanup-grace", "0.05", "--", "/bin/echo", "ran"]
+    ) == state_sync.UNCONFIRMED_TREE_EXIT
+    recorded = json.loads(marker.read_text(encoding="utf-8"))
+    assert recorded["pgid"] > 1
+    assert "could not stop" in recorded["detail"]
+
+
+def test_a_recorded_survivor_keeps_the_next_firing_out_until_it_is_gone(tmp_path):
+    lock = tmp_path / "local-check.lock"
+    marker = state_sync.unconfirmed_tree_path(lock)
+    sentinel = tmp_path / "second-writer-ran"
+    child = ["/bin/sh", "-c", f"touch {sentinel}"]
+    survivor = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    try:
+        state_sync.record_unconfirmed_tree(marker, survivor.pid, "simulated survivor")
+
+        # The lock itself is free — the guard is the evidence, not the lock.
+        assert state_sync.run(["locked", "--lock", str(lock), "--", *child]) == (
+            state_sync.UNCONFIRMED_TREE_EXIT
+        )
+        assert not sentinel.exists()
+        assert marker.exists()
+    finally:
+        survivor.kill()
+        survivor.wait()
+
+    # Once that group is really gone the refusal clears itself: no manual step is
+    # needed for the common case, and the watcher resumes on the next firing.
+    assert state_sync.run(["locked", "--lock", str(lock), "--", *child]) == 0
+    assert sentinel.exists()
+    assert not marker.exists()
+
+
+def test_an_unreadable_survivor_marker_fails_closed(tmp_path):
+    """A marker this boundary cannot read is not proof that anything stopped."""
+    lock = tmp_path / "local-check.lock"
+    marker = state_sync.unconfirmed_tree_path(lock)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{ truncated", encoding="utf-8")
+    sentinel = tmp_path / "second-writer-ran"
+
+    assert state_sync.run(
+        ["locked", "--lock", str(lock), "--", "/bin/sh", "-c", f"touch {sentinel}"]
+    ) == state_sync.UNCONFIRMED_TREE_EXIT
+    assert not sentinel.exists()
+
+
+def test_exit_codes_stay_distinguishable():
+    assert len(
+        {
+            0,
+            state_sync.BOOTSTRAP_REQUIRED_EXIT,
+            state_sync.LOCAL_RUN_TIMEOUT_EXIT,
+            state_sync.UNCONFIRMED_TREE_EXIT,
+        }
+    ) == 4
+
+
+def test_a_sync_that_cannot_stop_its_git_child_blocks_the_next_firing(
+    tmp_path, monkeypatch
+):
+    """That Git child leads a session of its own, so the wrapper above can
+    neither see nor stop it. The sync records it where the next firing looks,
+    and leaves one durable marker so the owner hears about the machine."""
+    def cleanup_failed(*args, **kwargs):
+        raise state_sync.StateSyncCleanupError(
+            "process group 4242 was still running", pgid=4242
+        )
+
+    monkeypatch.setattr(state_sync, "synchronize", cleanup_failed)
+
+    assert state_sync.run(["sync", "--repo", str(tmp_path)]) == (
+        state_sync.UNCONFIRMED_TREE_EXIT
+    )
+    survivor = json.loads(
+        (tmp_path / f"{state_sync.DEFAULT_LOCK_PATH}{state_sync.UNCONFIRMED_TREE_SUFFIX}")
+        .read_text(encoding="utf-8")
+    )
+    assert survivor["pgid"] == 4242
+    failure = state_sync.load_failure(tmp_path / state_sync.DEFAULT_MARKER_PATH)
+    assert failure is not None and "could not stop its Git child" in failure["detail"]
