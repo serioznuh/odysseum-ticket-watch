@@ -456,14 +456,15 @@ def test_local_check_bounds_the_deployment_pull_and_the_whole_firing():
 
     # A surviving process group is a hard stop wherever it is reported — the same
     # class of handling as the missing ref, never folded into "failed, carry on".
-    mirrored = re.search(
-        r"STATE_UNCONFIRMED_TREE_EXIT=(\d+)", "\n".join(lines)
-    )
-    assert mirrored and int(mirrored.group(1)) == state_sync.UNCONFIRMED_TREE_EXIT
+    script_text = "\n".join(lines)
+    for name, code in (
+        ("UNCONFIRMED", state_sync.UNCONFIRMED_TREE_EXIT),
+        ("UNGUARDED", state_sync.UNGUARDED_TREE_EXIT),
+    ):
+        assert re.search(rf"^STATE_{name}_TREE_EXIT={code}$", script_text, re.MULTILINE)
+        assert f'"$STATE_{name}_TREE_EXIT"' in script_text  # the check uses it
     stops = [
-        index
-        for index, line in enumerate(lines)
-        if '-eq "$STATE_UNCONFIRMED_TREE_EXIT"' in line
+        index for index, line in enumerate(lines) if line.startswith(("if surviving_group", "  if surviving_group"))
     ]
     assert len(stops) == 3, "deployment, pre-run sync and post-run sync each stop on it"
     post_sync = line_of("sync_state || sync_status")
@@ -654,10 +655,11 @@ def test_cleanup_retries_all_fit_inside_one_allowance(monkeypatch):
 def test_a_survivor_that_cannot_be_recorded_keeps_the_lock_instead(
     tmp_path, monkeypatch
 ):
-    """Round-2 finding: a marker that was never written cannot stop the next
-    firing, so failing to write it may not be logged and shrugged off. The
-    process stays alive — which is what keeps the overlap lock held — while the
-    surviving group is still there."""
+    """A marker that was never written cannot stop the next firing, so failing to
+    write it may not be logged and shrugged off. The process stays alive — which
+    is what keeps the overlap lock held — while the surviving group is still
+    there, and it reports the *unguarded* status rather than claiming a block it
+    cannot back up (later round-2 finding)."""
     def unwritable(*args, **kwargs):
         raise OSError("read-only file system")
 
@@ -674,7 +676,8 @@ def test_a_survivor_that_cannot_be_recorded_keeps_the_lock_instead(
         survivor.kill()
         survivor.wait()
 
-    assert code == state_sync.UNCONFIRMED_TREE_EXIT
+    assert code == state_sync.UNGUARDED_TREE_EXIT
+    assert code != state_sync.UNCONFIRMED_TREE_EXIT  # never read as "guarded"
     assert held >= 0.4, "the lock was released with no durable guard in place"
 
 
@@ -803,7 +806,7 @@ def test_the_survivor_retry_keeps_signals_handled(tmp_path, capsys):
             survivor.kill()
             survivor.wait()
 
-    assert code == state_sync.UNCONFIRMED_TREE_EXIT
+    assert code == state_sync.UNGUARDED_TREE_EXIT
     assert held >= 0.6, "the signal cut the hold short"
     assert "deferred signal" in capsys.readouterr().err
     assert signal.getsignal(signal.SIGTERM) is original
@@ -819,6 +822,7 @@ def test_both_wrappers_block_on_every_blocking_exit_code():
     assert state_sync.WRAPPER_BLOCKING_EXITS == (
         state_sync.BOOTSTRAP_REQUIRED_EXIT,
         state_sync.UNCONFIRMED_TREE_EXIT,
+        state_sync.UNGUARDED_TREE_EXIT,
     )
 
     for code in state_sync.WRAPPER_BLOCKING_EXITS:
@@ -833,3 +837,65 @@ def test_both_wrappers_block_on_every_blocking_exit_code():
             assert f"steps.presync.outputs.code != '{code}'" in section[
                 : section.index("run:")
             ], f"{gated} must be skipped on exit {code}"
+
+
+def test_the_lock_file_carries_the_record_when_the_marker_cannot_be_written(
+    tmp_path, monkeypatch
+):
+    """Round-2 finding, the other half: rather than give up on guarding the next
+    firing, the record goes into the lock file this firing already holds —
+    rewriting an existing file needs no new inode and no directory change, so it
+    can land where creating the marker beside it cannot."""
+    lock = tmp_path / "local-check.lock"
+    lock.write_text("", encoding="utf-8")
+    marker = state_sync.unconfirmed_tree_path(lock)
+    sentinel = tmp_path / "second-writer-ran"
+    child = ["/bin/sh", "-c", f"touch {sentinel}"]
+    survivor = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    exc = state_sync.StateSyncCleanupError("still running", pgid=survivor.pid)
+
+    def unwritable(*args, **kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(state_sync, "record_unconfirmed_tree", unwritable)
+    try:
+        assert state_sync._report_unconfirmed_tree(
+            exc, marker, "local check", lock=lock, hold=1, poll=0.05
+        ) == state_sync.UNCONFIRMED_TREE_EXIT  # guarded after all, so not 6
+        monkeypatch.undo()
+
+        assert not marker.exists()  # the marker never landed
+        assert state_sync.surviving_tree(marker, lock)["pgid"] == survivor.pid
+        # …and that is enough to keep the next firing out.
+        assert state_sync.run(["locked", "--lock", str(lock), "--", *child]) == (
+            state_sync.UNCONFIRMED_TREE_EXIT
+        )
+        assert not sentinel.exists()
+    finally:
+        survivor.kill()
+        survivor.wait()
+
+    # It clears itself the same way, by truncation — the lock file is never removed.
+    assert state_sync.run(["locked", "--lock", str(lock), "--", *child]) == 0
+    assert sentinel.exists()
+    assert lock.exists() and lock.read_text(encoding="utf-8").strip() == ""
+
+
+def test_the_block_message_names_the_record_it_wants_cleared(tmp_path, capsys):
+    """Two places can hold the record, and the lock file is not one an operator
+    may delete — so the message has to name the right one and say how."""
+    lock = tmp_path / "local-check.lock"
+    lock.write_text("", encoding="utf-8")
+    survivor = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    try:
+        state_sync.record_survivor_in_lock(lock, survivor.pid, "simulated survivor")
+        assert state_sync.run(
+            ["locked", "--lock", str(lock), "--", "/bin/echo", "ran"]
+        ) == state_sync.UNCONFIRMED_TREE_EXIT
+    finally:
+        survivor.kill()
+        survivor.wait()
+
+    blocked = capsys.readouterr().err
+    assert str(lock) in blocked
+    assert "never delete the lock itself" in blocked

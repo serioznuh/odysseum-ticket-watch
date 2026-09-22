@@ -98,11 +98,20 @@ CLEANUP_ATTEMPTS = 3
 UNCONFIRMED_TREE_EXIT = 5
 UNCONFIRMED_TREE_SUFFIX = ".unconfirmed"
 DEFAULT_LOCK_PATH = ".cache/local-check.lock"
-# Every status a startup wrapper must stop on instead of carrying on: both keep a
+# Worse than the above, and deliberately told apart from it: the group is still
+# running and *no* durable record of it could be written, so the next firing is
+# not protected by anything. Returning the ordinary blocked status here would
+# claim a guard that does not exist; this one asks for a human.
+UNGUARDED_TREE_EXIT = 6
+# Every status a startup wrapper must stop on instead of carrying on: each keeps a
 # firing from delivering or from putting a second writer beside something live.
 # scripts/local-check.sh and .github/workflows/watch.yml both block on all of
 # them, and a test pins that.
-WRAPPER_BLOCKING_EXITS = (BOOTSTRAP_REQUIRED_EXIT, UNCONFIRMED_TREE_EXIT)
+WRAPPER_BLOCKING_EXITS = (
+    BOOTSTRAP_REQUIRED_EXIT,
+    UNCONFIRMED_TREE_EXIT,
+    UNGUARDED_TREE_EXIT,
+)
 
 # Any of these proves this installation already notified the user: receipts and
 # the reminder ladder directly, and the baselines that only advance once their
@@ -385,17 +394,33 @@ def _survivor_detail(exc: StateSyncCleanupError, what: str) -> str:
     return f"{what} could not stop its own process tree: {exc}"
 
 
-def _record_survivor(exc: StateSyncCleanupError, marker: Path, what: str) -> bool:
+def _record_survivor(
+    exc: StateSyncCleanupError,
+    marker: Path,
+    what: str,
+    *,
+    lock: Path | None = None,
+) -> bool:
     """Write the durable record of a surviving tree, reporting whether it landed.
 
     Safe from a signal handler: it touches no ``Popen`` state the main thread may
     be inside, and a write that fails is reported rather than raised, because the
-    caller has its own, stronger answer for that case.
+    caller has its own, stronger answer for that case.  When the marker cannot be
+    written and a lock file is already there, the record goes into that file
+    instead — rewriting it needs no new inode and no directory change.
     """
+    detail = _survivor_detail(exc, what)
     try:
-        record_unconfirmed_tree(marker, exc.pgid, _survivor_detail(exc, what))
+        record_unconfirmed_tree(marker, exc.pgid, detail)
+        return True
     except OSError:
         log.exception("could not record surviving process group %s", exc.pgid)
+    if lock is None:
+        return False
+    try:
+        record_survivor_in_lock(lock, exc.pgid, detail)
+    except OSError:
+        log.exception("could not record process group %s in %s", exc.pgid, lock)
         return False
     return True
 
@@ -973,20 +998,45 @@ def record_unconfirmed_tree(
     return record
 
 
-def surviving_tree(path: str | Path) -> dict[str, object] | None:
-    """The recorded tree while it may still be running, else None.
+def record_survivor_in_lock(
+    lock: str | Path, pgid: int, detail: str, *, now: datetime | None = None
+) -> dict[str, object]:
+    """Write the survivor record into the lock file this firing already holds.
 
-    A recorded group that no longer answers is gone for good, so the marker is
-    cleared and the next firing proceeds normally — this refusal heals itself.
-    One that still answers keeps the firing out: starting a second writer beside
-    it is exactly the race the overlap lock exists to prevent.  A marker this
-    boundary cannot read is not proof that anything stopped, so it fails closed.
+    The last resort when the marker beside it cannot be written: rewriting a file
+    that already exists needs no new inode and no directory change, so it can
+    still land where creating that marker cannot.  The lock file is only ever
+    truncated and rewritten here, never created and never removed — a lock nobody
+    deletes is the whole point.
     """
-    marker = Path(path)
-    if not marker.exists():
+    record = {
+        "pgid": pgid,
+        "recorded_at": (now or datetime.now(TZ_PARIS)).astimezone(TZ_PARIS).isoformat(),
+        "detail": _clean_detail(detail) or "a supervised process tree could not be stopped",
+    }
+    handle = os.open(str(lock), os.O_WRONLY | os.O_TRUNC)  # never O_CREAT
+    try:
+        os.write(handle, (json.dumps(record, sort_keys=True) + "\n").encode("utf-8"))
+    finally:
+        os.close(handle)
+    return record
+
+
+def _clear_lock_record(path: Path) -> None:
+    """Drop a stale record from the lock file without ever removing the file."""
+    with path.open("r+", encoding="utf-8") as handle:
+        handle.truncate(0)
+
+
+def _survivor_from(path: Path, clear) -> dict[str, object] | None:
+    """One source's record, while the group it names may still be running."""
+    if not path.exists():
         return None
     try:
-        record = json.loads(marker.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        if not text.strip():
+            return None
+        record = json.loads(text)
         pgid = record["pgid"]
         if isinstance(pgid, bool) or not isinstance(pgid, int) or pgid <= 1:
             raise ValueError(f"invalid process group {pgid!r}")
@@ -994,12 +1044,35 @@ def surviving_tree(path: str | Path) -> dict[str, object] | None:
         return {
             "pgid": 0,
             "recorded_at": "",
-            "detail": f"unreadable marker {marker} ({exc}); it cannot prove the tree stopped",
+            "source": str(path),
+            "detail": f"unreadable survivor record {path} ({exc}); it cannot prove "
+            "the tree stopped",
         }
     if _signal_group(int(pgid), 0):
+        record["source"] = str(path)
         return record
-    clear_unconfirmed_tree(marker)
+    clear(path)
     return None
+
+
+def surviving_tree(
+    path: str | Path, lock: str | Path | None = None
+) -> dict[str, object] | None:
+    """The recorded tree while it may still be running, else None.
+
+    A recorded group that no longer answers is gone for good, so the record is
+    cleared and the next firing proceeds normally — this refusal heals itself.
+    One that still answers keeps the firing out: starting a second writer beside
+    it is exactly the race the overlap lock exists to prevent.  A record this
+    boundary cannot read is not proof that anything stopped, so it fails closed.
+
+    Both places a firing can leave that record are read: the marker beside the
+    lock, and the lock file itself when the marker could not be written.
+    """
+    found = _survivor_from(Path(path), clear_unconfirmed_tree)
+    if found is not None or lock is None:
+        return found
+    return _survivor_from(Path(lock), _clear_lock_record)
 
 
 def clear_unconfirmed_tree(path: str | Path) -> None:
@@ -1197,6 +1270,7 @@ def _report_unconfirmed_tree(
     marker: str | Path,
     what: str,
     *,
+    lock: str | Path | None = None,
     hold: float = LOCAL_RUN_DEADLINE_SECONDS,
     poll: float = 1.0,
 ) -> int:
@@ -1215,11 +1289,12 @@ def _report_unconfirmed_tree(
     """
     detail = _survivor_detail(exc, what)
     marker_path = Path(marker)
+    lock_path = None if lock is None else Path(lock)
     deadline = time.monotonic() + max(0.0, hold)
     recorded = False
     with _hold_through_signals(what) as deferred:
         while True:
-            if _record_survivor(exc, marker_path, what):
+            if _record_survivor(exc, marker_path, what, lock=lock_path):
                 recorded = True
                 break
             if not _signal_group(exc.pgid, 0):
@@ -1249,14 +1324,26 @@ def _report_unconfirmed_tree(
             f"(marker: {marker_path})",
             file=sys.stderr,
         )
-    else:
+        return UNCONFIRMED_TREE_EXIT
+    if not _signal_group(exc.pgid, 0):
+        # Nothing is left to run into, so this is an ordinary block after all:
+        # the group went away while the writes kept failing.
         print(
-            f"{detail}. Process group {exc.pgid} could be neither stopped nor "
-            f"recorded at {marker_path}; stop it by hand before the next firing "
-            "(`ps -g`), and check why that path is unwritable",
+            f"{detail}. Process group {exc.pgid} ended before it could be recorded, "
+            "so nothing is left for the next firing to run into",
             file=sys.stderr,
         )
-    return UNCONFIRMED_TREE_EXIT
+        return UNCONFIRMED_TREE_EXIT
+    # The honest answer, and a different one: this exit may not be read as "the
+    # next firing is blocked", because nothing durable says so.
+    print(
+        f"{detail}. Process group {exc.pgid} is still running and could be recorded "
+        f"neither at {marker_path} nor in the lock file, so THE NEXT FIRING IS NOT "
+        "PROTECTED: stop that group by hand (`ps -g`) and fix why those paths are "
+        "unwritable before the watcher runs again",
+        file=sys.stderr,
+    )
+    return UNGUARDED_TREE_EXIT
 
 
 def _child_command(
@@ -1350,7 +1437,8 @@ def run(argv: list[str] | None = None) -> int:
             transport_streak = _resolve_under(repo, args.store) / TRANSPORT_FAILURE_FILE
             # One place for every bounded child here to record a surviving group,
             # including a Git child started deep inside `synchronize`.
-            unconfirmed = _resolve_under(repo, unconfirmed_tree_path(args.lock))
+            lock_path = _resolve_under(repo, args.lock)
+            unconfirmed = unconfirmed_tree_path(lock_path)
             use_survivor_marker(unconfirmed)
             try:
                 live_path = synchronize(
@@ -1397,7 +1485,9 @@ def run(argv: list[str] | None = None) -> int:
                     )
                 except OSError:
                     log.exception("could not record the surviving Git child")
-                return _report_unconfirmed_tree(exc, unconfirmed, "state synchronization")
+                return _report_unconfirmed_tree(
+                    exc, unconfirmed, "state synchronization", lock=lock_path
+                )
             except StateSyncTransportError as exc:
                 streak = record_transport_failure(
                     str(exc),
@@ -1425,7 +1515,8 @@ def run(argv: list[str] | None = None) -> int:
             resolve_failure(live_path, marker)
         elif args.command in {"init", "recover"}:
             repo = Path(args.repo).resolve()
-            unconfirmed = _resolve_under(repo, unconfirmed_tree_path(DEFAULT_LOCK_PATH))
+            lock_path = _resolve_under(repo, DEFAULT_LOCK_PATH)
+            unconfirmed = unconfirmed_tree_path(lock_path)
             use_survivor_marker(unconfirmed)
             try:
                 if args.command == "init":
@@ -1448,7 +1539,9 @@ def run(argv: list[str] | None = None) -> int:
                 # These run in the production clone too, so a Git child they could
                 # not stop has to be recorded here as well: the scheduled firing
                 # that comes next must not start beside it.
-                return _report_unconfirmed_tree(exc, unconfirmed, f"state {args.command}")
+                return _report_unconfirmed_tree(
+                    exc, unconfirmed, f"state {args.command}", lock=lock_path
+                )
             except (OSError, StateSyncError, state_mod.StateError) as exc:
                 print(f"state {args.command} failed: {exc}", file=sys.stderr)
                 return 1
@@ -1462,7 +1555,8 @@ def run(argv: list[str] | None = None) -> int:
                 print(f"created shared state ref {args.ref} from {live_path}")
         elif args.command == "locked":
             child = _child_command(args.child, parser, "locked")
-            unconfirmed = _resolve_under(Path.cwd(), unconfirmed_tree_path(args.lock))
+            lock_path = _resolve_under(Path.cwd(), args.lock)
+            unconfirmed = unconfirmed_tree_path(lock_path)
             use_survivor_marker(unconfirmed)
             with file_lock(args.lock, blocking=False) as acquired:
                 if not acquired:
@@ -1472,14 +1566,16 @@ def run(argv: list[str] | None = None) -> int:
                 # may have ended without being able to stop its own tree, and an
                 # advisory lock dies with the process that held it. That firing
                 # recorded what survived, and this one stays out while it lives.
-                survivor = surviving_tree(unconfirmed)
+                survivor = surviving_tree(unconfirmed, lock_path)
                 if survivor is not None:
                     print(
                         "local check blocked: an earlier firing left process group "
                         f"{survivor['pgid']} running ({survivor['detail']}). Starting a "
                         "second writer beside it is exactly what the overlap lock "
                         f"prevents. Inspect `ps -g {survivor['pgid']}`, stop what is "
-                        f"left, then delete {unconfirmed}",
+                        f"left, then clear that record in {survivor.get('source', unconfirmed)}"
+                        " — delete the marker file, or empty the lock file; never "
+                        "delete the lock itself",
                         file=sys.stderr,
                     )
                     return UNCONFIRMED_TREE_EXIT
@@ -1497,7 +1593,9 @@ def run(argv: list[str] | None = None) -> int:
                         cleanup_budget=args.cleanup_budget,
                     )
                 except StateSyncCleanupError as exc:
-                    return _report_unconfirmed_tree(exc, unconfirmed, "local check")
+                    return _report_unconfirmed_tree(
+                        exc, unconfirmed, "local check", lock=lock_path
+                    )
                 if timed_out:
                     print(
                         f"local check exceeded its {args.deadline:g}s deadline; the run's "
@@ -1509,7 +1607,8 @@ def run(argv: list[str] | None = None) -> int:
                 return _exit_code(result.returncode)
         elif args.command == "bounded":
             child = _child_command(args.child, parser, "bounded")
-            unconfirmed = _resolve_under(Path.cwd(), unconfirmed_tree_path(args.lock))
+            lock_path = _resolve_under(Path.cwd(), args.lock)
+            unconfirmed = unconfirmed_tree_path(lock_path)
             use_survivor_marker(unconfirmed)
             try:
                 result, timed_out = _run_bounded(
@@ -1519,7 +1618,9 @@ def run(argv: list[str] | None = None) -> int:
                     cleanup_budget=args.cleanup_budget,
                 )
             except StateSyncCleanupError as exc:
-                return _report_unconfirmed_tree(exc, unconfirmed, " ".join(child))
+                return _report_unconfirmed_tree(
+                    exc, unconfirmed, " ".join(child), lock=lock_path
+                )
             if timed_out:
                 print(
                     f"`{' '.join(child)}` did not finish within {args.timeout:g}s; "

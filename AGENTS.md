@@ -53,8 +53,8 @@ Core facts agents need before editing:
   supervisor stopped and reaped its own tree, never by deleting the lock file;
   each level forwards a stop down to the tree it owns — unreachable from above —
   and its whole cleanup, recording included, fits the allowance the level above
-  gives before SIGKILL. A surviving tree is recorded next to the lock, never
-  presumed gone: `UNCONFIRMED_TREE_EXIT` (5) blocks the next firing like exit 3.
+  gives before SIGKILL. A surviving tree is recorded beside the lock or in it,
+  never presumed gone: exit 5 blocks the next firing, exit 6 needs a human.
 
 ### Cinesa half (second target)
 

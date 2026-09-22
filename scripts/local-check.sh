@@ -34,6 +34,23 @@ source .env
 
 status=0
 
+# Mirrors watcher.state_sync.UNCONFIRMED_TREE_EXIT and UNGUARDED_TREE_EXIT (a
+# test pins all of them): a bounded child left a process group running that
+# nothing here could stop. That group may still write, so every site below stops
+# this firing at once instead of stacking work beside it — the same class of hard
+# stop as the missing-ref exit, and never folded into "failed, carry on".
+#
+# On 5 the child recorded that group (next to the lock, or in the lock file when
+# that failed), so the next firing blocks by itself until the group is gone. 6
+# says the record could not be written at all: the next firing is NOT protected
+# and needs a human, which is why the two statuses stay distinct in the log.
+STATE_UNCONFIRMED_TREE_EXIT=5
+STATE_UNGUARDED_TREE_EXIT=6
+
+surviving_group() {
+  [ "$1" -eq "$STATE_UNCONFIRMED_TREE_EXIT" ] || [ "$1" -eq "$STATE_UNGUARDED_TREE_EXIT" ]
+}
+
 # Deploy code before touching shared runtime state. A broken/corrupt state ref
 # can therefore neither block this fast-forward nor roll it back. Re-exec the
 # newly deployed script once so script changes take effect in this firing; the
@@ -44,15 +61,6 @@ status=0
 # stopped with its whole process tree and counts as a failed deployment, so this
 # firing continues on the installed code instead of hanging until the overall
 # deadline and losing the reminder check entirely.
-#
-# Mirrors watcher.state_sync.UNCONFIRMED_TREE_EXIT (a test pins the two): a
-# bounded child left a process group running that nothing here could stop. That
-# group may still write, so this firing stops at once instead of stacking more
-# work beside it — the same class of hard stop as the missing-ref exit below, and
-# never folded into "failed, carry on". The next firing is blocked by the record
-# that child left next to the lock until that group is gone.
-STATE_UNCONFIRMED_TREE_EXIT=5
-
 if [ "${OTW_CODE_DEPLOYED:-}" != "1" ]; then
   deploy_status=0
   .venv/bin/python -m watcher.state_sync bounded \
@@ -61,7 +69,7 @@ if [ "${OTW_CODE_DEPLOYED:-}" != "1" ]; then
     export OTW_CODE_DEPLOYED=1
     exec /bin/bash "$0" "$@"
   fi
-  if [ "$deploy_status" -eq "$STATE_UNCONFIRMED_TREE_EXIT" ]; then
+  if surviving_group "$deploy_status"; then
     echo "ERROR: the deployment pull left a Git process group running; stopping" \
          "this firing rather than starting state work beside it" >&2
     exit "$deploy_status"
@@ -104,7 +112,7 @@ if [ "$pre_sync_status" -eq "$STATE_BOOTSTRAP_REQUIRED_EXIT" ]; then
        "'watcher.state_sync init' (new install) or 'recover' (existing one) runs" >&2
   exit "$pre_sync_status"
 fi
-if [ "$pre_sync_status" -eq "$STATE_UNCONFIRMED_TREE_EXIT" ]; then
+if surviving_group "$pre_sync_status"; then
   echo "ERROR: the pre-run state sync left a Git process group running; stopping" \
        "this firing before the watcher or a second sync runs beside it" >&2
   exit "$pre_sync_status"
@@ -121,7 +129,7 @@ fi
 # and preserves every local receipt before reporting the final run status.
 sync_status=0
 sync_state || sync_status=$?
-if [ "$sync_status" -eq "$STATE_UNCONFIRMED_TREE_EXIT" ]; then
+if surviving_group "$sync_status"; then
   # Never let this one be masked by an earlier ordinary failure: it is the status
   # that says a writer of this firing is still running.
   echo "ERROR: the post-run state sync left a Git process group running; the next" \
