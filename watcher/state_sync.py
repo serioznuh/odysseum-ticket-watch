@@ -193,6 +193,13 @@ def use_survivor_marker(path: str | Path) -> None:
     _SURVIVOR_MARKER = Path(path)
 
 
+def _lock_for_marker(marker: Path) -> Path | None:
+    """The lock file a survivor marker belongs to, so both sinks stay reachable."""
+    if marker.name.endswith(UNCONFIRMED_TREE_SUFFIX):
+        return marker.with_name(marker.name[: -len(UNCONFIRMED_TREE_SUFFIX)])
+    return None
+
+
 def survivor_marker_path(explicit: str | Path | None = None) -> Path:
     if explicit is not None:
         return Path(explicit)
@@ -373,7 +380,7 @@ def _stop_tree_on_signal(
                 f"signal {signum} asked for",
                 pgid=process.pid,
             )
-            _record_survivor(failure, marker, what)
+            _record_survivor(failure, marker, what, lock=_lock_for_marker(marker))
             raise failure
 
     installed: dict[int, object] = {}
@@ -413,14 +420,23 @@ def _record_survivor(
     try:
         record_unconfirmed_tree(marker, exc.pgid, detail)
         return True
-    except OSError:
-        log.exception("could not record surviving process group %s", exc.pgid)
+    except OSError as failure:
+        # Retried on a short loop, so the reason without a traceback each round:
+        # the operator message on stderr carries what to do about it.
+        log.error(
+            "could not record surviving process group %s at %s: %s",
+            exc.pgid,
+            marker,
+            failure,
+        )
     if lock is None:
         return False
     try:
         record_survivor_in_lock(lock, exc.pgid, detail)
-    except OSError:
-        log.exception("could not record process group %s in %s", exc.pgid, lock)
+    except OSError as failure:
+        log.error(
+            "could not record process group %s in %s: %s", exc.pgid, lock, failure
+        )
         return False
     return True
 
@@ -1271,8 +1287,8 @@ def _report_unconfirmed_tree(
     what: str,
     *,
     lock: str | Path | None = None,
-    hold: float = LOCAL_RUN_DEADLINE_SECONDS,
-    poll: float = 1.0,
+    hold: float = SURVIVOR_RECORD_ALLOWANCE_SECONDS,
+    poll: float = 0.2,
 ) -> int:
     """Record the survivor and refuse, instead of reporting a finished run.
 
@@ -1286,6 +1302,15 @@ def _report_unconfirmed_tree(
     process that never returns.  Signals stay handled for the whole of that wait —
     the same lifetime rule the supervised paths follow — because a default SIGTERM
     here would end the one guard in place.
+
+    ``hold`` follows the same nesting discipline as the cleanup budget: it is the
+    allowance the *caller* actually has left, never a fixed span.  The default is
+    the small reserved recording allowance, which is what a nested level (a sync,
+    a bounded pull) has before the supervisor above it escalates to SIGKILL —
+    holding longer there would only get this process killed mid-hold, so its
+    status would never reach the level that has to act on it.  Only the lock
+    holder itself passes a longer one, and only as much as is left of the firing's
+    documented lifetime.
     """
     detail = _survivor_detail(exc, what)
     marker_path = Path(marker)
@@ -1485,8 +1510,15 @@ def run(argv: list[str] | None = None) -> int:
                     )
                 except OSError:
                     log.exception("could not record the surviving Git child")
+                # Nested under the wrapper's supervisor: this has only the
+                # reserved recording allowance before that level SIGKILLs it, and
+                # a status it never returns cannot stop the next firing.
                 return _report_unconfirmed_tree(
-                    exc, unconfirmed, "state synchronization", lock=lock_path
+                    exc,
+                    unconfirmed,
+                    "state synchronization",
+                    lock=lock_path,
+                    hold=SURVIVOR_RECORD_ALLOWANCE_SECONDS,
                 )
             except StateSyncTransportError as exc:
                 streak = record_transport_failure(
@@ -1584,6 +1616,7 @@ def run(argv: list[str] | None = None) -> int:
                 # The lock is released only after _run_bounded has stopped and
                 # drained this run's own tree, so the next firing can never
                 # acquire it while an earlier writer is still alive.
+                started = time.monotonic()
                 try:
                     result, timed_out = _run_bounded(
                         child,
@@ -1593,8 +1626,18 @@ def run(argv: list[str] | None = None) -> int:
                         cleanup_budget=args.cleanup_budget,
                     )
                 except StateSyncCleanupError as exc:
+                    # This level *is* the lock holder, so holding on is a real
+                    # guard and it may use whatever is left of the firing's
+                    # documented lifetime — the deadline plus one cleanup
+                    # allowance — and not a second more, so a hung tree still
+                    # costs the reminder ladder two firings and no more.
+                    spent = time.monotonic() - started
                     return _report_unconfirmed_tree(
-                        exc, unconfirmed, "local check", lock=lock_path
+                        exc,
+                        unconfirmed,
+                        "local check",
+                        lock=lock_path,
+                        hold=max(0.0, args.deadline + args.cleanup_budget - spent),
                     )
                 if timed_out:
                     print(
@@ -1618,8 +1661,14 @@ def run(argv: list[str] | None = None) -> int:
                     cleanup_budget=args.cleanup_budget,
                 )
             except StateSyncCleanupError as exc:
+                # Nested too (the wrapper's deployment pull runs under `locked`),
+                # so the same reserved allowance applies.
                 return _report_unconfirmed_tree(
-                    exc, unconfirmed, " ".join(child), lock=lock_path
+                    exc,
+                    unconfirmed,
+                    " ".join(child),
+                    lock=lock_path,
+                    hold=SURVIVOR_RECORD_ALLOWANCE_SECONDS,
                 )
             if timed_out:
                 print(

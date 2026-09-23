@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -899,3 +900,90 @@ def test_the_block_message_names_the_record_it_wants_cleared(tmp_path, capsys):
     blocked = capsys.readouterr().err
     assert str(lock) in blocked
     assert "never delete the lock itself" in blocked
+
+
+def test_the_survivor_hold_defaults_to_the_reserved_recording_allowance():
+    """Round-6 finding: the hold defaulted to the whole local-run deadline. A
+    nested level has only the allowance reserved for recording before the level
+    above escalates to SIGKILL, so that has to be the default — a status this
+    process never gets to return cannot stop anything."""
+    default = inspect.signature(state_sync._report_unconfirmed_tree).parameters[
+        "hold"
+    ].default
+    assert default == state_sync.SURVIVOR_RECORD_ALLOWANCE_SECONDS
+    assert (
+        default + state_sync.GIT_CLEANUP_BUDGET_SECONDS
+        <= state_sync.CLEANUP_BUDGET_SECONDS / 2
+    )
+
+
+def test_a_nested_sync_reports_an_unguarded_survivor_inside_its_allowance(
+    tmp_path, monkeypatch
+):
+    """The case behind that finding, end to end: a sync that can neither stop its
+    Git group nor record it anywhere must come back with exit 6 while the
+    supervisor above it is still waiting — it SIGKILLs after half its cleanup
+    budget, and a killed sync leaves that sessioned group unrecorded."""
+    survivor = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+
+    def cleanup_failed(*args, **kwargs):
+        raise state_sync.StateSyncCleanupError("still running", pgid=survivor.pid)
+
+    def unwritable(*args, **kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(state_sync, "synchronize", cleanup_failed)
+    monkeypatch.setattr(state_sync, "record_unconfirmed_tree", unwritable)
+    try:
+        started = time.monotonic()
+        code = state_sync.run(["sync", "--repo", str(tmp_path)])
+        spent = time.monotonic() - started
+    finally:
+        survivor.kill()
+        survivor.wait()
+
+    assert code == state_sync.UNGUARDED_TREE_EXIT
+    # Neither sink took it (no lock file exists here), so the status is the only
+    # thing left — and it arrives inside the window the level above allows.
+    assert spent < state_sync.CLEANUP_BUDGET_SECONDS / 2, (
+        f"the nested hold took {spent:.2f}s, past the supervisor's escalation"
+    )
+
+
+def test_the_lock_holder_holds_only_what_is_left_of_the_firings_lifetime(
+    tmp_path, monkeypatch
+):
+    """The other half of the same rule: `locked` does hold the lock, so holding on
+    is a real guard — but only for what remains of the firing's documented
+    lifetime, so a hung tree still costs two firings and not four."""
+    captured = {}
+
+    def capture(exc, marker, what, **kwargs):
+        captured.update(kwargs)
+        return state_sync.UNGUARDED_TREE_EXIT
+
+    def cleanup_failed(*args, **kwargs):
+        time.sleep(0.3)
+        raise state_sync.StateSyncCleanupError("still running", pgid=4242)
+
+    monkeypatch.setattr(state_sync, "_run_bounded", cleanup_failed)
+    monkeypatch.setattr(state_sync, "_report_unconfirmed_tree", capture)
+
+    assert state_sync.run(
+        [
+            "locked",
+            "--lock",
+            str(tmp_path / "local-check.lock"),
+            "--deadline",
+            "2",
+            "--cleanup-budget",
+            "1",
+            "--",
+            "/bin/echo",
+            "ran",
+        ]
+    ) == state_sync.UNGUARDED_TREE_EXIT
+
+    lifetime = 2 + 1  # the deadline plus one cleanup allowance
+    assert 0 < captured["hold"] <= lifetime
+    assert captured["hold"] <= lifetime - 0.3 + 0.1, "time already spent is not deducted"
