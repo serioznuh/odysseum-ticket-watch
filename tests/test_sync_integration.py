@@ -880,6 +880,20 @@ def child_env() -> dict[str, str]:
     return env
 
 
+def run_supervisor(
+    *args: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """One `python -m watcher.state_sync` call in its own process, run to the end."""
+    return subprocess.run(
+        supervisor(*args),
+        cwd=ROOT,
+        env=child_env() if env is None else env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def test_deployment_pull_timeout_is_bounded_and_stops_its_whole_tree(tmp_path):
     """The wrapper's `git pull` runs under this boundary. A pull that never
     answers must not hold the overlap lock: it is stopped with its grandchildren
@@ -887,26 +901,19 @@ def test_deployment_pull_timeout_is_bounded_and_stops_its_whole_tree(tmp_path):
     running the installed code."""
     shim, pids = hung_git(tmp_path / "hung-deploy", "pull")
     started = time.monotonic()
-    fired = subprocess.run(
-        supervisor(
-            "bounded",
-            "--timeout",
-            str(BOUND),
-            "--cleanup-budget",
-            str(BUDGET),
-            "--",
-            str(shim),
-            "pull",
-            "--ff-only",
-            "--quiet",
-            "origin",
-            "main",
-        ),
-        cwd=ROOT,
-        env=child_env(),
-        capture_output=True,
-        text=True,
-        check=False,
+    fired = run_supervisor(
+        "bounded",
+        "--timeout",
+        str(BOUND),
+        "--cleanup-budget",
+        str(BUDGET),
+        "--",
+        str(shim),
+        "pull",
+        "--ff-only",
+        "--quiet",
+        "origin",
+        "main",
     )
 
     assert time.monotonic() - started < PATIENCE
@@ -1010,25 +1017,18 @@ def test_overall_deadline_releases_the_lock_only_after_the_tree_stops(tmp_path):
         f'printf "%s\\n%s\\n" "$$" "$!" > "{pids_file}"; wait'
     )
     started = time.monotonic()
-    fired = subprocess.run(
-        supervisor(
-            "locked",
-            "--lock",
-            str(lock),
-            "--deadline",
-            str(BOUND),
-            "--cleanup-budget",
-            str(BUDGET),
-            "--",
-            "/bin/sh",
-            "-c",
-            wedged,
-        ),
-        cwd=ROOT,
-        env=child_env(),
-        capture_output=True,
-        text=True,
-        check=False,
+    fired = run_supervisor(
+        "locked",
+        "--lock",
+        str(lock),
+        "--deadline",
+        str(BOUND),
+        "--cleanup-budget",
+        str(BUDGET),
+        "--",
+        "/bin/sh",
+        "-c",
+        wedged,
     )
 
     assert time.monotonic() - started < PATIENCE
@@ -1038,17 +1038,25 @@ def test_overall_deadline_releases_the_lock_only_after_the_tree_stops(tmp_path):
     assert lock.exists()  # released, not removed
 
     # Only now may the next firing run, and it must not report an overlap.
-    followed = subprocess.run(
-        supervisor("locked", "--lock", str(lock), "--", "/bin/echo", "next firing"),
-        cwd=ROOT,
-        env=child_env(),
+    followed = run_supervisor("locked", "--lock", str(lock), "--", "/bin/echo", "next firing")
+    assert followed.returncode == 0
+    assert "already running" not in followed.stderr
+    assert "next firing" in followed.stdout
+
+
+def fire_local_check(repo: Path, **extra: str) -> subprocess.CompletedProcess[str]:
+    script = install_local_check(repo)
+    env = child_env()
+    env["REAL_PYTHON"] = sys.executable
+    env.update(extra)
+    return subprocess.run(
+        ["/bin/bash", str(script)],
+        cwd=repo,
+        env=env,
         capture_output=True,
         text=True,
         check=False,
     )
-    assert followed.returncode == 0
-    assert "already running" not in followed.stderr
-    assert "next firing" in followed.stdout
 
 
 def test_failed_deployment_still_runs_the_watcher_on_installed_code(two_clones):
@@ -1057,18 +1065,8 @@ def test_failed_deployment_still_runs_the_watcher_on_installed_code(two_clones):
     _, local, _ = two_clones
     synchronize(local)
     git(local, "remote", "set-url", "origin", str(local.parent / "vanished.git"))
-    script = install_local_check(local)
-    env = child_env()
-    env["REAL_PYTHON"] = sys.executable
 
-    fired = subprocess.run(
-        ["/bin/bash", str(script)],
-        cwd=local,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    fired = fire_local_check(local)
 
     assert fired.returncode != 0
     assert fired.returncode != BOOTSTRAP_REQUIRED_EXIT
@@ -1121,33 +1119,11 @@ def test_a_signal_mid_git_call_stops_the_git_tree_before_the_lock_is_free(
     # moment the lock becomes observable — after the whole tree has stopped.
     assert [pid for pid in hung if is_alive(pid)] == []
     assert lock.exists()  # released, never deleted
-    followed = subprocess.run(
-        supervisor("locked", "--lock", str(lock), "--", "/bin/echo", "next firing"),
-        cwd=ROOT,
-        env=child_env(),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    followed = run_supervisor("locked", "--lock", str(lock), "--", "/bin/echo", "next firing")
     assert followed.returncode == 0
     assert "already running" not in followed.stderr
     # The interrupted sync wrote nothing new and left the validated copy in place.
     assert load_state(live_path(local)) == load_state(local / DEFAULT_STORE_PATH / "base.json")
-
-
-def fire_local_check(repo: Path, **extra: str) -> subprocess.CompletedProcess[str]:
-    script = install_local_check(repo)
-    env = child_env()
-    env["REAL_PYTHON"] = sys.executable
-    env.update(extra)
-    return subprocess.run(
-        ["/bin/bash", str(script)],
-        cwd=repo,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
 
 
 def test_a_surviving_group_stops_the_firing_before_the_watcher(two_clones):
@@ -1187,3 +1163,110 @@ def test_a_surviving_group_after_the_watcher_is_not_masked_by_another_failure(
     assert (local / "watcher-invocations").exists()  # the pass itself ran
     assert fired.returncode == state_sync.UNCONFIRMED_TREE_EXIT
     assert "the next firing stops until that group is gone" in fired.stderr
+
+
+def nested_level_that_announces(tmp_path: Path) -> tuple[list[str], Path]:
+    """A child playing a nested sync whose Git group survived and was recorded
+    nowhere: it leaves a group of its own session running, announces it the way
+    `_announce_survivor` does, notes its pid, then wedges."""
+    pid_file = tmp_path / "survivor-pid"
+    # Every stream detached, or the survivor would hold this test's capture pipes.
+    start_survivor = (
+        "import subprocess as s; print(s.Popen(['sleep', '"
+        f"{HUNG_SECONDS}'], start_new_session=True, stdin=s.DEVNULL, "
+        "stdout=s.DEVNULL, stderr=s.DEVNULL).pid)"
+    )
+    script = (
+        f'survivor=$("{sys.executable}" -c "{start_survivor}") && '
+        f'echo "$survivor" >&"${state_sync.SURVIVOR_CHANNEL_ENV}" && '
+        f'echo "$survivor" > "{pid_file}" && '
+        f"sleep {HUNG_SECONDS}"
+    )
+    return ["/bin/bash", "-c", script], pid_file
+
+
+def announced_survivor(pid_file: Path) -> int:
+    deadline = time.monotonic() + 10
+    while not (pid_file.exists() and pid_file.read_text(encoding="utf-8").strip()):
+        assert time.monotonic() < deadline, "the nested level never announced"
+        time.sleep(0.05)
+    return int(pid_file.read_text(encoding="utf-8"))
+
+
+def kill_group(pgid: int) -> None:
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def assert_recorded_by_name_until_gone(lock: Path, survivor: int, tmp_path: Path) -> None:
+    """The record names the group: it blocks while that group lives and clears
+    itself once it is gone."""
+    marker = state_sync.unconfirmed_tree_path(lock)
+    assert json.loads(marker.read_text(encoding="utf-8"))["pgid"] == survivor
+    sentinel = tmp_path / "second-writer-ran"
+    next_firing = ("locked", "--lock", str(lock), "--", "/bin/sh", "-c", f"touch {sentinel}")
+    assert run_supervisor(*next_firing).returncode == state_sync.UNCONFIRMED_TREE_EXIT
+    assert not sentinel.exists()
+
+    kill_group(survivor)
+    assert_tree_stopped([survivor])
+    assert run_supervisor(*next_firing).returncode == 0
+    assert sentinel.exists()
+
+
+def test_the_watchdog_still_records_a_group_a_nested_level_announced(tmp_path):
+    """Round-5 finding: when the overall deadline stops the shell, a nested sync's
+    exit 6 — a sessioned Git group it could neither stop nor record — has no way
+    up, and `locked` used to release the lock with exit 4 beside that group. The
+    nested level also announces the group on the channel `locked` hands down, so
+    the lock holder records it by name before letting go."""
+    lock = tmp_path / "local-check.lock"
+    child, pid_file = nested_level_that_announces(tmp_path)
+    try:
+        fired = run_supervisor(
+            "locked",
+            "--lock",
+            str(lock),
+            "--deadline",
+            str(BOUND),
+            "--cleanup-budget",
+            str(BUDGET),
+            "--",
+            *child,
+        )
+    finally:
+        survivor = announced_survivor(pid_file)
+
+    try:
+        assert "deadline" in fired.stderr
+        assert fired.returncode == state_sync.UNCONFIRMED_TREE_EXIT, fired.stderr
+        assert_recorded_by_name_until_gone(lock, survivor, tmp_path)
+    finally:
+        kill_group(survivor)
+
+
+def test_a_stop_signal_still_records_a_group_a_nested_level_announced(tmp_path):
+    """The same gap on the other way a firing ends early: launchd's SIGTERM. The
+    lock holder stops its tree and dies by that signal as before — but only after
+    recording what a nested level announced, while it still holds the lock."""
+    lock = tmp_path / "local-check.lock"
+    child, pid_file = nested_level_that_announces(tmp_path)
+    firing = subprocess.Popen(
+        supervisor("locked", "--lock", str(lock), "--cleanup-budget", str(BUDGET), "--", *child),
+        cwd=ROOT,
+        env=child_env(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    survivor = announced_survivor(pid_file)
+    try:
+        firing.send_signal(signal.SIGTERM)
+        assert firing.wait(timeout=PATIENCE) == -signal.SIGTERM
+        assert_recorded_by_name_until_gone(lock, survivor, tmp_path)
+    finally:
+        if firing.poll() is None:
+            firing.kill()
+            firing.wait()
+        kill_group(survivor)

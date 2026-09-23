@@ -9,6 +9,8 @@ import re
 import signal
 import subprocess
 import time
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -522,6 +524,53 @@ def unstoppable(monkeypatch) -> None:
     monkeypatch.setattr(state_sync, "_drain_group", lambda pid, *, grace: False)
 
 
+def never_drains(monkeypatch) -> None:
+    """A group that never goes, consuming each wait exactly like the real drain."""
+
+    def drain(pid, *, grace):
+        time.sleep(max(0.0, grace))
+        return False
+
+    monkeypatch.setattr(state_sync, "_drain_group", drain)
+
+
+def unwritable_marker(monkeypatch) -> None:
+    """The survivor marker cannot be written, as on a read-only or full disk."""
+
+    def unwritable(*args, **kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(state_sync, "record_unconfirmed_tree", unwritable)
+
+
+def cleanup_fails_for(pgid: int):
+    """A stand-in for any supervised call whose Git group outlived cleanup."""
+
+    def cleanup_failed(*args, **kwargs):
+        raise state_sync.StateSyncCleanupError("still running", pgid=pgid)
+
+    return cleanup_failed
+
+
+@contextmanager
+def live_group() -> Iterator[int]:
+    """A real process group of its own, killed and reaped on the way out."""
+    process = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    try:
+        yield process.pid
+    finally:
+        process.kill()
+        process.wait()
+
+
+def default_marker(repo: Path) -> Path:
+    return state_sync.unconfirmed_tree_path(repo / state_sync.DEFAULT_LOCK_PATH)
+
+
+def locked(lock: Path, *child: str, extra: Sequence[str] = ()) -> int:
+    return state_sync.run(["locked", "--lock", str(lock), *extra, "--", *child])
+
+
 def test_cleanup_that_cannot_confirm_a_stop_raises_instead_of_returning(
     monkeypatch,
 ):
@@ -537,13 +586,12 @@ def test_a_tree_that_outlives_cleanup_blocks_the_next_firing(tmp_path, monkeypat
     to outlive it: the firing records what survived instead of reporting a clean
     finish, and the next one stops on that rather than joining a live writer."""
     lock = tmp_path / "local-check.lock"
-    marker = state_sync.unconfirmed_tree_path(lock)
     unstoppable(monkeypatch)
 
-    assert state_sync.run(
-        ["locked", "--lock", str(lock), "--cleanup-budget", "0.05", "--", "/bin/echo", "ran"]
+    assert locked(
+        lock, "/bin/echo", "ran", extra=["--cleanup-budget", "0.05"]
     ) == state_sync.UNCONFIRMED_TREE_EXIT
-    recorded = json.loads(marker.read_text(encoding="utf-8"))
+    recorded = json.loads(state_sync.unconfirmed_tree_path(lock).read_text(encoding="utf-8"))
     assert recorded["pgid"] > 1
     assert "could not stop" in recorded["detail"]
 
@@ -552,24 +600,18 @@ def test_a_recorded_survivor_keeps_the_next_firing_out_until_it_is_gone(tmp_path
     lock = tmp_path / "local-check.lock"
     marker = state_sync.unconfirmed_tree_path(lock)
     sentinel = tmp_path / "second-writer-ran"
-    child = ["/bin/sh", "-c", f"touch {sentinel}"]
-    survivor = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
-    try:
-        state_sync.record_unconfirmed_tree(marker, survivor.pid, "simulated survivor")
+    child = ("/bin/sh", "-c", f"touch {sentinel}")
+    with live_group() as survivor:
+        state_sync.record_unconfirmed_tree(marker, survivor, "simulated survivor")
 
         # The lock itself is free — the guard is the evidence, not the lock.
-        assert state_sync.run(["locked", "--lock", str(lock), "--", *child]) == (
-            state_sync.UNCONFIRMED_TREE_EXIT
-        )
+        assert locked(lock, *child) == state_sync.UNCONFIRMED_TREE_EXIT
         assert not sentinel.exists()
         assert marker.exists()
-    finally:
-        survivor.kill()
-        survivor.wait()
 
     # Once that group is really gone the refusal clears itself: no manual step is
     # needed for the common case, and the watcher resumes on the next firing.
-    assert state_sync.run(["locked", "--lock", str(lock), "--", *child]) == 0
+    assert locked(lock, *child) == 0
     assert sentinel.exists()
     assert not marker.exists()
 
@@ -582,21 +624,21 @@ def test_an_unreadable_survivor_marker_fails_closed(tmp_path):
     marker.write_text("{ truncated", encoding="utf-8")
     sentinel = tmp_path / "second-writer-ran"
 
-    assert state_sync.run(
-        ["locked", "--lock", str(lock), "--", "/bin/sh", "-c", f"touch {sentinel}"]
+    assert locked(
+        lock, "/bin/sh", "-c", f"touch {sentinel}"
     ) == state_sync.UNCONFIRMED_TREE_EXIT
     assert not sentinel.exists()
 
 
 def test_exit_codes_stay_distinguishable():
-    assert len(
-        {
-            0,
-            state_sync.BOOTSTRAP_REQUIRED_EXIT,
-            state_sync.LOCAL_RUN_TIMEOUT_EXIT,
-            state_sync.UNCONFIRMED_TREE_EXIT,
-        }
-    ) == 4
+    codes = {
+        0,
+        state_sync.BOOTSTRAP_REQUIRED_EXIT,
+        state_sync.LOCAL_RUN_TIMEOUT_EXIT,
+        state_sync.UNCONFIRMED_TREE_EXIT,
+        state_sync.UNGUARDED_TREE_EXIT,
+    }
+    assert len(codes) == 5
 
 
 def test_a_sync_that_cannot_stop_its_git_child_blocks_the_next_firing(
@@ -605,33 +647,15 @@ def test_a_sync_that_cannot_stop_its_git_child_blocks_the_next_firing(
     """That Git child leads a session of its own, so the wrapper above can
     neither see nor stop it. The sync records it where the next firing looks,
     and leaves one durable marker so the owner hears about the machine."""
-    def cleanup_failed(*args, **kwargs):
-        raise state_sync.StateSyncCleanupError(
-            "process group 4242 was still running", pgid=4242
-        )
-
-    monkeypatch.setattr(state_sync, "synchronize", cleanup_failed)
+    monkeypatch.setattr(state_sync, "synchronize", cleanup_fails_for(4242))
 
     assert state_sync.run(["sync", "--repo", str(tmp_path)]) == (
         state_sync.UNCONFIRMED_TREE_EXIT
     )
-    survivor = json.loads(
-        (tmp_path / f"{state_sync.DEFAULT_LOCK_PATH}{state_sync.UNCONFIRMED_TREE_SUFFIX}")
-        .read_text(encoding="utf-8")
-    )
+    survivor = json.loads(default_marker(tmp_path).read_text(encoding="utf-8"))
     assert survivor["pgid"] == 4242
     failure = state_sync.load_failure(tmp_path / state_sync.DEFAULT_MARKER_PATH)
     assert failure is not None and "could not stop its Git child" in failure["detail"]
-
-
-def never_drains(monkeypatch) -> None:
-    """A group that never goes, consuming each wait exactly like the real drain."""
-
-    def drain(pid, *, grace):
-        time.sleep(max(0.0, grace))
-        return False
-
-    monkeypatch.setattr(state_sync, "_drain_group", drain)
 
 
 def test_cleanup_retries_all_fit_inside_one_allowance(monkeypatch):
@@ -661,21 +685,14 @@ def test_a_survivor_that_cannot_be_recorded_keeps_the_lock_instead(
     is what keeps the overlap lock held — while the surviving group is still
     there, and it reports the *unguarded* status rather than claiming a block it
     cannot back up (later round-2 finding)."""
-    def unwritable(*args, **kwargs):
-        raise OSError("read-only file system")
-
-    monkeypatch.setattr(state_sync, "record_unconfirmed_tree", unwritable)
-    survivor = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
-    exc = state_sync.StateSyncCleanupError("still running", pgid=survivor.pid)
-    try:
+    unwritable_marker(monkeypatch)
+    with live_group() as survivor:
+        exc = state_sync.StateSyncCleanupError("still running", pgid=survivor)
         started = time.monotonic()
         code = state_sync._report_unconfirmed_tree(
             exc, tmp_path / "survivor.json", "local check", hold=0.4, poll=0.05
         )
         held = time.monotonic() - started
-    finally:
-        survivor.kill()
-        survivor.wait()
 
     assert code == state_sync.UNGUARDED_TREE_EXIT
     assert code != state_sync.UNCONFIRMED_TREE_EXIT  # never read as "guarded"
@@ -684,10 +701,7 @@ def test_a_survivor_that_cannot_be_recorded_keeps_the_lock_instead(
 
 def test_the_hold_ends_once_the_survivor_is_gone(tmp_path, monkeypatch):
     """…and it is not a blind wait: nothing is left to run into, so it returns."""
-    def unwritable(*args, **kwargs):
-        raise OSError("read-only file system")
-
-    monkeypatch.setattr(state_sync, "record_unconfirmed_tree", unwritable)
+    unwritable_marker(monkeypatch)
     gone = subprocess.Popen(["/bin/sh", "-c", "exit 0"], start_new_session=True)
     gone.wait()
     exc = state_sync.StateSyncCleanupError("was still running", pgid=gone.pid)
@@ -730,18 +744,12 @@ def test_a_surviving_git_child_is_never_reclassified_as_ref_absence(
 def test_an_operator_command_also_records_a_surviving_git_child(tmp_path, monkeypatch):
     """`init`/`recover` run in the production clone, so the scheduled firing that
     comes next must not start beside a Git group they could not stop either."""
-    def cleanup_failed(*args, **kwargs):
-        raise state_sync.StateSyncCleanupError("still running", pgid=4243)
-
-    monkeypatch.setattr(state_sync, "initialize", cleanup_failed)
+    monkeypatch.setattr(state_sync, "initialize", cleanup_fails_for(4243))
 
     assert state_sync.run(["init", "--repo", str(tmp_path)]) == (
         state_sync.UNCONFIRMED_TREE_EXIT
     )
-    survivor = json.loads(
-        (tmp_path / f"{state_sync.DEFAULT_LOCK_PATH}{state_sync.UNCONFIRMED_TREE_SUFFIX}")
-        .read_text(encoding="utf-8")
-    )
+    survivor = json.loads(default_marker(tmp_path).read_text(encoding="utf-8"))
     assert survivor["pgid"] == 4243
 
 
@@ -782,19 +790,14 @@ def test_a_signal_that_cannot_stop_the_tree_records_it_before_giving_up(
         pass
 
 
-def test_the_survivor_retry_keeps_signals_handled(tmp_path, capsys):
+def test_the_survivor_retry_keeps_signals_handled(tmp_path, monkeypatch, capsys):
     """Round-1 finding: that retry loop used to run with default signal handling,
     so a SIGTERM there ended the only guard in place. It is deferred instead —
     this test process would not survive the signal otherwise."""
     original = signal.getsignal(signal.SIGTERM)
-    survivor = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
-    exc = state_sync.StateSyncCleanupError("still running", pgid=survivor.pid)
-
-    with pytest.MonkeyPatch.context() as patch:
-        def unwritable(*args, **kwargs):
-            raise OSError("read-only file system")
-
-        patch.setattr(state_sync, "record_unconfirmed_tree", unwritable)
+    unwritable_marker(monkeypatch)
+    with live_group() as survivor:
+        exc = state_sync.StateSyncCleanupError("still running", pgid=survivor)
         killer = kill_this_process_after(0.2)
         try:
             started = time.monotonic()
@@ -804,8 +807,6 @@ def test_the_survivor_retry_keeps_signals_handled(tmp_path, capsys):
             held = time.monotonic() - started
         finally:
             killer.wait()
-            survivor.kill()
-            survivor.wait()
 
     assert code == state_sync.UNGUARDED_TREE_EXIT
     assert held >= 0.6, "the signal cut the hold short"
@@ -851,33 +852,24 @@ def test_the_lock_file_carries_the_record_when_the_marker_cannot_be_written(
     lock.write_text("", encoding="utf-8")
     marker = state_sync.unconfirmed_tree_path(lock)
     sentinel = tmp_path / "second-writer-ran"
-    child = ["/bin/sh", "-c", f"touch {sentinel}"]
-    survivor = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
-    exc = state_sync.StateSyncCleanupError("still running", pgid=survivor.pid)
+    child = ("/bin/sh", "-c", f"touch {sentinel}")
 
-    def unwritable(*args, **kwargs):
-        raise OSError("read-only file system")
-
-    monkeypatch.setattr(state_sync, "record_unconfirmed_tree", unwritable)
-    try:
+    unwritable_marker(monkeypatch)
+    with live_group() as survivor:
+        exc = state_sync.StateSyncCleanupError("still running", pgid=survivor)
         assert state_sync._report_unconfirmed_tree(
             exc, marker, "local check", lock=lock, hold=1, poll=0.05
         ) == state_sync.UNCONFIRMED_TREE_EXIT  # guarded after all, so not 6
         monkeypatch.undo()
 
         assert not marker.exists()  # the marker never landed
-        assert state_sync.surviving_tree(marker, lock)["pgid"] == survivor.pid
+        assert state_sync.surviving_tree(marker, lock)["pgid"] == survivor
         # …and that is enough to keep the next firing out.
-        assert state_sync.run(["locked", "--lock", str(lock), "--", *child]) == (
-            state_sync.UNCONFIRMED_TREE_EXIT
-        )
+        assert locked(lock, *child) == state_sync.UNCONFIRMED_TREE_EXIT
         assert not sentinel.exists()
-    finally:
-        survivor.kill()
-        survivor.wait()
 
     # It clears itself the same way, by truncation — the lock file is never removed.
-    assert state_sync.run(["locked", "--lock", str(lock), "--", *child]) == 0
+    assert locked(lock, *child) == 0
     assert sentinel.exists()
     assert lock.exists() and lock.read_text(encoding="utf-8").strip() == ""
 
@@ -887,15 +879,9 @@ def test_the_block_message_names_the_record_it_wants_cleared(tmp_path, capsys):
     may delete — so the message has to name the right one and say how."""
     lock = tmp_path / "local-check.lock"
     lock.write_text("", encoding="utf-8")
-    survivor = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
-    try:
-        state_sync.record_survivor_in_lock(lock, survivor.pid, "simulated survivor")
-        assert state_sync.run(
-            ["locked", "--lock", str(lock), "--", "/bin/echo", "ran"]
-        ) == state_sync.UNCONFIRMED_TREE_EXIT
-    finally:
-        survivor.kill()
-        survivor.wait()
+    with live_group() as survivor:
+        state_sync.record_survivor_in_lock(lock, survivor, "simulated survivor")
+        assert locked(lock, "/bin/echo", "ran") == state_sync.UNCONFIRMED_TREE_EXIT
 
     blocked = capsys.readouterr().err
     assert str(lock) in blocked
@@ -924,23 +910,12 @@ def test_a_nested_sync_reports_an_unguarded_survivor_inside_its_allowance(
     Git group nor record it anywhere must come back with exit 6 while the
     supervisor above it is still waiting — it SIGKILLs after half its cleanup
     budget, and a killed sync leaves that sessioned group unrecorded."""
-    survivor = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
-
-    def cleanup_failed(*args, **kwargs):
-        raise state_sync.StateSyncCleanupError("still running", pgid=survivor.pid)
-
-    def unwritable(*args, **kwargs):
-        raise OSError("read-only file system")
-
-    monkeypatch.setattr(state_sync, "synchronize", cleanup_failed)
-    monkeypatch.setattr(state_sync, "record_unconfirmed_tree", unwritable)
-    try:
+    unwritable_marker(monkeypatch)
+    with live_group() as survivor:
+        monkeypatch.setattr(state_sync, "synchronize", cleanup_fails_for(survivor))
         started = time.monotonic()
         code = state_sync.run(["sync", "--repo", str(tmp_path)])
         spent = time.monotonic() - started
-    finally:
-        survivor.kill()
-        survivor.wait()
 
     assert code == state_sync.UNGUARDED_TREE_EXIT
     # Neither sink took it (no lock file exists here), so the status is the only
@@ -969,19 +944,11 @@ def test_the_lock_holder_holds_only_what_is_left_of_the_firings_lifetime(
     monkeypatch.setattr(state_sync, "_run_bounded", cleanup_failed)
     monkeypatch.setattr(state_sync, "_report_unconfirmed_tree", capture)
 
-    assert state_sync.run(
-        [
-            "locked",
-            "--lock",
-            str(tmp_path / "local-check.lock"),
-            "--deadline",
-            "2",
-            "--cleanup-budget",
-            "1",
-            "--",
-            "/bin/echo",
-            "ran",
-        ]
+    assert locked(
+        tmp_path / "local-check.lock",
+        "/bin/echo",
+        "ran",
+        extra=["--deadline", "2", "--cleanup-budget", "1"],
     ) == state_sync.UNGUARDED_TREE_EXIT
 
     lifetime = 2 + 1  # the deadline plus one cleanup allowance
@@ -1027,22 +994,14 @@ def test_a_nested_supervisor_uses_the_nested_cleanup_budget(tmp_path, monkeypatc
 def test_the_lock_holder_records_a_survivor_a_nested_level_could_not(tmp_path):
     """Round-4 finding: `locked` passed an inner exit 6 through and released the
     lock with nothing left behind. It is the outermost level and the one holding
-    the lock, so it records the survivor itself — unnamed, since a nested level's
-    group cannot be named from here, which is why that record never self-clears."""
+    the lock, so it records the survivor itself — unnamed, since nothing named the
+    group to it, which is why that record never self-clears."""
     lock = tmp_path / "local-check.lock"
     marker = state_sync.unconfirmed_tree_path(lock)
     sentinel = tmp_path / "second-writer-ran"
 
-    assert state_sync.run(
-        [
-            "locked",
-            "--lock",
-            str(lock),
-            "--",
-            "/bin/sh",
-            "-c",
-            f"exit {state_sync.UNGUARDED_TREE_EXIT}",
-        ]
+    assert locked(
+        lock, "/bin/sh", "-c", f"exit {state_sync.UNGUARDED_TREE_EXIT}"
     ) == state_sync.UNGUARDED_TREE_EXIT
     recorded = json.loads(marker.read_text(encoding="utf-8"))
     assert recorded["pgid"] == 0
@@ -1050,8 +1009,8 @@ def test_the_lock_holder_records_a_survivor_a_nested_level_could_not(tmp_path):
 
     # The next firing stops on it, and — unlike a record that names its group —
     # this one cannot clear itself, because nothing can prove an unnamed group gone.
-    assert state_sync.run(
-        ["locked", "--lock", str(lock), "--", "/bin/sh", "-c", f"touch {sentinel}"]
+    assert locked(
+        lock, "/bin/sh", "-c", f"touch {sentinel}"
     ) == state_sync.UNCONFIRMED_TREE_EXIT
     assert not sentinel.exists()
     assert marker.exists()
@@ -1061,17 +1020,67 @@ def test_an_inner_block_that_already_recorded_is_left_alone(tmp_path):
     """Exit 5 means the nested level did record (or its group had gone), so this
     level must not overwrite that with an unnamed record only a human can clear."""
     lock = tmp_path / "local-check.lock"
-    marker = state_sync.unconfirmed_tree_path(lock)
 
-    assert state_sync.run(
-        [
-            "locked",
-            "--lock",
-            str(lock),
-            "--",
-            "/bin/sh",
-            "-c",
-            f"exit {state_sync.UNCONFIRMED_TREE_EXIT}",
-        ]
+    assert locked(
+        lock, "/bin/sh", "-c", f"exit {state_sync.UNCONFIRMED_TREE_EXIT}"
     ) == state_sync.UNCONFIRMED_TREE_EXIT
-    assert not marker.exists()
+    assert not state_sync.unconfirmed_tree_path(lock).exists()
+
+
+# ---------------------------------------------------------------------------
+# OTW-29: a survivor no disk record could hold still reaches the lock holder
+# ---------------------------------------------------------------------------
+
+
+def test_a_survivor_recorded_nowhere_is_announced_to_the_lock_holder(
+    tmp_path, monkeypatch
+):
+    """Round-5 finding: once the watchdog stopped the shell, a nested exit 6 had
+    no way up, so the lock holder released the lock beside that group. A level
+    whose record lands nowhere now also announces the group on the channel the
+    lock holder handed down — and only then: a recorded group needs no second word."""
+    with state_sync._survivor_channel() as (reader, writer):
+        monkeypatch.setenv(state_sync.SURVIVOR_CHANNEL_ENV, str(writer))
+
+        assert state_sync._record_survivor(4244, "recorded", tmp_path / "m.json")
+        assert state_sync._announced_survivors(reader) == []
+
+        unwritable_marker(monkeypatch)
+        missing_lock = tmp_path / "absent.lock"  # the lock sink fails too
+        for _ in range(2):
+            assert not state_sync._record_survivor(
+                4245, "nowhere", tmp_path / "m.json", lock=missing_lock
+            )
+        assert state_sync._announced_survivors(reader) == [4245]
+
+
+def test_an_announcement_never_writes_into_a_file_that_reused_the_fd(
+    tmp_path, monkeypatch
+):
+    """The fd number travels in the environment; if something closed the pipe
+    and a file took that number, the announcement must not land in the file."""
+    unrelated = tmp_path / "unrelated"
+    with unrelated.open("wb") as handle:
+        monkeypatch.setenv(state_sync.SURVIVOR_CHANNEL_ENV, str(handle.fileno()))
+        state_sync._announce_survivor(4246)
+    assert unrelated.read_bytes() == b""
+
+
+def test_a_second_survivor_is_never_hidden_behind_an_existing_record(tmp_path):
+    """One record names one group. When another group already holds the record,
+    the lock holder may not overwrite it with just the newcomer, nor leave the
+    newcomer out: it records an unnamed survivor, which only a human clears."""
+    lock = tmp_path / "local-check.lock"
+    marker = state_sync.unconfirmed_tree_path(lock)
+    with live_group() as recorded, live_group() as announced:
+        state_sync.record_unconfirmed_tree(marker, recorded, "already recorded")
+        code = state_sync._guard_survivors(
+            [state_sync.StateSyncCleanupError("announced", pgid=announced)],
+            unknown=False,
+            marker=marker,
+            lock=lock,
+            hold=1,
+        )
+
+    assert code == state_sync.UNGUARDED_TREE_EXIT
+    assert json.loads(marker.read_text(encoding="utf-8"))["pgid"] == 0
