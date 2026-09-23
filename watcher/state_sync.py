@@ -380,7 +380,12 @@ def _stop_tree_on_signal(
                 f"signal {signum} asked for",
                 pgid=process.pid,
             )
-            _record_survivor(failure, marker, what, lock=_lock_for_marker(marker))
+            _record_survivor(
+                failure.pgid,
+                _survivor_detail(failure, what),
+                marker,
+                lock=_lock_for_marker(marker),
+            )
             raise failure
 
     installed: dict[int, object] = {}
@@ -402,9 +407,9 @@ def _survivor_detail(exc: StateSyncCleanupError, what: str) -> str:
 
 
 def _record_survivor(
-    exc: StateSyncCleanupError,
+    pgid: int,
+    detail: str,
     marker: Path,
-    what: str,
     *,
     lock: Path | None = None,
 ) -> bool:
@@ -416,27 +421,24 @@ def _record_survivor(
     written and a lock file is already there, the record goes into that file
     instead — rewriting it needs no new inode and no directory change.
     """
-    detail = _survivor_detail(exc, what)
     try:
-        record_unconfirmed_tree(marker, exc.pgid, detail)
+        record_unconfirmed_tree(marker, pgid, detail)
         return True
     except OSError as failure:
         # Retried on a short loop, so the reason without a traceback each round:
         # the operator message on stderr carries what to do about it.
         log.error(
             "could not record surviving process group %s at %s: %s",
-            exc.pgid,
+            pgid,
             marker,
             failure,
         )
     if lock is None:
         return False
     try:
-        record_survivor_in_lock(lock, exc.pgid, detail)
+        record_survivor_in_lock(lock, pgid, detail)
     except OSError as failure:
-        log.error(
-            "could not record process group %s in %s: %s", exc.pgid, lock, failure
-        )
+        log.error("could not record process group %s in %s: %s", pgid, lock, failure)
         return False
     return True
 
@@ -1054,7 +1056,10 @@ def _survivor_from(path: Path, clear) -> dict[str, object] | None:
             return None
         record = json.loads(text)
         pgid = record["pgid"]
-        if isinstance(pgid, bool) or not isinstance(pgid, int) or pgid <= 1:
+        # 0 is deliberate: the outermost supervisor writes it when a nested level
+        # reported a survivor it could not name. Nothing can prove such a group is
+        # gone, so that record never self-clears — see below.
+        if isinstance(pgid, bool) or not isinstance(pgid, int) or pgid < 0 or pgid == 1:
             raise ValueError(f"invalid process group {pgid!r}")
     except (OSError, json.JSONDecodeError, TypeError, KeyError, ValueError) as exc:
         return {
@@ -1064,7 +1069,9 @@ def _survivor_from(path: Path, clear) -> dict[str, object] | None:
             "detail": f"unreadable survivor record {path} ({exc}); it cannot prove "
             "the tree stopped",
         }
-    if _signal_group(int(pgid), 0):
+    if pgid == 0 or _signal_group(int(pgid), 0):
+        # An unnamed survivor keeps blocking: only a human can decide it is gone,
+        # and `_signal_group(0, ...)` would mean *this* process's own group.
         record["source"] = str(path)
         return record
     clear(path)
@@ -1319,7 +1326,7 @@ def _report_unconfirmed_tree(
     recorded = False
     with _hold_through_signals(what) as deferred:
         while True:
-            if _record_survivor(exc, marker_path, what, lock=lock_path):
+            if _record_survivor(exc.pgid, detail, marker_path, lock=lock_path):
                 recorded = True
                 break
             if not _signal_group(exc.pgid, 0):
@@ -1366,6 +1373,56 @@ def _report_unconfirmed_tree(
         f"neither at {marker_path} nor in the lock file, so THE NEXT FIRING IS NOT "
         "PROTECTED: stop that group by hand (`ps -g`) and fix why those paths are "
         "unwritable before the watcher runs again",
+        file=sys.stderr,
+    )
+    return UNGUARDED_TREE_EXIT
+
+
+def _guard_unnamed_survivor(
+    marker: Path,
+    lock: Path,
+    detail: str,
+    *,
+    hold: float,
+    poll: float = 0.2,
+) -> int:
+    """Leave a block behind for a survivor a nested level could not record.
+
+    Reached only on a nested ``UNGUARDED_TREE_EXIT``: something of that firing is
+    still running and neither sink took it there.  This level is the outermost and
+    the one holding the lock, so it is the last that can leave anything behind —
+    releasing the lock as if nothing needed guarding is the one thing it may not
+    do.  The group cannot be named from here, so the record says so: it blocks
+    every later firing until a human clears it, because nothing can prove an
+    unnamed group has gone.  While even that cannot be written, holding the lock is
+    the guard, for as long as this firing's lifetime allows.
+    """
+    deadline = time.monotonic() + max(0.0, hold)
+    with _hold_through_signals("local check") as deferred:
+        while True:
+            if _record_survivor(0, detail, marker, lock=lock):
+                print(
+                    f"{detail}. Recorded as an unnamed survivor: every later firing "
+                    f"stops until you check what is still running and clear that "
+                    f"record (delete the marker file, or empty the lock file; never "
+                    f"delete the lock itself)",
+                    file=sys.stderr,
+                )
+                return UNGUARDED_TREE_EXIT
+            if time.monotonic() >= deadline:
+                break
+            print(
+                f"{detail}; it can be recorded neither at {marker} nor in {lock}, so "
+                "this process keeps the overlap lock while it retries",
+                file=sys.stderr,
+            )
+            time.sleep(max(0.05, poll))
+    if deferred:
+        print(f"deferred signal(s) {sorted(set(deferred))} while holding the lock", file=sys.stderr)
+    print(
+        f"{detail}. It could be recorded nowhere, so THE NEXT FIRING IS NOT "
+        "PROTECTED: find what is still running (`ps -ax`), stop it, and fix why "
+        f"{marker} and {lock} are unwritable before the watcher runs again",
         file=sys.stderr,
     )
     return UNGUARDED_TREE_EXIT
@@ -1444,8 +1501,11 @@ def run(argv: list[str] | None = None) -> int:
     )
     bounded.add_argument("--timeout", type=float, default=DEPLOY_TIMEOUT_SECONDS)
     bounded.add_argument("--lock", default=DEFAULT_LOCK_PATH)
+    # Nested under `locked` (the wrapper's deployment pull), so it draws from the
+    # nested budget, not the supervisor's: its cleanup plus the reserved recording
+    # allowance has to fit in the window that supervisor waits before SIGKILL.
     bounded.add_argument(
-        "--cleanup-budget", type=float, default=CLEANUP_BUDGET_SECONDS
+        "--cleanup-budget", type=float, default=GIT_CLEANUP_BUDGET_SECONDS
     )
     bounded.add_argument("child", nargs=argparse.REMAINDER)
     record = subparsers.add_parser("record")
@@ -1600,14 +1660,24 @@ def run(argv: list[str] | None = None) -> int:
                 # recorded what survived, and this one stays out while it lives.
                 survivor = surviving_tree(unconfirmed, lock_path)
                 if survivor is not None:
+                    # pgid 0 is the unnamed case: there is nothing to inspect by
+                    # group, and nothing can prove it gone, so only a human clears it.
+                    named = int(survivor["pgid"]) > 0
+                    subject = (
+                        f"process group {survivor['pgid']}"
+                        if named
+                        else "a process group it could not name"
+                    )
+                    inspect_with = (
+                        f"`ps -g {survivor['pgid']}`" if named else "`ps -ax`"
+                    )
                     print(
-                        "local check blocked: an earlier firing left process group "
-                        f"{survivor['pgid']} running ({survivor['detail']}). Starting a "
-                        "second writer beside it is exactly what the overlap lock "
-                        f"prevents. Inspect `ps -g {survivor['pgid']}`, stop what is "
-                        f"left, then clear that record in {survivor.get('source', unconfirmed)}"
-                        " — delete the marker file, or empty the lock file; never "
-                        "delete the lock itself",
+                        f"local check blocked: an earlier firing left {subject} running "
+                        f"({survivor['detail']}). Starting a second writer beside it is "
+                        "exactly what the overlap lock prevents. Inspect "
+                        f"{inspect_with}, stop what is left, then clear that record in "
+                        f"{survivor.get('source', unconfirmed)} — delete the marker "
+                        "file, or empty the lock file; never delete the lock itself",
                         file=sys.stderr,
                     )
                     return UNCONFIRMED_TREE_EXIT
@@ -1647,7 +1717,26 @@ def run(argv: list[str] | None = None) -> int:
                         file=sys.stderr,
                     )
                     return LOCAL_RUN_TIMEOUT_EXIT
-                return _exit_code(result.returncode)
+                inner = _exit_code(result.returncode)
+                if inner == UNGUARDED_TREE_EXIT and surviving_tree(
+                    unconfirmed, lock_path
+                ) is None:
+                    # A nested level reported a survivor it could record nowhere.
+                    # This level holds the lock and has the rest of the firing's
+                    # lifetime, so it is the last chance to leave a block behind;
+                    # passing the status through and releasing the lock would let
+                    # the next firing start beside whatever is still running. An
+                    # existing record is left alone: one that names its group is
+                    # strictly better, because it can clear itself.
+                    spent = time.monotonic() - started
+                    return _guard_unnamed_survivor(
+                        unconfirmed,
+                        lock_path,
+                        "a nested level of this local check left a process group "
+                        "running that it could neither stop nor record",
+                        hold=max(0.0, args.deadline + args.cleanup_budget - spent),
+                    )
+                return inner
         elif args.command == "bounded":
             child = _child_command(args.child, parser, "bounded")
             lock_path = _resolve_under(Path.cwd(), args.lock)

@@ -987,3 +987,91 @@ def test_the_lock_holder_holds_only_what_is_left_of_the_firings_lifetime(
     lifetime = 2 + 1  # the deadline plus one cleanup allowance
     assert 0 < captured["hold"] <= lifetime
     assert captured["hold"] <= lifetime - 0.3 + 0.1, "time already spent is not deducted"
+
+
+def captured_budgets(monkeypatch, argv: list[str]) -> dict:
+    """The cleanup budget one CLI supervisor actually hands its child."""
+    seen = {}
+
+    def capture(command, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(list(command), 0, "", ""), False
+
+    monkeypatch.setattr(state_sync, "_run_bounded", capture)
+    assert state_sync.run(argv) == 0
+    return seen
+
+
+def test_a_nested_supervisor_uses_the_nested_cleanup_budget(tmp_path, monkeypatch):
+    """Round-4 finding: `bounded` took the supervisor's full budget although it
+    runs under `locked`, which escalates to SIGKILL after half of its own — so it
+    could be killed before recording a Git tree only it can see. `locked` itself
+    keeps the full budget; it is the outermost level."""
+    lock = str(tmp_path / "local-check.lock")
+    nested = captured_budgets(
+        monkeypatch, ["bounded", "--lock", lock, "--", "/bin/echo", "x"]
+    )
+    assert nested["cleanup_budget"] == state_sync.GIT_CLEANUP_BUDGET_SECONDS
+    outer = captured_budgets(
+        monkeypatch, ["locked", "--lock", lock, "--", "/bin/echo", "x"]
+    )
+    assert outer["cleanup_budget"] == state_sync.CLEANUP_BUDGET_SECONDS
+    # The nested cleanup plus its recording allowance has to fit the window the
+    # outer level waits after SIGTERM, which is half of the outer budget.
+    assert (
+        nested["cleanup_budget"] + state_sync.SURVIVOR_RECORD_ALLOWANCE_SECONDS
+        <= outer["cleanup_budget"] / 2
+    )
+
+
+def test_the_lock_holder_records_a_survivor_a_nested_level_could_not(tmp_path):
+    """Round-4 finding: `locked` passed an inner exit 6 through and released the
+    lock with nothing left behind. It is the outermost level and the one holding
+    the lock, so it records the survivor itself — unnamed, since a nested level's
+    group cannot be named from here, which is why that record never self-clears."""
+    lock = tmp_path / "local-check.lock"
+    marker = state_sync.unconfirmed_tree_path(lock)
+    sentinel = tmp_path / "second-writer-ran"
+
+    assert state_sync.run(
+        [
+            "locked",
+            "--lock",
+            str(lock),
+            "--",
+            "/bin/sh",
+            "-c",
+            f"exit {state_sync.UNGUARDED_TREE_EXIT}",
+        ]
+    ) == state_sync.UNGUARDED_TREE_EXIT
+    recorded = json.loads(marker.read_text(encoding="utf-8"))
+    assert recorded["pgid"] == 0
+    assert "could neither stop nor record" in recorded["detail"]
+
+    # The next firing stops on it, and — unlike a record that names its group —
+    # this one cannot clear itself, because nothing can prove an unnamed group gone.
+    assert state_sync.run(
+        ["locked", "--lock", str(lock), "--", "/bin/sh", "-c", f"touch {sentinel}"]
+    ) == state_sync.UNCONFIRMED_TREE_EXIT
+    assert not sentinel.exists()
+    assert marker.exists()
+
+
+def test_an_inner_block_that_already_recorded_is_left_alone(tmp_path):
+    """Exit 5 means the nested level did record (or its group had gone), so this
+    level must not overwrite that with an unnamed record only a human can clear."""
+    lock = tmp_path / "local-check.lock"
+    marker = state_sync.unconfirmed_tree_path(lock)
+
+    assert state_sync.run(
+        [
+            "locked",
+            "--lock",
+            str(lock),
+            "--",
+            "/bin/sh",
+            "-c",
+            f"exit {state_sync.UNCONFIRMED_TREE_EXIT}",
+        ]
+    ) == state_sync.UNCONFIRMED_TREE_EXIT
+    assert not marker.exists()
