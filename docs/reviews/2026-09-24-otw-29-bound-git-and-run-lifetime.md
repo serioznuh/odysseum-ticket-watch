@@ -20,3 +20,24 @@ NOTES:
 <!-- cross-review-merge-state: APPROVED -->
 Approved after 1 round by Codex, plus a post-approval Claude pass; eligible for merge pending GitHub confirmation.
 Done-when: met
+
+# Claude review of the OTW-29 Git and run-lifetime bounds
+Flow 4 (/claude-review) · fixer gpt-6-sol/high · reviewer claude-opus-5.5/xhigh · 2026-09-24
+<!-- cross-review-loop-id: 56b97c64-1ee0-4ade-b9f6-ff2bede0b6a7 -->
+
+## Task
+Review PR 30 (OTW-29: bound Git operations and the local run's lifetime) for real bugs.
+## Round 1 — VERDICT: APPROVE
+Claude (loop-reviewer, xhigh) approved with no findings, including the architecture pass; the authoritative gate passed on the reviewed head.
+FINDINGS: none
+NOTES:
+1. A recorded survivor's pgid reused later by an unrelated group keeps blocking until that group exits. [accepted] Needs a prior double fault; a blocked firing is the safe failure and the record names the file to clear.
+2. A 600 s deadline SIGTERM during a Cinesa pass leaves the `open`-started Chrome behind. [accepted] The Cinesa half is currently disabled; revisit before re-enabling it.
+3. `locked` now polls through `communicate(timeout=600)` for the whole firing. [accepted] Negligible energy cost next to the watcher pass itself.
+4. A nested level returning 6 for a group that already exited still reports 'needs a human'. [accepted] Only the log wording is less precise; the block itself is correct.
+5. The current-state bullet is one long line and README has no operator steps for clearing a survivor record. [accepted] The stderr messages name the exact file; README wording can follow with OTW-28's operator notes.
+6. Moving the supervision helpers out of `watcher/state_sync.py` would ease review. [accepted] A module split is a separate change; OTW-28 will show which guarantees must stay together.
+## Outcome
+<!-- cross-review-merge-state: APPROVED pr=30 -->
+Approved after 1 round by Claude with no findings; eligible for merge pending GitHub confirmation.
+Done-when: met
