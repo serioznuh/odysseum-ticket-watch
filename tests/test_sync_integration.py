@@ -1536,6 +1536,51 @@ def test_an_unanswered_reservation_push_sends_nothing_and_stays_retryable(
     assert len(telegram) == 1
 
 
+def landed_then_failed_git(directory: Path) -> Path:
+    """A `git` whose push reaches the remote, then reports a dropped connection."""
+    directory.mkdir(parents=True, exist_ok=True)
+    shim = directory / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "push" ]; then\n'
+        f'  "{REAL_GIT}" "$@" || exit $?\n'
+        '  echo "fatal: the remote end hung up unexpectedly" >&2\n'
+        "  exit 128\n"
+        "fi\n"
+        f'exec "{REAL_GIT}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+def test_a_push_that_landed_but_reported_failure_is_confirmed_not_stranded(
+    tmp_path, two_clones, telegram, monkeypatch
+):
+    """Round-1 finding: a non-zero `git push` is no proof nothing landed. The
+    retry used to meet its own held entry, decline, and leave it unreleased — so
+    work known to be unsent stayed blocked for every other holder (a fresh cloud
+    runner always is one). The retry now recognises its own entries on the tip:
+    the reservation is confirmed and the work is sent, exactly once."""
+    _, local, cloud = two_clones
+    synchronize(local)
+    synchronize(cloud)
+    shim = landed_then_failed_git(tmp_path / "hung-up")
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
+
+    runner_pass = watcher_pass(cloud, "cloud:run-1")
+    assert delivery.deliver_alert(runner_pass, grouped("new_show:a"), RACE_NOW) is True
+    assert len(telegram) == 1
+    state_mod.save_state(live_path(cloud), runner_pass.state)
+    synchronize(cloud)
+    synchronize(local)
+    assert load_state(live_path(local))["reservations"] == {}  # settled
+
+    fresh = watcher_pass(local, "cloud:run-2")
+    assert delivery.deliver_alert(fresh, grouped("new_show:a"), RACE_NOW) is False
+    assert len(telegram) == 1
+
+
 def test_a_missing_ref_during_the_pass_refuses_every_send(two_clones, telegram):
     origin, local, _ = two_clones
     synchronize(local)

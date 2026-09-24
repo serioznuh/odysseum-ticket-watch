@@ -606,6 +606,19 @@ def _reserve(ctx: Any, delivery_id: str, record: dict) -> _Grant | None:
         decided["grant"] = _Grant(token, entries, lease)
         return deepcopy(entries)
 
+    def release_unconfirmed() -> None:
+        grant = decided.get("grant")
+        if grant is None:
+            return  # no entry of this token was ever pushed
+        # A push of this token may have landed without an answer. This process
+        # knows it will not send under this token, so it says so; the post-run
+        # sync publishes that, and it outranks the held entry if one did land.
+        _set_entries(ctx, grant, "released")
+        try:
+            _persist(ctx)
+        except Exception:
+            log.exception("could not persist the released reservation")
+
     try:
         confirmed = coordinator.reserve(claim)
     except (state_sync.StateSyncError, state_mod.StateError, OSError) as exc:
@@ -615,19 +628,12 @@ def _reserve(ctx: Any, delivery_id: str, record: dict) -> _Grant | None:
             delivery_id,
             exc,
         )
-        grant = decided.get("grant")
-        if grant is not None:
-            # The push may have landed without an answer. This process knows it
-            # will not send under this token, so it says so; the post-run sync
-            # publishes that, and it outranks the held entry if one did land.
-            _set_entries(ctx, grant, "released")
-            try:
-                _persist(ctx)
-            except Exception:
-                log.exception("could not persist the released reservation")
+        release_unconfirmed()
         return None
     if not confirmed:
         log.info("delivery %s not sent: %s", delivery_id, decided.get("reason"))
+        # Declined on a later attempt after an earlier push of this token.
+        release_unconfirmed()
         return None
     return decided["grant"]
 

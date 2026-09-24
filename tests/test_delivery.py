@@ -1707,3 +1707,39 @@ def test_settled_and_long_expired_reservations_are_pruned(tmp_path, monkeypatch)
     assert local.state["reservations"]  # still inside the retention window
     delivery.recover(local, retained + timedelta(days=7))
     assert local.state["reservations"] == {}
+
+
+def test_a_decline_after_an_earlier_push_of_the_token_releases_it(
+    tmp_path, monkeypatch
+):
+    """Defence in depth for the same round-1 finding: whenever a reservation
+    ends unconfirmed after this token was pushed at least once, the process
+    publishes that it will not send under it, so the entry cannot strand the
+    work for other holders."""
+    ref = SharedRef(DEFAULT_STATE)
+    base = deepcopy(ref.state)
+
+    class LandsThenDeclines(RefCoordinator):
+        def reserve(self, claim):
+            entries = claim(deepcopy(self.ref.state))
+            self.ref.state["reservations"].update(deepcopy(entries))  # landed
+            # A later attempt that declines (here: the tip changed under it).
+            self.ref.state["alerts"]["new_show:dune-imax"] = NOW.isoformat()
+            assert claim(deepcopy(self.ref.state)) is None
+            self.ref.state["alerts"].clear()
+            return False
+
+    local = host(tmp_path / "local.json", ref, "local:mac")
+    local.coordinator = LandsThenDeclines(ref, "local:mac")
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls)
+
+    assert delivery.deliver_alert(local, alert(finding()), NOW) is False
+    assert calls == []
+    assert [e["status"] for e in load_state(tmp_path / "local.json")[
+        "reservations"
+    ].values()] == ["released"]
+    ref.sync(local, base)
+    cloud = host(tmp_path / "cloud.json", ref, "cloud:run-9")
+    assert delivery.recover(cloud, NOW + timedelta(minutes=5)) is True
+    assert len(calls) == 1

@@ -900,13 +900,42 @@ def _reconcile_reservations(snapshots: Sequence[dict], merged: dict) -> dict:
     for snapshot in snapshots:
         for logical_id, entry in snapshot["reservations"].items():
             rebuilt[logical_id] = deepcopy(
-                resolve_reservation(rebuilt.get(logical_id), entry)
+                _recovered_reservation(rebuilt.get(logical_id), entry)
             )
     return {
         logical_id: entry
         for logical_id, entry in rebuilt.items()
         if not reservation_settled(merged, logical_id, entry)
     }
+
+
+# Recovery has no publication order to break a tie with, so it keeps whichever
+# reservation still blocks: one that may have sent outranks one merely held,
+# which outranks a released one.
+_RECOVERY_BLOCKING = {"released": 0, "held": 1, "uncertain": 2}
+
+
+def _recovered_reservation(first: dict | None, second: dict) -> dict:
+    """The reservation recovery keeps when two stores disagree.
+
+    One holder's token seen twice, or two tokens at different generations, is
+    decided as in an ordinary merge. Two tokens at the *same* generation are two
+    claims of which the ref accepted only one, and stores that share no base
+    cannot say which: ``resolve_reservation`` would keep the first store's (an
+    older ``--from`` backup, folded before the shared ref), which may be the
+    loser's released token standing in for the winner's uncertain one. The
+    entry that still blocks is kept instead, so recovery never frees work its
+    real holder may already have sent.
+    """
+    if (
+        first is None
+        or first["token"] == second["token"]
+        or first["generation"] != second["generation"]
+    ):
+        return resolve_reservation(first, second)
+    if _RECOVERY_BLOCKING[second["status"]] > _RECOVERY_BLOCKING[first["status"]]:
+        return second
+    return first
 
 
 def _reconcile_outbox(snapshots: Sequence[dict], merged: dict) -> dict:
@@ -1182,16 +1211,27 @@ def reserve(
     post-run sync, whose merge honours what was reserved here.  Every Git wait
     is bounded (OTW-29); a timeout raises the ordinary transport error, which
     is *not* an answer — the push may have landed — so the caller must neither
-    send nor treat the work as refused.  A confirmed absence of the ref raises
+    send nor treat the work as refused.  A push that exits non-zero is no
+    proof it failed either (the ref can update before the connection drops),
+    so the next attempt first checks whether the tip already carries this
+    call's entries; if it does, the reservation is confirmed after all.  A confirmed absence of the ref raises
     as it does for ``synchronize`` (OTW-30): no send from an unverified history.
     """
     paths = _Store(repo, store)
     with file_lock(paths.lock, blocking=True):
         last_error = "reservation push was rejected"
+        attempted: dict | None = None
         for _ in range(max(1, push_attempts)):
             remote_commit, upstream = _remote_state(paths.repo, remote, state_ref)
             if upstream is None:
                 raise _ref_absent_error(state_ref, _store_evidence(paths))
+            if attempted is not None and all(
+                upstream["reservations"].get(logical_id) == entry
+                for logical_id, entry in attempted.items()
+            ):
+                # The "failed" push landed. Only its holder moves these entries,
+                # so finding them unchanged on the tip confirms the reservation.
+                return True
             entries = claim(deepcopy(upstream))
             if entries is None:
                 return False
@@ -1208,8 +1248,10 @@ def reserve(
             )
             if pushed.returncode == 0:
                 return True
-            # Rejected: the ref moved since it was fetched (or the remote
-            # refused outright). Nothing landed; decide again from the new tip.
+            # Usually rejected because the ref moved since it was fetched, but a
+            # non-zero push may also have landed before its connection failed:
+            # the next attempt checks the tip for these entries before deciding.
+            attempted = deepcopy(entries)
             last_error = (pushed.stderr or pushed.stdout).strip() or last_error
         raise StateSyncTransportError(
             f"delivery reservation not confirmed after {max(1, push_attempts)} "

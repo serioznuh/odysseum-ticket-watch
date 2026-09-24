@@ -1229,3 +1229,42 @@ def test_a_store_keeps_one_holder_id_and_a_fresh_store_gets_its_own(
     runner_store.mkdir()
     assert state_sync.store_holder(runner_store).startswith("cloud:")
     assert state_sync.store_holder(runner_store) != first
+
+
+@pytest.mark.parametrize("backup_first", [True, False])
+def test_recovery_keeps_the_blocking_reservation_of_two_equal_generations(
+    backup_first,
+):
+    """Round-1 finding: two tokens at one generation are two claims of which the
+    ref accepted one, and recovery cannot tell which. A `--from` backup is folded
+    before the shared ref, so taking the first store's entry let the loser's
+    released token replace the winner's uncertain one — and let another host
+    reserve work the winner may already have sent. Whatever the order, the
+    entry that still blocks survives."""
+    loser = deepcopy(DEFAULT_STATE)
+    loser["reservations"][IN_FLIGHT_ID] = held_reservation("t-lose", "released")
+    winner = deepcopy(DEFAULT_STATE)
+    winner["reservations"][IN_FLIGHT_ID] = held_reservation("t-win", "uncertain")
+    stores = [loser, winner] if backup_first else [winner, loser]
+
+    recovered = state_sync.reconcile_stores(stores)
+
+    kept = recovered["reservations"][IN_FLIGHT_ID]
+    assert (kept["token"], kept["status"]) == ("t-win", "uncertain")
+
+    held = deepcopy(DEFAULT_STATE)
+    held["reservations"][IN_FLIGHT_ID] = held_reservation("t-win")
+    stores = [loser, held] if backup_first else [held, loser]
+    kept = state_sync.reconcile_stores(stores)["reservations"][IN_FLIGHT_ID]
+    assert (kept["token"], kept["status"]) == ("t-win", "held")
+
+    # …and the recovered state still refuses the key to every other host.
+    from watcher import delivery
+
+    unit = {
+        "id": IN_FLIGHT_ID,
+        "ack": {"type": "alerts", "keys": ["news:leak-42"]},
+        "force": False,
+        "expires_at": None,
+    }
+    assert delivery._decline_reason(recovered, None, [unit], "local:other", NOW)
