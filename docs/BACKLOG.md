@@ -43,7 +43,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-26 | Bound runtime-state history fetched by ephemeral runners | P3 | M | Infra, tooling & docs | [ ] |
 | OTW-27 | Cloud supervision trusts an unstable one-row Actions response and false-alerts | P0 | S | Bugs | [x] |
 | OTW-28 | Coordinate Mac/cloud delivery before sending shared notifications | P1 | L | Infra, tooling & docs | [ ] |
-| OTW-29 | Bound Git operations and the local run's lifetime | P1 | M | Infra, tooling & docs | [ ] |
+| OTW-29 | Bound Git operations and the local run's lifetime | P1 | M | Infra, tooling & docs | [x] |
 | OTW-30 | Require explicit bootstrap when the shared runtime-state ref is missing | P2 | M | Infra, tooling & docs | [x] |
 
 ## Recommended next work (reviewed 2026-09-21)
@@ -54,18 +54,19 @@ verification, and dependencies listed on completed items are historical.
 
 | Order | ID | Work and reason for this position | Effort estimate |
 | --- | --- | --- | --- |
-| 1 | OTW-29 | Bound Git waits and release the local lock safely after a hung run; coordination must not introduce another indefinite wait. | M · about 1 day |
-| 2 | OTW-28 | Prevent Mac/cloud overlap from sending the same finding twice, using the trusted startup and bounded transport above. | L · 2–3 days |
-| 3 | OTW-12 | Make reminder wording agree with the effective ladder after fresh observations; a false promise is reproducible. | S · 3–4 h |
-| 4 | OTW-17 | Clarify merged new/moved sale announcements; a small, visible improvement to alert precision. | S · 2–4 h |
-| 5 | OTW-26 | Bound CI's state-history download before its cost grows further; preserve the delivery coordination contract during fetch optimization. | M · about 1 day |
-| 6 | OTW-01 | Add documentation checks after the backlog descriptions and statuses are current. | S · 2–4 h |
-| 7 | OTW-24 | Finish Cinesa's exceptional cleanup bookkeeping; low urgency while Cinesa is disabled, but complete before future use. | S · 2–3 h |
+| 1 | OTW-28 | Prevent Mac/cloud overlap from sending the same finding twice, using the trusted startup and bounded transport now in place. | L · 2–3 days |
+| 2 | OTW-12 | Make reminder wording agree with the effective ladder after fresh observations; a false promise is reproducible. | S · 3–4 h |
+| 3 | OTW-17 | Clarify merged new/moved sale announcements; a small, visible improvement to alert precision. | S · 2–4 h |
+| 4 | OTW-26 | Bound CI's state-history download before its cost grows further; preserve the delivery coordination contract during fetch optimization. | M · about 1 day |
+| 5 | OTW-01 | Add documentation checks after the backlog descriptions and statuses are current. | S · 2–4 h |
+| 6 | OTW-24 | Finish Cinesa's exceptional cleanup bookkeeping; low urgency while Cinesa is disabled, but complete before future use. | S · 2–3 h |
 
 OTW-28 tracks the remaining delivery race accepted in OTW-20/OTW-21 and made
-visible by OTW-08. OTW-29 promotes the last accepted OTW-21 operational risk
-into explicit work; an isolated check reproduced it on 2026-09-21, without
-changing production state. It does not depend on an additional host or OTW-22.
+visible by OTW-08. Both accepted OTW-21 operational risks are now closed:
+OTW-30 made missing-ref bootstrap explicit and OTW-29 bounded every Git wait and
+the local run's lifetime, so coordination has trusted startup state and no
+indefinite wait left to inherit. It does not depend on an additional host or
+OTW-22.
 
 **Deferred:** OTW-04 becomes useful when Cinesa is enabled for an active watch
 again (S · 3–4 h). **Parked by owner:** OTW-22 has no available host beyond the

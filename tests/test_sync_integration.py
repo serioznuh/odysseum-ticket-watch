@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from copy import deepcopy
 from pathlib import Path
 
@@ -682,9 +685,19 @@ def install_local_check(repo: Path) -> Path:
     (repo / ".env").write_text("", encoding="utf-8")
     (repo / ".venv" / "bin").mkdir(parents=True)
     stub = repo / ".venv" / "bin" / "python"
+    # OTW_FAKE_SYNC_EXIT[_ON] lets a test give one `sync` call an exit status that
+    # is impractical to provoke for real (a Git group nothing could stop), while
+    # every other state_sync call stays the real thing.
     stub.write_text(
         "#!/bin/sh\n"
         'if [ "$1" = "-m" ] && [ "$2" = "watcher.state_sync" ]; then\n'
+        '  if [ "$3" = "sync" ] && [ -n "${OTW_FAKE_SYNC_EXIT:-}" ]; then\n'
+        '    calls=$(( $(cat sync-calls 2>/dev/null || echo 0) + 1 ))\n'
+        '    printf %s "$calls" > sync-calls\n'
+        '    if [ "$calls" = "${OTW_FAKE_SYNC_EXIT_ON:-1}" ]; then\n'
+        '      exit "$OTW_FAKE_SYNC_EXIT"\n'
+        "    fi\n"
+        "  fi\n"
         '  exec "$REAL_PYTHON" "$@"\n'
         "fi\n"
         "printf '%s\\n' \"$*\" >> watcher-invocations\n",
@@ -777,3 +790,483 @@ def test_local_check_stops_before_the_watcher_even_with_local_receipts(two_clone
     # The owner still learns about it: one durable marker, delivered as a loud
     # alert by the first pass that runs after recovery.
     assert load_failure(local / DEFAULT_MARKER_PATH) is not None
+
+
+# ---------------------------------------------------------------------------
+# OTW-29: bounded Git waits and a bounded local run
+# ---------------------------------------------------------------------------
+
+REAL_GIT = shutil.which("git")
+HUNG_SECONDS = 600  # far beyond every bound exercised below
+BOUND = 1.0
+BUDGET = 1.0
+# The configured bound plus its cleanup allowance, with generous slack for
+# interpreter startup on a loaded machine. Measured against a child that would
+# otherwise wedge for HUNG_SECONDS, this is what "finite" means here.
+PATIENCE = BOUND + 2 * BUDGET + 15.0
+
+
+def hung_git(directory: Path, *subcommands: str) -> tuple[Path, Path]:
+    """A `git` that wedges on the named subcommands instead of answering.
+
+    It leaves a grandchild of its own behind — what a stalled transfer really
+    looks like, an `ssh` or `git-remote-https` still holding the socket — and
+    records both pids, so a test can prove the whole owned tree was stopped and
+    not merely the process Python spawned directly.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    pids = directory / "hung-pids"
+    shim = directory / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'case "$1" in\n  {"|".join(subcommands)})\n'
+        f"    sleep {HUNG_SECONDS} &\n"
+        f'    printf "%s\\n%s\\n" "$$" "$!" >> "{pids}"\n'
+        "    wait\n"
+        "    ;;\n"
+        "esac\n"
+        f'exec "{REAL_GIT}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim, pids
+
+
+def hung_pids(path: Path, *, timeout: float = 10.0) -> list[int]:
+    """The child and grandchild pids the wedged shim recorded."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            found = [int(line) for line in path.read_text(encoding="utf-8").split()]
+            if len(found) >= 2:
+                return found
+        time.sleep(0.05)
+    raise AssertionError(f"the hung child never recorded its pids in {path}")
+
+
+def is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def assert_tree_stopped(pids: Sequence[int], *, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        alive = [pid for pid in pids if is_alive(pid)]
+        if not alive:
+            return
+        assert time.monotonic() < deadline, f"owned processes still running: {alive}"
+        time.sleep(0.05)
+
+
+def bounded_waits(monkeypatch) -> None:
+    """Shrink the in-process bounds; the behavior under test is the timeout."""
+    monkeypatch.setattr(state_sync, "GIT_TIMEOUT_SECONDS", BOUND)
+    monkeypatch.setattr(state_sync, "GIT_CLEANUP_BUDGET_SECONDS", BUDGET)
+
+
+def supervisor(*args: str) -> list[str]:
+    return [sys.executable, "-m", "watcher.state_sync", *args]
+
+
+def child_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT)
+    return env
+
+
+def run_supervisor(
+    *args: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """One `python -m watcher.state_sync` call in its own process, run to the end."""
+    return subprocess.run(
+        supervisor(*args),
+        cwd=ROOT,
+        env=child_env() if env is None else env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_deployment_pull_timeout_is_bounded_and_stops_its_whole_tree(tmp_path):
+    """The wrapper's `git pull` runs under this boundary. A pull that never
+    answers must not hold the overlap lock: it is stopped with its grandchildren
+    and reported as a failed deployment, which the wrapper already survives by
+    running the installed code."""
+    shim, pids = hung_git(tmp_path / "hung-deploy", "pull")
+    started = time.monotonic()
+    fired = run_supervisor(
+        "bounded",
+        "--timeout",
+        str(BOUND),
+        "--cleanup-budget",
+        str(BUDGET),
+        "--",
+        str(shim),
+        "pull",
+        "--ff-only",
+        "--quiet",
+        "origin",
+        "main",
+    )
+
+    assert time.monotonic() - started < PATIENCE
+    assert fired.returncode == state_sync.LOCAL_RUN_TIMEOUT_EXIT
+    assert fired.returncode != BOOTSTRAP_REQUIRED_EXIT  # never the missing-ref block
+    assert "did not finish within" in fired.stderr
+    assert_tree_stopped(hung_pids(pids))
+
+
+def test_pre_run_sync_timeout_is_a_bounded_transport_failure(
+    tmp_path, two_clones, monkeypatch
+):
+    """The mandatory pre-run sync stays mandatory, but it cannot hang. A Git
+    child that never answers is the existing transport condition: no new alert
+    path, no confirmed-absence block, and the last validated copy untouched."""
+    _, local, _ = two_clones
+    synchronize(local)
+    deliver(local, HISTORIC_ALERT, "attempt-historic")
+    synchronize(local)
+    live_before = live_path(local).read_bytes()
+    base_before = (local / DEFAULT_STORE_PATH / "base.json").read_bytes()
+
+    shim, pids = hung_git(tmp_path / "hung-presync", "ls-remote")
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
+    bounded_waits(monkeypatch)
+
+    started = time.monotonic()
+    assert run(["sync", "--repo", str(local), "--push-attempts", "1"]) == 1
+    assert time.monotonic() - started < PATIENCE
+    assert_tree_stopped(hung_pids(pids))
+
+    # Gating is unchanged: one transient timeout only advances the capped streak.
+    streak = load_transport_failure(local / DEFAULT_STORE_PATH / TRANSPORT_FAILURE_FILE)
+    assert streak is not None and streak["count"] == 1
+    assert load_failure(local / DEFAULT_MARKER_PATH) is None
+    assert live_path(local).read_bytes() == live_before
+    assert (local / DEFAULT_STORE_PATH / "base.json").read_bytes() == base_before
+
+    monkeypatch.undo()
+    assert run(["sync", "--repo", str(local)]) == 0
+    assert not (local / DEFAULT_STORE_PATH / TRANSPORT_FAILURE_FILE).exists()
+
+
+def test_post_run_sync_stall_retains_receipts_and_quarantined_work(
+    tmp_path, two_clones, monkeypatch
+):
+    """The post-run sync carries the just-finished pass's receipts. A stalled
+    push must lose none of them, must leave an interrupted send `uncertain`
+    rather than retry it, and must stay retryable on the next firing."""
+    _, local, cloud = two_clones
+    synchronize(local)
+    synchronize(cloud)
+
+    def saved_by_the_pass(state: dict) -> None:
+        state["alerts"]["receipt-before-stall"] = STAMP
+        state["delivery_receipts"]["attempt-before-stall"] = {
+            "delivery_id": "telegram:receipt-before-stall",
+            "keys": ["receipt-before-stall"],
+            "delivered_at": STAMP,
+            "telegram_message_id": 909,
+        }
+        interrupted = deepcopy(IN_FLIGHT)
+        interrupted["status"] = "uncertain"
+        state["outbox"][IN_FLIGHT_ID] = interrupted
+
+    change_state(local, saved_by_the_pass)
+
+    shim, pids = hung_git(tmp_path / "hung-push", "push")
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
+    bounded_waits(monkeypatch)
+
+    started = time.monotonic()
+    assert run(["sync", "--repo", str(local), "--push-attempts", "1"]) == 1
+    assert time.monotonic() - started < PATIENCE
+    assert_tree_stopped(hung_pids(pids))
+
+    stalled = load_state(live_path(local))
+    assert "receipt-before-stall" in stalled["alerts"]
+    assert "attempt-before-stall" in stalled["delivery_receipts"]
+    assert stalled["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+    streak = load_transport_failure(local / DEFAULT_STORE_PATH / TRANSPORT_FAILURE_FILE)
+    assert streak is not None and streak["count"] == 1
+    assert load_failure(local / DEFAULT_MARKER_PATH) is None
+
+    monkeypatch.undo()
+    assert run(["sync", "--repo", str(local)]) == 0
+    synchronize(cloud)
+    shared = load_state(live_path(cloud))
+    assert "receipt-before-stall" in shared["alerts"]
+    assert shared["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+
+
+def test_overall_deadline_releases_the_lock_only_after_the_tree_stops(tmp_path):
+    """The watchdog for a firing that wedges anywhere — pull, sync or watcher.
+    It must end the run, stop the tree it owns, and leave the lock usable; the
+    lock file itself is never deleted to let a second writer in early."""
+    lock = tmp_path / "local-check.lock"
+    pids_file = tmp_path / "wedged-pids"
+    wedged = (
+        f"sleep {HUNG_SECONDS} & "
+        f'printf "%s\\n%s\\n" "$$" "$!" > "{pids_file}"; wait'
+    )
+    started = time.monotonic()
+    fired = run_supervisor(
+        "locked",
+        "--lock",
+        str(lock),
+        "--deadline",
+        str(BOUND),
+        "--cleanup-budget",
+        str(BUDGET),
+        "--",
+        "/bin/sh",
+        "-c",
+        wedged,
+    )
+
+    assert time.monotonic() - started < PATIENCE
+    assert fired.returncode == state_sync.LOCAL_RUN_TIMEOUT_EXIT
+    assert "deadline" in fired.stderr
+    assert_tree_stopped(hung_pids(pids_file))
+    assert lock.exists()  # released, not removed
+
+    # Only now may the next firing run, and it must not report an overlap.
+    followed = run_supervisor("locked", "--lock", str(lock), "--", "/bin/echo", "next firing")
+    assert followed.returncode == 0
+    assert "already running" not in followed.stderr
+    assert "next firing" in followed.stdout
+
+
+def fire_local_check(repo: Path, **extra: str) -> subprocess.CompletedProcess[str]:
+    script = install_local_check(repo)
+    env = child_env()
+    env["REAL_PYTHON"] = sys.executable
+    env.update(extra)
+    return subprocess.run(
+        ["/bin/bash", str(script)],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_failed_deployment_still_runs_the_watcher_on_installed_code(two_clones):
+    """The fallback a bounded pull reuses: deployment reports and the firing
+    continues, so a Git problem never costs the reminder check."""
+    _, local, _ = two_clones
+    synchronize(local)
+    git(local, "remote", "set-url", "origin", str(local.parent / "vanished.git"))
+
+    fired = fire_local_check(local)
+
+    assert fired.returncode != 0
+    assert fired.returncode != BOOTSTRAP_REQUIRED_EXIT
+    assert "code deployment from origin/main failed" in fired.stderr
+    # The watcher ran anyway, on the installed code, with the last validated state.
+    assert (local / "watcher-invocations").exists()
+    assert HISTORIC_ALERT not in load_state(live_path(local))["alerts"]
+
+
+def test_a_signal_mid_git_call_stops_the_git_tree_before_the_lock_is_free(
+    tmp_path, two_clones
+):
+    """The hole a separate session opens: the locked firing's group kill reaches
+    the state sync, but not the Git child *it* started in a session of its own.
+    Every supervisor in the chain has to hand the stop down, so by the time the
+    lock can be seen as free no Git process of that firing is still running."""
+    _, local, _ = two_clones
+    synchronize(local)
+    shim, pids_file = hung_git(tmp_path / "hung-signal", "ls-remote", "fetch")
+    lock = tmp_path / "local-check.lock"
+    env = child_env()
+    env["PATH"] = f"{shim.parent}{os.pathsep}{env['PATH']}"
+    # `exec` so the state sync itself is the supervised child: a signal to the
+    # locked supervisor reaches it, and only its own forwarding reaches Git.
+    sync_command = (
+        f'exec "{sys.executable}" -m watcher.state_sync sync'
+        f' --repo "{local}" --store "{local}/{DEFAULT_STORE_PATH}"'
+    )
+    firing = subprocess.Popen(
+        supervisor(
+            "locked",
+            "--lock",
+            str(lock),
+            "--cleanup-budget",
+            str(BUDGET),
+            "--",
+            "/bin/sh",
+            "-c",
+            sync_command,
+        ),
+        cwd=ROOT,
+        env=env,
+    )
+    hung = hung_pids(pids_file)  # Git and its helper are running
+
+    os.kill(firing.pid, signal.SIGTERM)
+    assert firing.wait(timeout=PATIENCE) != 0
+
+    # No tolerance here on purpose: the supervisor may only exit — which is the
+    # moment the lock becomes observable — after the whole tree has stopped.
+    assert [pid for pid in hung if is_alive(pid)] == []
+    assert lock.exists()  # released, never deleted
+    followed = run_supervisor("locked", "--lock", str(lock), "--", "/bin/echo", "next firing")
+    assert followed.returncode == 0
+    assert "already running" not in followed.stderr
+    # The interrupted sync wrote nothing new and left the validated copy in place.
+    assert load_state(live_path(local)) == load_state(local / DEFAULT_STORE_PATH / "base.json")
+
+
+def test_a_surviving_group_stops_the_firing_before_the_watcher(two_clones):
+    """Round-2 finding: exit 5 is not an ordinary sync failure to carry on from.
+    A group that nothing could stop may still be writing, so the firing must not
+    stack the watcher and a second sync beside it."""
+    _, local, _ = two_clones
+    synchronize(local)
+
+    fired = fire_local_check(
+        local, OTW_FAKE_SYNC_EXIT=str(state_sync.UNCONFIRMED_TREE_EXIT)
+    )
+
+    assert fired.returncode == state_sync.UNCONFIRMED_TREE_EXIT
+    assert "left a Git process group running" in fired.stderr
+    assert not (local / "watcher-invocations").exists()
+    assert (local / "sync-calls").read_text(encoding="utf-8") == "1"  # no second sync
+
+
+def test_a_surviving_group_after_the_watcher_is_not_masked_by_another_failure(
+    two_clones,
+):
+    """…and the status may not be lost either: an ordinary earlier failure (here a
+    failed deployment) must not hide the one status that says a writer of this
+    firing is still running."""
+    _, local, _ = two_clones
+    synchronize(local)
+    git(local, "remote", "set-url", "origin", str(local.parent / "vanished.git"))
+
+    fired = fire_local_check(
+        local,
+        OTW_FAKE_SYNC_EXIT=str(state_sync.UNCONFIRMED_TREE_EXIT),
+        OTW_FAKE_SYNC_EXIT_ON="2",
+    )
+
+    assert "code deployment from origin/main failed" in fired.stderr  # ordinary, 1
+    assert (local / "watcher-invocations").exists()  # the pass itself ran
+    assert fired.returncode == state_sync.UNCONFIRMED_TREE_EXIT
+    assert "the next firing stops until that group is gone" in fired.stderr
+
+
+def nested_level_that_announces(tmp_path: Path) -> tuple[list[str], Path]:
+    """A child playing a nested sync whose Git group survived and was recorded
+    nowhere: it leaves a group of its own session running, announces it the way
+    `_announce_survivor` does, notes its pid, then wedges."""
+    pid_file = tmp_path / "survivor-pid"
+    # Every stream detached, or the survivor would hold this test's capture pipes.
+    start_survivor = (
+        "import subprocess as s; print(s.Popen(['sleep', '"
+        f"{HUNG_SECONDS}'], start_new_session=True, stdin=s.DEVNULL, "
+        "stdout=s.DEVNULL, stderr=s.DEVNULL).pid)"
+    )
+    script = (
+        f'survivor=$("{sys.executable}" -c "{start_survivor}") && '
+        f'echo "$survivor" >&"${state_sync.SURVIVOR_CHANNEL_ENV}" && '
+        f'echo "$survivor" > "{pid_file}" && '
+        f"sleep {HUNG_SECONDS}"
+    )
+    return ["/bin/bash", "-c", script], pid_file
+
+
+def announced_survivor(pid_file: Path) -> int:
+    deadline = time.monotonic() + 10
+    while not (pid_file.exists() and pid_file.read_text(encoding="utf-8").strip()):
+        assert time.monotonic() < deadline, "the nested level never announced"
+        time.sleep(0.05)
+    return int(pid_file.read_text(encoding="utf-8"))
+
+
+def kill_group(pgid: int) -> None:
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def assert_recorded_by_name_until_gone(lock: Path, survivor: int, tmp_path: Path) -> None:
+    """The record names the group: it blocks while that group lives and clears
+    itself once it is gone."""
+    marker = state_sync.unconfirmed_tree_path(lock)
+    assert json.loads(marker.read_text(encoding="utf-8"))["pgid"] == survivor
+    sentinel = tmp_path / "second-writer-ran"
+    next_firing = ("locked", "--lock", str(lock), "--", "/bin/sh", "-c", f"touch {sentinel}")
+    assert run_supervisor(*next_firing).returncode == state_sync.UNCONFIRMED_TREE_EXIT
+    assert not sentinel.exists()
+
+    kill_group(survivor)
+    assert_tree_stopped([survivor])
+    assert run_supervisor(*next_firing).returncode == 0
+    assert sentinel.exists()
+
+
+def test_the_watchdog_still_records_a_group_a_nested_level_announced(tmp_path):
+    """Round-5 finding: when the overall deadline stops the shell, a nested sync's
+    exit 6 — a sessioned Git group it could neither stop nor record — has no way
+    up, and `locked` used to release the lock with exit 4 beside that group. The
+    nested level also announces the group on the channel `locked` hands down, so
+    the lock holder records it by name before letting go."""
+    lock = tmp_path / "local-check.lock"
+    child, pid_file = nested_level_that_announces(tmp_path)
+    try:
+        fired = run_supervisor(
+            "locked",
+            "--lock",
+            str(lock),
+            "--deadline",
+            str(BOUND),
+            "--cleanup-budget",
+            str(BUDGET),
+            "--",
+            *child,
+        )
+    finally:
+        survivor = announced_survivor(pid_file)
+
+    try:
+        assert "deadline" in fired.stderr
+        assert fired.returncode == state_sync.UNCONFIRMED_TREE_EXIT, fired.stderr
+        assert_recorded_by_name_until_gone(lock, survivor, tmp_path)
+    finally:
+        kill_group(survivor)
+
+
+def test_a_stop_signal_still_records_a_group_a_nested_level_announced(tmp_path):
+    """The same gap on the other way a firing ends early: launchd's SIGTERM. The
+    lock holder stops its tree and dies by that signal as before — but only after
+    recording what a nested level announced, while it still holds the lock."""
+    lock = tmp_path / "local-check.lock"
+    child, pid_file = nested_level_that_announces(tmp_path)
+    firing = subprocess.Popen(
+        supervisor("locked", "--lock", str(lock), "--cleanup-budget", str(BUDGET), "--", *child),
+        cwd=ROOT,
+        env=child_env(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    survivor = announced_survivor(pid_file)
+    try:
+        firing.send_signal(signal.SIGTERM)
+        assert firing.wait(timeout=PATIENCE) == -signal.SIGTERM
+        assert_recorded_by_name_until_gone(lock, survivor, tmp_path)
+    finally:
+        if firing.poll() is None:
+            firing.kill()
+            firing.wait()
+        kill_group(survivor)

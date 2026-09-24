@@ -47,6 +47,14 @@ Core facts agents need before editing:
   state **both before and after** the watcher run. The pre-run sync is not
   redundant: without it the Mac cannot see a reminder the cloud failover sent
   while it slept and can re-send it.
+- Every Git child there and in `state_sync` is bounded, `locked` caps the whole
+  firing, and a timeout is a **transport** failure (capped streak, no new alert
+  path), never a confirmed absence. The overlap lock is released only after a
+  supervisor stopped and reaped its own tree, never by deleting the lock file;
+  each level forwards a stop down to the tree it owns — unreachable from above —
+  and its whole cleanup, recording included, fits the allowance the level above
+  gives before SIGKILL. A surviving tree is recorded beside the lock or in it,
+  never presumed gone: exit 5 blocks the next firing, exit 6 needs a human.
 
 ### Cinesa half (second target)
 

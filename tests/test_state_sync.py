@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import os
 import re
+import signal
+import subprocess
+import time
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +20,7 @@ import pytest
 
 from watcher import jobs, notify, state_sync
 from watcher.detect import TZ_PARIS
-from watcher.state import DEFAULT_STATE, save_state
+from watcher.state import DEFAULT_STATE, LOCAL_FIRING_INTERVAL_MINUTES, save_state
 
 NOW = datetime(2026, 9, 17, 12, 0, tzinfo=TZ_PARIS)
 
@@ -392,3 +399,767 @@ def test_reconciliation_keeps_work_a_later_store_never_knew_about():
     assert set(merged["outbox"]) == {"telegram:queued", IN_FLIGHT_ID}
     assert merged["outbox"]["telegram:queued"]["status"] == "pending"
     assert merged["outbox"][IN_FLIGHT_ID]["status"] == "uncertain"
+
+
+# ---------------------------------------------------------------------------
+# OTW-29: nothing in a local firing waits forever
+# ---------------------------------------------------------------------------
+
+
+def test_local_run_deadline_is_finite_and_leaves_room_for_every_bounded_step():
+    """The overall watchdog is a backstop, never a competitor: a healthy pass —
+    its whole polling budget plus a bounded deployment pull and both syncs' first
+    network waits — has to finish well inside it, and it still has to be finite
+    so a wedged tree cannot hold the lock across every later firing."""
+    assert state_sync.LOCAL_RUN_DEADLINE_SECONDS == (
+        2 * LOCAL_FIRING_INTERVAL_MINUTES * 60
+    )
+    assert state_sync.LOCAL_RUN_DEADLINE_SECONDS >= (
+        jobs.POLLING_BUDGET_SECONDS
+        + state_sync.DEPLOY_TIMEOUT_SECONDS
+        + 2 * state_sync.GIT_TIMEOUT_SECONDS
+    )
+    # A timeout must stay tellable apart from the missing-ref block and success.
+    assert state_sync.LOCAL_RUN_TIMEOUT_EXIT not in {
+        0,
+        state_sync.BOOTSTRAP_REQUIRED_EXIT,
+    }
+
+
+def test_git_timeout_is_reported_as_a_transport_failure(tmp_path, monkeypatch):
+    """A Git child that never answers gets the existing capped streak, not a new
+    loud alert path — and never the confirmed-absence block, because a timeout is
+    no answer about what the shared ref holds."""
+    def timed_out(command, **kwargs):
+        return subprocess.CompletedProcess(list(command), 0, "", ""), True
+
+    monkeypatch.setattr(state_sync, "_run_bounded", timed_out)
+    with pytest.raises(state_sync.StateSyncTransportError, match="did not answer"):
+        state_sync._git(tmp_path, "ls-remote", "--exit-code", "origin", "refs/x")
+    # check=False callers are not exempt: a timeout is not a returncode.
+    with pytest.raises(state_sync.StateSyncTransportError):
+        state_sync._git(tmp_path, "push", "origin", "x", check=False)
+
+
+def test_local_check_bounds_the_deployment_pull_and_the_whole_firing():
+    """The wrapper holds one overlap lock across deployment, both syncs and the
+    watcher, so an unbounded Git child there costs every later firing too."""
+    root = Path(__file__).resolve().parent.parent
+    lines = (root / "scripts" / "local-check.sh").read_text(encoding="utf-8").splitlines()
+
+    def line_of(needle: str) -> int:
+        return next(index for index, line in enumerate(lines) if needle in line)
+
+    locked = line_of("state_sync locked")
+    pull = line_of("git pull --ff-only")
+    pre_sync = line_of("sync_state || pre_sync_status")
+    # The pull runs through the stdlib boundary, and deployment still comes first.
+    assert "state_sync bounded" in "".join(lines[pull - 1 : pull + 1])
+    assert locked < pull < pre_sync
+
+    # A surviving process group is a hard stop wherever it is reported — the same
+    # class of handling as the missing ref, never folded into "failed, carry on".
+    script_text = "\n".join(lines)
+    for name, code in (
+        ("UNCONFIRMED", state_sync.UNCONFIRMED_TREE_EXIT),
+        ("UNGUARDED", state_sync.UNGUARDED_TREE_EXIT),
+    ):
+        assert re.search(rf"^STATE_{name}_TREE_EXIT={code}$", script_text, re.MULTILINE)
+        assert f'"$STATE_{name}_TREE_EXIT"' in script_text  # the check uses it
+    stops = [
+        index for index, line in enumerate(lines) if line.startswith(("if surviving_group", "  if surviving_group"))
+    ]
+    assert len(stops) == 3, "deployment, pre-run sync and post-run sync each stop on it"
+    post_sync = line_of("sync_state || sync_status")
+    assert stops[0] < pre_sync and stops[1] < post_sync
+    # …and the post-run check comes before the folding that could mask it.
+    assert stops[2] < line_of('"$status" -eq 0')
+
+
+def test_termination_stays_forwarded_while_the_tree_is_cleaned_up():
+    """A signal arriving during timeout cleanup must still be forwarded to the
+    owned tree. If the handlers were uninstalled before cleanup, that signal
+    would end this supervisor while part of its tree could still be running."""
+    original = signal.getsignal(signal.SIGTERM)
+    observed = {}
+    real_stop_tree = state_sync._stop_tree
+
+    def watch_cleanup(process, *, window):
+        observed["during"] = signal.getsignal(signal.SIGTERM)
+        return real_stop_tree(process, window=window)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(state_sync, "_stop_tree", watch_cleanup)
+        _, timed_out = state_sync._run_bounded(
+            ["/bin/sh", "-c", "sleep 30 & wait"],
+            timeout=0.2,
+            cleanup_budget=1.0,
+            capture=False,
+        )
+
+    assert timed_out is True
+    assert callable(observed["during"]) and observed["during"] is not original
+    # …and the supervisor hands the signals back once no child of its own is left.
+    assert signal.getsignal(signal.SIGTERM) is original
+
+
+def test_a_git_tree_is_cleaned_up_inside_its_supervisors_allowance():
+    """A sync stopped by the overall deadline has to finish stopping its own Git
+    child before the supervisor above it escalates to SIGKILL, which that Git
+    child would otherwise outlive."""
+    assert (
+        state_sync.GIT_CLEANUP_BUDGET_SECONDS
+        + state_sync.SURVIVOR_RECORD_ALLOWANCE_SECONDS
+        <= state_sync.CLEANUP_BUDGET_SECONDS / 2
+    )
+
+
+# ---------------------------------------------------------------------------
+# OTW-29: a tree that outlives cleanup is reported, never presumed gone
+# ---------------------------------------------------------------------------
+
+
+def unstoppable(monkeypatch) -> None:
+    """Make every escalation report that the group is still running."""
+    monkeypatch.setattr(state_sync, "_drain_group", lambda pid, *, grace: False)
+
+
+def never_drains(monkeypatch) -> None:
+    """A group that never goes, consuming each wait exactly like the real drain."""
+
+    def drain(pid, *, grace):
+        time.sleep(max(0.0, grace))
+        return False
+
+    monkeypatch.setattr(state_sync, "_drain_group", drain)
+
+
+def unwritable_marker(monkeypatch) -> None:
+    """The survivor marker cannot be written, as on a read-only or full disk."""
+
+    def unwritable(*args, **kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(state_sync, "record_unconfirmed_tree", unwritable)
+
+
+def cleanup_fails_for(pgid: int):
+    """A stand-in for any supervised call whose Git group outlived cleanup."""
+
+    def cleanup_failed(*args, **kwargs):
+        raise state_sync.StateSyncCleanupError("still running", pgid=pgid)
+
+    return cleanup_failed
+
+
+@contextmanager
+def live_group() -> Iterator[int]:
+    """A real process group of its own, killed and reaped on the way out.
+
+    The whole group is killed, not just the shell: a shell that forks `sleep`
+    instead of exec'ing it (dash on Linux) would otherwise leave that group
+    running for real after the test says it is gone.
+    """
+    process = subprocess.Popen(["/bin/sh", "-c", "exec sleep 30"], start_new_session=True)
+    try:
+        yield process.pid
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def default_marker(repo: Path) -> Path:
+    return state_sync.unconfirmed_tree_path(repo / state_sync.DEFAULT_LOCK_PATH)
+
+
+def locked(lock: Path, *child: str, extra: Sequence[str] = ()) -> int:
+    return state_sync.run(["locked", "--lock", str(lock), *extra, "--", *child])
+
+
+def test_cleanup_that_cannot_confirm_a_stop_raises_instead_of_returning(
+    monkeypatch,
+):
+    unstoppable(monkeypatch)
+    with pytest.raises(state_sync.StateSyncCleanupError, match="still running"):
+        state_sync._run_bounded(
+            ["/bin/echo", "done"], timeout=5, cleanup_budget=0.05, capture=False
+        )
+
+
+def test_a_tree_that_outlives_cleanup_blocks_the_next_firing(tmp_path, monkeypatch):
+    """The lock cannot be held past this process's own life, so the refusal has
+    to outlive it: the firing records what survived instead of reporting a clean
+    finish, and the next one stops on that rather than joining a live writer."""
+    lock = tmp_path / "local-check.lock"
+    unstoppable(monkeypatch)
+
+    assert locked(
+        lock, "/bin/echo", "ran", extra=["--cleanup-budget", "0.05"]
+    ) == state_sync.UNCONFIRMED_TREE_EXIT
+    recorded = json.loads(state_sync.unconfirmed_tree_path(lock).read_text(encoding="utf-8"))
+    assert recorded["pgid"] > 1
+    assert "could not stop" in recorded["detail"]
+
+
+def test_a_recorded_survivor_keeps_the_next_firing_out_until_it_is_gone(tmp_path):
+    lock = tmp_path / "local-check.lock"
+    marker = state_sync.unconfirmed_tree_path(lock)
+    sentinel = tmp_path / "second-writer-ran"
+    child = ("/bin/sh", "-c", f"touch {sentinel}")
+    with live_group() as survivor:
+        state_sync.record_unconfirmed_tree(marker, survivor, "simulated survivor")
+
+        # The lock itself is free — the guard is the evidence, not the lock.
+        assert locked(lock, *child) == state_sync.UNCONFIRMED_TREE_EXIT
+        assert not sentinel.exists()
+        assert marker.exists()
+
+    # Once that group is really gone the refusal clears itself: no manual step is
+    # needed for the common case, and the watcher resumes on the next firing.
+    assert locked(lock, *child) == 0
+    assert sentinel.exists()
+    assert not marker.exists()
+
+
+def test_an_unreadable_survivor_marker_fails_closed(tmp_path):
+    """A marker this boundary cannot read is not proof that anything stopped."""
+    lock = tmp_path / "local-check.lock"
+    marker = state_sync.unconfirmed_tree_path(lock)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{ truncated", encoding="utf-8")
+    sentinel = tmp_path / "second-writer-ran"
+
+    assert locked(
+        lock, "/bin/sh", "-c", f"touch {sentinel}"
+    ) == state_sync.UNCONFIRMED_TREE_EXIT
+    assert not sentinel.exists()
+
+
+def test_exit_codes_stay_distinguishable():
+    codes = {
+        0,
+        state_sync.BOOTSTRAP_REQUIRED_EXIT,
+        state_sync.LOCAL_RUN_TIMEOUT_EXIT,
+        state_sync.UNCONFIRMED_TREE_EXIT,
+        state_sync.UNGUARDED_TREE_EXIT,
+    }
+    assert len(codes) == 5
+
+
+def test_a_sync_that_cannot_stop_its_git_child_blocks_the_next_firing(
+    tmp_path, monkeypatch
+):
+    """That Git child leads a session of its own, so the wrapper above can
+    neither see nor stop it. The sync records it where the next firing looks,
+    and leaves one durable marker so the owner hears about the machine."""
+    monkeypatch.setattr(state_sync, "synchronize", cleanup_fails_for(4242))
+
+    assert state_sync.run(["sync", "--repo", str(tmp_path)]) == (
+        state_sync.UNCONFIRMED_TREE_EXIT
+    )
+    survivor = json.loads(default_marker(tmp_path).read_text(encoding="utf-8"))
+    assert survivor["pgid"] == 4242
+    failure = state_sync.load_failure(tmp_path / state_sync.DEFAULT_MARKER_PATH)
+    assert failure is not None and "could not stop its Git child" in failure["detail"]
+
+
+def test_cleanup_retries_all_fit_inside_one_allowance(monkeypatch):
+    """Round-2 finding: the retries must not multiply the allowance. A sync gets
+    one window to stop its Git group and record it, because the level above
+    escalates to SIGKILL after half of its own; per-attempt waits would blow
+    straight through that and the survivor would never be recorded."""
+    never_drains(monkeypatch)
+    budget = 0.4
+
+    started = time.monotonic()
+    with pytest.raises(state_sync.StateSyncCleanupError):
+        state_sync._run_bounded(
+            ["/bin/echo", "done"], timeout=5, cleanup_budget=budget, capture=False
+        )
+    spent = time.monotonic() - started
+
+    # One budget, with slack for scheduling — not the 7 waits the rounds contain.
+    assert spent < budget * 2, f"cleanup spent {spent:.2f}s of a {budget:g}s budget"
+
+
+def test_a_survivor_that_cannot_be_recorded_keeps_the_lock_instead(
+    tmp_path, monkeypatch
+):
+    """A marker that was never written cannot stop the next firing, so failing to
+    write it may not be logged and shrugged off. The process stays alive — which
+    is what keeps the overlap lock held — while the surviving group is still
+    there, and it reports the *unguarded* status rather than claiming a block it
+    cannot back up (later round-2 finding)."""
+    unwritable_marker(monkeypatch)
+    with live_group() as survivor:
+        exc = state_sync.StateSyncCleanupError("still running", pgid=survivor)
+        started = time.monotonic()
+        code = state_sync._report_unconfirmed_tree(
+            exc, tmp_path / "survivor.json", "local check", hold=0.4, poll=0.05
+        )
+        held = time.monotonic() - started
+
+    assert code == state_sync.UNGUARDED_TREE_EXIT
+    assert code != state_sync.UNCONFIRMED_TREE_EXIT  # never read as "guarded"
+    assert held >= 0.4, "the lock was released with no durable guard in place"
+
+
+def test_the_hold_ends_once_the_survivor_is_gone(tmp_path, monkeypatch):
+    """…and it is not a blind wait: nothing is left to run into, so it returns."""
+    unwritable_marker(monkeypatch)
+    gone = subprocess.Popen(["/bin/sh", "-c", "exit 0"], start_new_session=True)
+    gone.wait()
+    exc = state_sync.StateSyncCleanupError("was still running", pgid=gone.pid)
+
+    started = time.monotonic()
+    assert state_sync._report_unconfirmed_tree(
+        exc, tmp_path / "survivor.json", "local check", hold=30, poll=0.05
+    ) == state_sync.UNCONFIRMED_TREE_EXIT
+    assert time.monotonic() - started < 5
+
+
+def test_a_surviving_git_child_is_never_reclassified_as_ref_absence(
+    tmp_path, monkeypatch
+):
+    """Round-2 finding: the stale-ref cleanup runs inside the confirmed-absence
+    branch. A Git child that outlived cleanup there has to reach the caller that
+    records it, or the firing reports a missing ref and leaves that group running
+    and unrecorded for the next one to join."""
+    def git_with(cleanup_failure: bool):
+        def fake_git(repo, *args, **kwargs):
+            if args[0] == "ls-remote":
+                return subprocess.CompletedProcess(["git", *args], 2, "", "")
+            if cleanup_failure:
+                raise state_sync.StateSyncCleanupError("still running", pgid=4242)
+            raise state_sync.StateSyncError("update-ref refused")
+
+        return fake_git
+
+    monkeypatch.setattr(state_sync, "_git", git_with(True))
+    with pytest.raises(state_sync.StateSyncCleanupError):
+        state_sync._remote_state(tmp_path, "origin", state_sync.DEFAULT_STATE_REF)
+
+    # Any other failure of that housekeeping still may not mask the absence.
+    monkeypatch.setattr(state_sync, "_git", git_with(False))
+    assert state_sync._remote_state(
+        tmp_path, "origin", state_sync.DEFAULT_STATE_REF
+    ) == (None, None)
+
+
+def test_an_operator_command_also_records_a_surviving_git_child(tmp_path, monkeypatch):
+    """`init`/`recover` run in the production clone, so the scheduled firing that
+    comes next must not start beside a Git group they could not stop either."""
+    monkeypatch.setattr(state_sync, "initialize", cleanup_fails_for(4243))
+
+    assert state_sync.run(["init", "--repo", str(tmp_path)]) == (
+        state_sync.UNCONFIRMED_TREE_EXIT
+    )
+    survivor = json.loads(default_marker(tmp_path).read_text(encoding="utf-8"))
+    assert survivor["pgid"] == 4243
+
+
+def kill_this_process_after(delay: float) -> subprocess.Popen:
+    """A helper that delivers a real SIGTERM to this process, once."""
+    return subprocess.Popen(
+        ["/bin/sh", "-c", f"sleep {delay}; kill -TERM {os.getpid()}"]
+    )
+
+
+def test_a_signal_that_cannot_stop_the_tree_records_it_before_giving_up(
+    tmp_path, monkeypatch
+):
+    """Round-1 finding: when the stop a signal asks for does not take, waiting on
+    is exactly wrong — a surviving Git child holding a captured pipe keeps the
+    wait blocked until the level above SIGKILLs this process, and nothing would be
+    recorded. The handler records the survivor itself and ends the wait."""
+    marker = tmp_path / "survivor.json"
+    never_drains(monkeypatch)
+    killer = kill_this_process_after(0.4)
+    try:
+        with pytest.raises(state_sync.StateSyncCleanupError) as failure:
+            state_sync._run_bounded(
+                ["/bin/sh", "-c", "trap '' TERM; sleep 20"],
+                timeout=20,
+                cleanup_budget=0.2,
+                survivor_marker=marker,
+            )
+    finally:
+        killer.wait()
+
+    recorded = json.loads(marker.read_text(encoding="utf-8"))
+    assert recorded["pgid"] == failure.value.pgid
+    assert "could not stop" in recorded["detail"]
+    try:  # the tree was SIGKILLed on the way out; do not leave it unreaped
+        os.waitpid(failure.value.pgid, 0)
+    except (ChildProcessError, OSError):
+        pass
+
+
+def test_the_survivor_retry_keeps_signals_handled(tmp_path, monkeypatch, capsys):
+    """Round-1 finding: that retry loop used to run with default signal handling,
+    so a SIGTERM there ended the only guard in place. It is deferred instead —
+    this test process would not survive the signal otherwise."""
+    original = signal.getsignal(signal.SIGTERM)
+    unwritable_marker(monkeypatch)
+    with live_group() as survivor:
+        exc = state_sync.StateSyncCleanupError("still running", pgid=survivor)
+        killer = kill_this_process_after(0.2)
+        try:
+            started = time.monotonic()
+            code = state_sync._report_unconfirmed_tree(
+                exc, tmp_path / "survivor.json", "local check", hold=0.6, poll=0.05
+            )
+            held = time.monotonic() - started
+        finally:
+            killer.wait()
+
+    assert code == state_sync.UNGUARDED_TREE_EXIT
+    assert held >= 0.6, "the signal cut the hold short"
+    assert "deferred signal" in capsys.readouterr().err
+    assert signal.getsignal(signal.SIGTERM) is original
+
+
+def test_both_wrappers_block_on_every_blocking_exit_code():
+    """Round-1 finding: the cloud wrapper blocked only on the missing ref, so a
+    pre-sync that left a live Git group fell through to sending and to a second
+    Git writer. Both wrappers must stop on the whole set."""
+    root = Path(__file__).resolve().parent.parent
+    script = (root / "scripts" / "local-check.sh").read_text(encoding="utf-8")
+    workflow = (root / ".github" / "workflows" / "watch.yml").read_text(encoding="utf-8")
+    assert state_sync.WRAPPER_BLOCKING_EXITS == (
+        state_sync.BOOTSTRAP_REQUIRED_EXIT,
+        state_sync.UNCONFIRMED_TREE_EXIT,
+        state_sync.UNGUARDED_TREE_EXIT,
+    )
+
+    for code in state_sync.WRAPPER_BLOCKING_EXITS:
+        assert re.search(rf"^STATE_[A-Z_]+={code}$", script, re.MULTILINE), (
+            f"local-check.sh no longer mirrors blocking exit {code}"
+        )
+        assert f'steps.presync.outputs.code == \'{code}\'' in workflow, (
+            f"the cloud wrapper has no step that stops the job on exit {code}"
+        )
+        for gated in ("Validate Telegram credentials", "Synchronize runtime state (after)"):
+            section = workflow[workflow.index(gated) :]
+            assert f"steps.presync.outputs.code != '{code}'" in section[
+                : section.index("run:")
+            ], f"{gated} must be skipped on exit {code}"
+
+
+def test_the_lock_file_carries_the_record_when_the_marker_cannot_be_written(
+    tmp_path, monkeypatch
+):
+    """Round-2 finding, the other half: rather than give up on guarding the next
+    firing, the record goes into the lock file this firing already holds —
+    rewriting an existing file needs no new inode and no directory change, so it
+    can land where creating the marker beside it cannot."""
+    lock = tmp_path / "local-check.lock"
+    lock.write_text("", encoding="utf-8")
+    marker = state_sync.unconfirmed_tree_path(lock)
+    sentinel = tmp_path / "second-writer-ran"
+    child = ("/bin/sh", "-c", f"touch {sentinel}")
+
+    unwritable_marker(monkeypatch)
+    with live_group() as survivor:
+        exc = state_sync.StateSyncCleanupError("still running", pgid=survivor)
+        assert state_sync._report_unconfirmed_tree(
+            exc, marker, "local check", lock=lock, hold=1, poll=0.05
+        ) == state_sync.UNCONFIRMED_TREE_EXIT  # guarded after all, so not 6
+        monkeypatch.undo()
+
+        assert not marker.exists()  # the marker never landed
+        assert state_sync.surviving_tree(marker, lock)["pgid"] == survivor
+        # …and that is enough to keep the next firing out.
+        assert locked(lock, *child) == state_sync.UNCONFIRMED_TREE_EXIT
+        assert not sentinel.exists()
+
+    # It clears itself the same way, by truncation — the lock file is never removed.
+    assert locked(lock, *child) == 0
+    assert sentinel.exists()
+    assert lock.exists() and lock.read_text(encoding="utf-8").strip() == ""
+
+
+def test_the_block_message_names_the_record_it_wants_cleared(tmp_path, capsys):
+    """Two places can hold the record, and the lock file is not one an operator
+    may delete — so the message has to name the right one and say how."""
+    lock = tmp_path / "local-check.lock"
+    lock.write_text("", encoding="utf-8")
+    with live_group() as survivor:
+        state_sync.record_survivor_in_lock(lock, survivor, "simulated survivor")
+        assert locked(lock, "/bin/echo", "ran") == state_sync.UNCONFIRMED_TREE_EXIT
+
+    blocked = capsys.readouterr().err
+    assert str(lock) in blocked
+    assert "never delete the lock itself" in blocked
+
+
+def test_the_survivor_hold_defaults_to_the_reserved_recording_allowance():
+    """Round-6 finding: the hold defaulted to the whole local-run deadline. A
+    nested level has only the allowance reserved for recording before the level
+    above escalates to SIGKILL, so that has to be the default — a status this
+    process never gets to return cannot stop anything."""
+    default = inspect.signature(state_sync._report_unconfirmed_tree).parameters[
+        "hold"
+    ].default
+    assert default == state_sync.SURVIVOR_RECORD_ALLOWANCE_SECONDS
+    assert (
+        default + state_sync.GIT_CLEANUP_BUDGET_SECONDS
+        <= state_sync.CLEANUP_BUDGET_SECONDS / 2
+    )
+
+
+def test_a_nested_sync_reports_an_unguarded_survivor_inside_its_allowance(
+    tmp_path, monkeypatch
+):
+    """The case behind that finding, end to end: a sync that can neither stop its
+    Git group nor record it anywhere must come back with exit 6 while the
+    supervisor above it is still waiting — it SIGKILLs after half its cleanup
+    budget, and a killed sync leaves that sessioned group unrecorded."""
+    unwritable_marker(monkeypatch)
+    with live_group() as survivor:
+        monkeypatch.setattr(state_sync, "synchronize", cleanup_fails_for(survivor))
+        started = time.monotonic()
+        code = state_sync.run(["sync", "--repo", str(tmp_path)])
+        spent = time.monotonic() - started
+
+    assert code == state_sync.UNGUARDED_TREE_EXIT
+    # Neither sink took it (no lock file exists here), so the status is the only
+    # thing left — and it arrives inside the window the level above allows.
+    assert spent < state_sync.CLEANUP_BUDGET_SECONDS / 2, (
+        f"the nested hold took {spent:.2f}s, past the supervisor's escalation"
+    )
+
+
+def test_the_lock_holder_holds_only_what_is_left_of_the_firings_lifetime(
+    tmp_path, monkeypatch
+):
+    """The other half of the same rule: `locked` does hold the lock, so holding on
+    is a real guard — but only for what remains of the firing's documented
+    lifetime, so a hung tree still costs two firings and not four."""
+    captured = {}
+
+    def capture(exc, marker, what, **kwargs):
+        captured.update(kwargs)
+        return state_sync.UNGUARDED_TREE_EXIT
+
+    def cleanup_failed(*args, **kwargs):
+        time.sleep(0.3)
+        raise state_sync.StateSyncCleanupError("still running", pgid=4242)
+
+    monkeypatch.setattr(state_sync, "_run_bounded", cleanup_failed)
+    monkeypatch.setattr(state_sync, "_report_unconfirmed_tree", capture)
+
+    assert locked(
+        tmp_path / "local-check.lock",
+        "/bin/echo",
+        "ran",
+        extra=["--deadline", "2", "--cleanup-budget", "1"],
+    ) == state_sync.UNGUARDED_TREE_EXIT
+
+    lifetime = 2 + 1  # the deadline plus one cleanup allowance
+    assert 0 < captured["hold"] <= lifetime
+    assert captured["hold"] <= lifetime - 0.3 + 0.1, "time already spent is not deducted"
+
+
+def captured_budgets(monkeypatch, argv: list[str]) -> dict:
+    """The cleanup budget one CLI supervisor actually hands its child."""
+    seen = {}
+
+    def capture(command, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(list(command), 0, "", ""), False
+
+    monkeypatch.setattr(state_sync, "_run_bounded", capture)
+    assert state_sync.run(argv) == 0
+    return seen
+
+
+def test_a_nested_supervisor_uses_the_nested_cleanup_budget(tmp_path, monkeypatch):
+    """Round-4 finding: `bounded` took the supervisor's full budget although it
+    runs under `locked`, which escalates to SIGKILL after half of its own — so it
+    could be killed before recording a Git tree only it can see. `locked` itself
+    keeps the full budget; it is the outermost level."""
+    lock = str(tmp_path / "local-check.lock")
+    nested = captured_budgets(
+        monkeypatch, ["bounded", "--lock", lock, "--", "/bin/echo", "x"]
+    )
+    assert nested["cleanup_budget"] == state_sync.GIT_CLEANUP_BUDGET_SECONDS
+    outer = captured_budgets(
+        monkeypatch, ["locked", "--lock", lock, "--", "/bin/echo", "x"]
+    )
+    assert outer["cleanup_budget"] == state_sync.CLEANUP_BUDGET_SECONDS
+    # The nested cleanup plus its recording allowance has to fit the window the
+    # outer level waits after SIGTERM, which is half of the outer budget.
+    assert (
+        nested["cleanup_budget"] + state_sync.SURVIVOR_RECORD_ALLOWANCE_SECONDS
+        <= outer["cleanup_budget"] / 2
+    )
+
+
+def test_the_lock_holder_records_a_survivor_a_nested_level_could_not(tmp_path):
+    """Round-4 finding: `locked` passed an inner exit 6 through and released the
+    lock with nothing left behind. It is the outermost level and the one holding
+    the lock, so it records the survivor itself — unnamed, since nothing named the
+    group to it, which is why that record never self-clears."""
+    lock = tmp_path / "local-check.lock"
+    marker = state_sync.unconfirmed_tree_path(lock)
+    sentinel = tmp_path / "second-writer-ran"
+
+    assert locked(
+        lock, "/bin/sh", "-c", f"exit {state_sync.UNGUARDED_TREE_EXIT}"
+    ) == state_sync.UNGUARDED_TREE_EXIT
+    recorded = json.loads(marker.read_text(encoding="utf-8"))
+    assert recorded["pgid"] == 0
+    assert "could neither stop nor record" in recorded["detail"]
+
+    # The next firing stops on it, and — unlike a record that names its group —
+    # this one cannot clear itself, because nothing can prove an unnamed group gone.
+    assert locked(
+        lock, "/bin/sh", "-c", f"touch {sentinel}"
+    ) == state_sync.UNCONFIRMED_TREE_EXIT
+    assert not sentinel.exists()
+    assert marker.exists()
+
+
+def test_an_inner_block_that_already_recorded_is_left_alone(tmp_path):
+    """Exit 5 means the nested level did record (or its group had gone), so this
+    level must not overwrite that with an unnamed record only a human can clear."""
+    lock = tmp_path / "local-check.lock"
+
+    assert locked(
+        lock, "/bin/sh", "-c", f"exit {state_sync.UNCONFIRMED_TREE_EXIT}"
+    ) == state_sync.UNCONFIRMED_TREE_EXIT
+    assert not state_sync.unconfirmed_tree_path(lock).exists()
+
+
+# ---------------------------------------------------------------------------
+# OTW-29: a survivor no disk record could hold still reaches the lock holder
+# ---------------------------------------------------------------------------
+
+
+def test_a_survivor_recorded_nowhere_is_announced_to_the_lock_holder(
+    tmp_path, monkeypatch
+):
+    """Round-5 finding: once the watchdog stopped the shell, a nested exit 6 had
+    no way up, so the lock holder released the lock beside that group. A level
+    whose record lands nowhere now also announces the group on the channel the
+    lock holder handed down — and only then: a recorded group needs no second word."""
+    with state_sync._survivor_channel() as (reader, writer):
+        monkeypatch.setenv(state_sync.SURVIVOR_CHANNEL_ENV, str(writer))
+
+        assert state_sync._record_survivor(4244, "recorded", tmp_path / "m.json")
+        assert state_sync._announced_survivors(reader) == []
+
+        unwritable_marker(monkeypatch)
+        missing_lock = tmp_path / "absent.lock"  # the lock sink fails too
+        for _ in range(2):
+            assert not state_sync._record_survivor(
+                4245, "nowhere", tmp_path / "m.json", lock=missing_lock
+            )
+        assert state_sync._announced_survivors(reader) == [4245]
+
+
+def test_an_announcement_never_writes_into_a_file_that_reused_the_fd(
+    tmp_path, monkeypatch
+):
+    """The fd number travels in the environment; if something closed the pipe
+    and a file took that number, the announcement must not land in the file."""
+    unrelated = tmp_path / "unrelated"
+    with unrelated.open("wb") as handle:
+        monkeypatch.setenv(state_sync.SURVIVOR_CHANNEL_ENV, str(handle.fileno()))
+        state_sync._announce_survivor(4246)
+    assert unrelated.read_bytes() == b""
+
+
+def test_a_second_survivor_is_never_hidden_behind_an_existing_record(tmp_path):
+    """One record names one group. When another group already holds the record,
+    the lock holder may not overwrite it with just the newcomer, nor leave the
+    newcomer out: it records an unnamed survivor, which only a human clears."""
+    lock = tmp_path / "local-check.lock"
+    marker = state_sync.unconfirmed_tree_path(lock)
+    with live_group() as recorded, live_group() as announced:
+        state_sync.record_unconfirmed_tree(marker, recorded, "already recorded")
+        code = state_sync._guard_survivors(
+            [state_sync.StateSyncCleanupError("announced", pgid=announced)],
+            unknown=False,
+            marker=marker,
+            lock=lock,
+            hold=1,
+        )
+
+    assert code == state_sync.UNGUARDED_TREE_EXIT
+    assert json.loads(marker.read_text(encoding="utf-8"))["pgid"] == 0
+
+
+# ---------------------------------------------------------------------------
+# OTW-29: a group of zombies is gone, a group with one live member is not
+# ---------------------------------------------------------------------------
+
+
+def fake_proc(root: Path, members: dict[int, tuple[str, int]]) -> None:
+    """A `/proc` holding one `stat` per pid: {pid: (state, pgrp)}."""
+    for pid, (state, pgrp) in members.items():
+        (root / str(pid)).mkdir(parents=True)
+        # The command name may contain spaces and parentheses, as real ones do.
+        (root / str(pid) / "stat").write_text(
+            f"{pid} (odd) name) {state} 1 {pgrp} {pgrp} 0 -1 4194560 0 0\n",
+            encoding="utf-8",
+        )
+    (root / "self").mkdir(exist_ok=True)
+
+
+def killpg_answers(monkeypatch) -> None:
+    """Linux's answer for a group whose members are all unreaped zombies: 0."""
+    monkeypatch.setattr(state_sync.os, "killpg", lambda pgid, signum: None)
+
+
+def test_a_group_of_only_zombies_counts_as_gone(tmp_path, monkeypatch):
+    """CI finding: on Linux, killpg(pgid, 0) succeeds for a group whose members
+    are all zombies (macOS reports EPERM). A killed, finished child is not a
+    survivor, so reading it as one blocked healthy firings with exit 5."""
+    fake_proc(tmp_path, {100: ("Z", 4242), 101: ("Z", 4242), 200: ("S", 999)})
+    monkeypatch.setattr(state_sync, "PROC_ROOT", tmp_path)
+    killpg_answers(monkeypatch)
+
+    assert state_sync._signal_group(4242, 0) is False
+    assert state_sync._drain_group(4242, grace=0) is True
+
+
+def test_one_live_member_keeps_the_group_a_survivor(tmp_path, monkeypatch):
+    """…and the survivor guard stays precise: a single member that is not a
+    zombie means something of that group still runs."""
+    fake_proc(tmp_path, {100: ("Z", 4242), 101: ("D", 4242)})
+    monkeypatch.setattr(state_sync, "PROC_ROOT", tmp_path)
+    killpg_answers(monkeypatch)
+
+    assert state_sync._signal_group(4242, 0) is True
+    assert state_sync._drain_group(4242, grace=0) is False
+
+
+def test_without_proc_an_answering_group_stays_alive(tmp_path, monkeypatch):
+    """No `/proc` (macOS), or no member found: nothing proves the group gone, so
+    the answer to killpg stands."""
+    killpg_answers(monkeypatch)
+    monkeypatch.setattr(state_sync, "PROC_ROOT", tmp_path / "absent")
+    assert state_sync._signal_group(4242, 0) is True
+
+    fake_proc(tmp_path / "proc", {100: ("S", 999)})
+    monkeypatch.setattr(state_sync, "PROC_ROOT", tmp_path / "proc")
+    assert state_sync._signal_group(4242, 0) is True
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="Linux /proc only")
+def test_a_real_unreaped_child_is_not_a_survivor():
+    """The real thing on Linux: a finished child nobody has reaped yet."""
+    child = subprocess.Popen(["/bin/sh", "-c", "exit 0"], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 5
+        while state_sync._group_member_states(child.pid) != ["Z"]:
+            assert time.monotonic() < deadline, "the child never became a zombie"
+            time.sleep(0.02)
+        assert state_sync._signal_group(child.pid, 0) is False
+    finally:
+        child.wait()
