@@ -895,3 +895,58 @@ def test_stale_key_migration_still_converts_the_real_legacy_shapes():
         migrate_stale_keys(st)
 
         assert list(st["alerts"]) == [f"stale:{iso}:0"], iso
+
+
+# ------------------------------------------------------------ OTW-28 reservations
+
+def test_v4_migration_adds_empty_reservations_without_losing_history():
+    state = fresh_state()
+    state["version"] = 4
+    state.pop("reservations")
+    state["alerts"]["sale:dune:x"] = NOW.isoformat()
+    state["delivery_receipts"]["attempt"] = {
+        "delivery_id": "telegram:x",
+        "keys": ["sale:dune:x"],
+        "delivered_at": NOW.isoformat(),
+        "telegram_message_id": 3,
+    }
+
+    migrated = migrate_state(state)
+
+    assert migrated["version"] == CURRENT_STATE_VERSION == 5
+    assert migrated["reservations"] == {}
+    assert migrated["alerts"] == state["alerts"]
+    assert migrated["delivery_receipts"] == state["delivery_receipts"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda entry: entry.update(status="sending"),
+        lambda entry: entry.update(generation=0),
+        lambda entry: entry.update(generation=True),
+        lambda entry: entry.update(token=""),
+        lambda entry: entry.update(lease_expires_at="2026-09-17T12:10:00"),
+        lambda entry: entry.update(ack={"type": "alerts"}),
+        lambda entry: entry.pop("holder"),
+        lambda entry: entry.update(extra="field"),
+    ],
+)
+def test_malformed_reservations_are_rejected(mutate):
+    state = fresh_state()
+    entry = {
+        "token": "t1",
+        "holder": "local:mac",
+        "generation": 1,
+        "status": "held",
+        "reserved_at": NOW.isoformat(),
+        "lease_expires_at": iso_in(timedelta(minutes=10)),
+        "delivery_id": "telegram:x",
+        "ack": {"type": "alerts", "keys": ["news:x"]},
+        "force": False,
+    }
+    state["reservations"]["telegram:x"] = entry
+    migrate_state(state)  # the well-formed entry is accepted
+    mutate(entry)
+    with pytest.raises(StateError, match="reservations"):
+        migrate_state(state)

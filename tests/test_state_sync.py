@@ -852,6 +852,19 @@ def test_both_wrappers_block_on_every_blocking_exit_code():
                 : section.index("run:")
             ], f"{gated} must be skipped on exit {code}"
 
+    # OTW-28: the watcher's reservations are bounded Git pushes too, so a
+    # surviving group reported by the pass itself also keeps the post-run sync
+    # from starting beside it.
+    watcher_step = workflow[workflow.index("- name: Run watcher") :]
+    watcher_step = watcher_step[: watcher_step.index("- name:", 1)]
+    assert "id: watch" in watcher_step
+    assert 'echo "code=$code" >> "$GITHUB_OUTPUT"' in watcher_step
+    post_sync = workflow[workflow.index("Synchronize runtime state (after)") :]
+    for code in (state_sync.UNCONFIRMED_TREE_EXIT, state_sync.UNGUARDED_TREE_EXIT):
+        assert f"steps.watch.outputs.code != '{code}'" in post_sync[
+            : post_sync.index("run:")
+        ]
+
 
 def test_the_lock_file_carries_the_record_when_the_marker_cannot_be_written(
     tmp_path, monkeypatch
@@ -1167,3 +1180,52 @@ def test_a_real_unreaped_child_is_not_a_survivor():
         assert state_sync._signal_group(child.pid, 0) is False
     finally:
         child.wait()
+
+
+# ---------------------------------------------------------------------------
+# OTW-28: recovery and the store's reservation-holder id
+# ---------------------------------------------------------------------------
+
+
+def held_reservation(token: str, status: str = "held") -> dict:
+    return {
+        "token": token,
+        "holder": "cloud:run-1",
+        "generation": 1,
+        "status": status,
+        "reserved_at": NOW.isoformat(),
+        "lease_expires_at": NOW.isoformat(),
+        "delivery_id": IN_FLIGHT_ID,
+        "ack": {"type": "alerts", "keys": ["news:leak-42"]},
+        "force": False,
+    }
+
+
+def test_recovery_keeps_every_live_reservation_a_store_holds():
+    """Stores share no base, so a store that lacks a reservation is no proof it
+    was released: dropping it would let another host claim work its first holder
+    may already have sent. The most advanced word of one holder still wins."""
+    ref_copy = deepcopy(DEFAULT_STATE)
+    ref_copy["reservations"][IN_FLIGHT_ID] = held_reservation("t1")
+    ref_copy["reservations"]["telegram:other"] = held_reservation("t2")
+    mac = deepcopy(DEFAULT_STATE)
+    mac["reservations"]["telegram:other"] = held_reservation("t2", "uncertain")
+
+    merged = state_sync.reconcile_stores([ref_copy, mac])
+
+    assert merged["reservations"][IN_FLIGHT_ID]["status"] == "held"
+    assert merged["reservations"]["telegram:other"]["status"] == "uncertain"
+
+
+def test_a_store_keeps_one_holder_id_and_a_fresh_store_gets_its_own(
+    tmp_path, monkeypatch
+):
+    first = state_sync.store_holder(tmp_path)
+    assert first.startswith("local:")
+    assert state_sync.store_holder(tmp_path) == first
+
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    runner_store = tmp_path / "runner"
+    runner_store.mkdir()
+    assert state_sync.store_holder(runner_store).startswith("cloud:")
+    assert state_sync.store_holder(runner_store) != first

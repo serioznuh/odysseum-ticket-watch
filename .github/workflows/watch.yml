@@ -103,11 +103,17 @@ jobs:
           echo "::error::the pre-run state sync left a Git process group running; stopping before any send or a second Git writer"
           exit 1
 
+      # Every send first wins a reservation on the shared state ref (OTW-28), a
+      # bounded Git push like the syncs'. If one leaves a Git process group it
+      # could not stop, the watcher exits 5 or 6 like a sync would, and the
+      # post-run sync below is skipped rather than started beside that group.
       - name: Run watcher (${{ steps.mode.outputs.mode }})
+        id: watch
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          set +e
           if [ "${{ steps.mode.outputs.mode }}" = "test" ]; then
             python -m watcher --state .cache/state-sync/state.json --test-telegram
           else
@@ -127,6 +133,9 @@ jobs:
             # selected, so a manual check keeps its existing full-check path.
             python -m watcher --state .cache/state-sync/state.json --mode "${{ steps.mode.outputs.mode }}" --reminder-grace-minutes 25 ${{ steps.mode.outputs.with_news }} ${{ inputs.dry_run == true && '--dry-run' || '' }}
           fi
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
 
       # A quiet watcher pass may make no Telegram call. Run this read-only
       # probe after failover work so a transient Telegram/API failure cannot
@@ -139,5 +148,5 @@ jobs:
         run: python -m watcher --state .cache/state-sync/state.json --check-telegram
 
       - name: Synchronize runtime state (after)
-        if: ${{ always() && inputs.dry_run != true && steps.presync.outputs.code != '3' && steps.presync.outputs.code != '5' && steps.presync.outputs.code != '6' }}
+        if: ${{ always() && inputs.dry_run != true && steps.presync.outputs.code != '3' && steps.presync.outputs.code != '5' && steps.presync.outputs.code != '6' && steps.watch.outputs.code != '5' && steps.watch.outputs.code != '6' }}
         run: python -m watcher.state_sync sync

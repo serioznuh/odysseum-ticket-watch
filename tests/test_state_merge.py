@@ -303,3 +303,79 @@ def test_cli_failure_names_recovery_and_does_not_replace_output(tmp_path, capsys
     assert "state reconciliation failed" in capsys.readouterr().err
     assert output.read_bytes() == before
     assert load_state(output) == base
+
+
+# --------------------------------------------------------------- OTW-28 reservations
+
+def reservation(token: str, *, generation: int = 1, status: str = "held", key="news:a"):
+    return {
+        "token": token,
+        "holder": f"host-of-{token}",
+        "generation": generation,
+        "status": status,
+        "reserved_at": "2026-09-17T12:00:00+02:00",
+        "lease_expires_at": "2026-09-17T12:10:00+02:00",
+        "delivery_id": f"telegram:{key}",
+        "ack": {"type": "alerts", "keys": [key]},
+        "force": False,
+    }
+
+
+def with_reservation(entry: dict | None, logical_id: str = "telegram:news-a") -> dict:
+    state = fresh_state()
+    if entry is not None:
+        state["reservations"][logical_id] = entry
+    return state
+
+
+@pytest.mark.parametrize(
+    ("upstream", "local", "winner"),
+    [
+        # One holder's reservation seen twice: its most advanced status wins.
+        (reservation("t1"), reservation("t1", status="released"), "local"),
+        (reservation("t1", status="uncertain"), reservation("t1"), "upstream"),
+        (reservation("t1", status="released"), reservation("t1", status="uncertain"), "local"),
+        # Two reservations: the later generation superseded the earlier one…
+        (reservation("t1"), reservation("t2", generation=2), "local"),
+        (reservation("t2", generation=2), reservation("t1", status="released"), "upstream"),
+        # …and at equal generation the one the ref accepted won the push.
+        (reservation("t1"), reservation("t2", status="released"), "upstream"),
+    ],
+)
+def test_concurrent_reservations_resolve_without_guessing(upstream, local, winner):
+    base = fresh_state()
+    merged = merge_states(base, with_reservation(upstream), with_reservation(local))
+    expected = upstream if winner == "upstream" else local
+    assert merged["reservations"] == {"telegram:news-a": expected}
+
+
+def test_a_settled_reservation_is_dropped_and_a_deletion_is_honoured():
+    held = reservation("t1")
+    base = with_reservation(held)
+    upstream = with_reservation(held)
+    delivered = with_reservation(None)  # the holder settled it on confirmation
+    delivered["alerts"]["news:a"] = "2026-09-17T12:01:00+02:00"
+    delivered["delivery_receipts"]["t1"] = {
+        "delivery_id": "telegram:whole-message",
+        "keys": ["news:a"],
+        "delivered_at": "2026-09-17T12:01:00+02:00",
+    }
+    assert merge_states(base, upstream, delivered)["reservations"] == {}
+
+    # Even a view that never saw it deleted drops an entry its receipt settles.
+    assert merge_states(fresh_state(), upstream, delivered)["reservations"] == {}
+
+    # A forced reservation is settled only by a receipt for its own logical id.
+    forced = reservation("t2")
+    forced["force"] = True
+    unsettled = merge_states(fresh_state(), with_reservation(forced), delivered)
+    assert list(unsettled["reservations"]) == ["telegram:news-a"]
+
+
+def test_an_unchanged_reservation_survives_an_unrelated_merge():
+    held = reservation("t1")
+    base = with_reservation(held)
+    local = with_reservation(held)
+    local["alerts"]["news:b"] = "2026-09-17T12:01:00+02:00"
+    merged = merge_states(base, with_reservation(held), local)
+    assert merged["reservations"] == {"telegram:news-a": held}

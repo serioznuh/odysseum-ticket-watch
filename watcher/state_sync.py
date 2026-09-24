@@ -144,6 +144,8 @@ _DELIVERY_EVIDENCE_FIELDS = (
     "alerts",
     "delivery_receipts",
     "outbox",
+    # A reservation may have been used for a send nobody has a receipt for yet.
+    "reservations",
     "reminders_sent",
     "sales",
     "formats_seen",
