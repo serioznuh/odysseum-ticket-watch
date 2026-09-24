@@ -67,8 +67,8 @@
       "imax70"
     ]
   },
-  "last_catalogue_ok": "2026-09-24T10:49:03.153210+02:00",
-  "last_check_ok": "2026-09-24T10:49:03.153210+02:00",
+  "last_catalogue_ok": "2026-09-24T10:54:14.027942+02:00",
+  "last_check_ok": "2026-09-24T10:54:14.027942+02:00",
   "last_heartbeat": "2026-09-22T00:03:41.315560+02:00",
   "outbox": {},
   "reminders_sent": {
@@ -76,6 +76,7 @@
       "1440"
     ]
   },
+  "reservations": {},
   "sale_target": null,
   "sales": {
     "dune-troisieme-partie-50828": "2026-09-09T09:00:00+02:00",
@@ -88,5 +89,5 @@
     "la-seance-70mm-dune-troisieme-partie-55319"
   ],
   "tickets_available": true,
-  "version": 4
+  "version": 5
 }
