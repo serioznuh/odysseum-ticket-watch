@@ -45,31 +45,48 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-28 | Coordinate Mac/cloud delivery before sending shared notifications | P1 | L | Infra, tooling & docs | [x] |
 | OTW-29 | Bound Git operations and the local run's lifetime | P1 | M | Infra, tooling & docs | [x] |
 | OTW-30 | Require explicit bootstrap when the shared runtime-state ref is missing | P2 | M | Infra, tooling & docs | [x] |
+| OTW-31 | A blocked Pathé check stays silent for 6 h while a wanted date is pending | P1 | S | Bugs | [ ] |
+| OTW-32 | A GitHub outage holds back alerts only the Mac can produce | P2 | M | Infra, tooling & docs | [ ] |
+| OTW-33 | Cloud supervision polls GitHub every firing and is rate-limited a third of the day | P2 | S | Bugs | [ ] |
+| OTW-34 | Per-firing liveness timestamps commit to the shared ref ~280 times a day | P3 | S | Infra, tooling & docs | [ ] |
+| OTW-35 | Plan the end of the watch: stop after 20 December, decide Cinesa's future | P2 | S | Infra, tooling & docs | [ ] |
 
-## Recommended next work (reviewed 2026-09-21)
+## Recommended next work (reviewed 2026-09-24)
 
-The next phase is stabilization of the implemented architecture. The index
-above is the completion record; estimates below include implementation and
-verification, and dependencies listed on completed items are historical.
+OTW-28 closed the last planned architecture item. What the watch still has to
+deliver is the IMAX 70 mm alert for the wanted dates, 19–20 December; on
+2026-09-24 the 70 mm programme was bookable for 15 December only, so that alert
+can come any day. The order below protects it first, then lowers operating noise,
+then prepares the end of the watch. The index above is the completion record;
+estimates include implementation and verification.
 
 | Order | ID | Work and reason for this position | Effort estimate |
 | --- | --- | --- | --- |
-| 1 | OTW-28 | Prevent Mac/cloud overlap from sending the same finding twice, using the trusted startup and bounded transport now in place. | L · 2–3 days |
-| 2 | OTW-12 | Make reminder wording agree with the effective ladder after fresh observations; a false promise is reproducible. | S · 3–4 h |
-| 3 | OTW-17 | Clarify merged new/moved sale announcements; a small, visible improvement to alert precision. | S · 2–4 h |
-| 4 | OTW-26 | Bound CI's state-history download before its cost grows further; preserve the delivery coordination contract during fetch optimization. | M · about 1 day |
-| 5 | OTW-01 | Add documentation checks after the backlog descriptions and statuses are current. | S · 2–4 h |
-| 6 | OTW-24 | Finish Cinesa's exceptional cleanup bookkeeping; low urgency while Cinesa is disabled, but complete before future use. | S · 2–3 h |
+| 1 | OTW-31 | A blocked Pathé check must be reported within about 30 minutes while a wanted date is pending, not after 6 h; this silence recurred on 2026-09-18. | S · 2–4 h |
+| 2 | OTW-33 | Cloud supervision has been blind on roughly a third of firings since 2026-09-21; throttling fixes it without a new secret. | S · 2–3 h |
+| 3 | OTW-32 | Owner decision first: may Mac-only alerts that were never published skip the shared reservation? If yes, land it before December. | M · about 1 day |
+| 4 | OTW-34 | Bring ~280 daily state-ref commits down to a bounded liveness resolution; this also reduces reservation contention and OTW-26's growth. | S · 3–4 h |
+| 5 | OTW-35 | Ready by 2026-12-15, executed after 2026-12-20; the Cinesa decision inside it can be taken now. | S · 3–4 h |
+| 6 | OTW-12 | Reminder wording versus the effective ladder; less valuable since the national sale opened on 2026-09-09, but still reproducible. | S · 3–4 h |
+| 7 | OTW-01 | Documentation checks; `docs/current-state.md` is at 179 of its 180-line budget and items 1–5 all touch it. | S · 2–4 h |
+| 8 | OTW-17 | Merged new/moved sale wording; low value after the sale opened. | S · 2–4 h |
 
-OTW-28 tracks the remaining delivery race accepted in OTW-20/OTW-21 and made
-visible by OTW-08. Both accepted OTW-21 operational risks are now closed:
-OTW-30 made missing-ref bootstrap explicit and OTW-29 bounded every Git wait and
-the local run's lifetime, so coordination has trusted startup state and no
-indefinite wait left to inherit. It does not depend on an additional host or
-OTW-22.
+**Cross-repository prerequisite:** the loop machinery items CR-112, CR-113 and
+CR-116 in `serioznuh/cross-llm-review` should land before the next OTW loop
+merges. On 2026-09-24 the OTW-28 loop passed its approval, merge and backlog
+gates with an uncommitted review-log edit and merged a one-way state-schema
+migration without asking the owner.
 
-**Deferred:** OTW-04 becomes useful when Cinesa is enabled for an active watch
-again (S · 3–4 h). **Parked by owner:** OTW-22 has no available host beyond the
+**Change freeze:** pushing to `main` deploys to the Mac. From 2026-12-10 until
+both wanted dates have passed, merge only P0 fixes.
+
+**Lower urgency:** OTW-26 — a fresh runner fetched the whole state ref in about
+1 s (688 KiB) on 2026-09-24, and OTW-34 cuts its growth about tenfold. Revisit if
+that fetch exceeds a few megabytes or the watch continues past December.
+
+**Deferred:** OTW-04 and OTW-24 wait for OTW-35's Cinesa decision: retiring
+Cinesa closes them as superseded (owner approval), re-targeting it makes both
+prerequisites. **Parked by owner:** OTW-22 has no available host beyond the
 current MacBook; revisit only when another approved host exists and re-estimate
 then. It is not a dependency of any item in the active queue.
 
@@ -402,6 +419,60 @@ driver (OTW-14) repairs conflicting records but cannot undo duplicate messages
 already sent. OTW-20 and OTW-21 address durable delivery and coordination;
 the existing grace and two-sided pull remain necessary until that replacement
 has been verified.
+
+### OTW-31 · A blocked Pathé check stays silent for 6 h while a wanted date is pending
+**Priority:** P1 · **Effort:** S
+**Problem:** `alerts.record_pathe_failure` raises its loud blind/degraded alert
+only when the failure streak reaches `failure_streak_threshold` **and** no fully
+healthy snapshot exists for 6 h (`is_check_fresh(st, 6.0, now)`). The 6 h was
+sized for the 4 h baseline cadence. While a wanted date is pending,
+`state.adaptive_staleness_hours` returns 0 and every 5-min firing checks Pathé,
+yet a block of up to 6 h still says nothing. Production log: on 2026-09-18
+`/api/shows` answered `403 Forbidden` from 19:29 to 21:48 (27 failed checks) and
+no alert was sent; on 2026-09-03 a block ran from about 05:00 to 21:46. The
+19–20 December IMAX 70 mm sessions can open at any time, and the usual cause —
+Akamai refusing the Mac's current route, such as a VPN — is something the owner
+can fix within minutes once told.
+**Fix sketch:** derive the blind tolerance from the active cadence tier instead
+of a fixed 6 h. While `adaptive_staleness_hours` is at the every-firing floor (a
+pending wanted date or the opening window), alert once consecutive failed
+firings span about 30 minutes; slower tiers keep the 6 h rule. Reuse the
+existing loud alert and its 403/VPN wording, one alert per episode, the silent
+recovery and the degraded→blind re-arming; add no new alert kind. The value
+changes when a loud alert fires, so confirm it with the owner before merging.
+**Files:** `watcher/alerts.py`, `watcher/state.py` or `watcher/jobs.py` for the
+tier, `config.toml` if the tolerance becomes configurable, `tests/test_main.py`,
+`README.md` alert catalogue, `docs/current-state.md`.
+**Done when:** with a wanted date pending, failures spanning 30 minutes send
+exactly one loud alert and a continuing outage stays quiet; a baseline-tier
+outage keeps the 6 h rule; recovery re-arms and degraded→blind still escalates;
+wanted-date alerts are unchanged. Ruff, pytest and an affected-flow dry-run pass.
+
+### OTW-33 · Cloud supervision polls GitHub every firing and is rate-limited a third of the day
+**Priority:** P2 · **Effort:** S
+**Problem:** `jobs.run_cloud_supervision_job` calls
+`cloud.has_successful_scheduled_run` on every 5-min firing — 12 unauthenticated
+GitHub API requests an hour, by design without a credential. The unauthenticated
+limit (60 an hour) is shared by everything on the owner's public IP, and since
+2026-09-21 the job logged `403 rate limit exceeded` 238 times (101 of 288 firings
+on 2026-09-22, 105 on 2026-09-23). Each one is "unavailable (no alert)", so the
+supervision OTW-09/OTW-27 built is silently blind about a third of the day. Its
+threshold is `cloud.stale_hours = 18`; polling every 5 minutes buys nothing.
+**Fix sketch:** poll at most once per configurable interval (30–60 min is ample
+for an 18 h threshold) and reuse the last conclusive answer in between. After a
+rate-limit refusal, wait until the reset time GitHub returns before asking
+again. Keep the throttle bookkeeping in a local git-ignored cache under
+`.cache/`, never in shared state, so it adds no ref commits. Unchanged: any
+recent success proves health, uncertainty stays quiet, and a proven 18 h absence
+alerts once until positive recovery. Stay credential-free unless throttling
+proves insufficient.
+**Files:** `watcher/cloud.py`, `watcher/jobs.py`, `config.toml`,
+`tests/test_cloud_supervision.py`, `docs/current-state.md`.
+**Done when:** twelve consecutive firings make at most one API request per
+interval; a rate-limited answer defers the next request until its reset; the
+alert/recovery decisions in the existing supervision tests are unchanged; a
+simulated shared-IP exhaustion no longer blinds more than one interval. Ruff,
+pytest and an affected-flow dry-run pass.
 
 ## 3. Features
 
@@ -836,16 +907,23 @@ cover a shallow initial fetch, later syncs, rejected concurrent pushes and
 retry without losing confirmed receipts. Remote history is preserved, code
 deployment remains independent, and ruff, pytest and an affected-flow dry-run
 pass. Estimate: about one day including Git integration verification.
+**Update (2026-09-24):** in practice the payload changes on every firing while a
+wanted date is pending — the liveness timestamps — so the ref grew by 250–280
+commits a day (OTW-34). A fresh runner still fetched the whole ref in about 1 s
+(688 KiB), so this stays low urgency; revisit after OTW-34, or if that fetch
+exceeds a few megabytes.
 
 ### OTW-28 · Coordinate Mac/cloud delivery before sending shared notifications
 **Priority:** P1 · **Effort:** L (2–3 days including fault-injection tests)
 **Problem:** the Mac and cloud can read the same unsent finding before either
 publishes its receipt. `delivery._attempt` persists a claim only to that host's
 local JSON; the other host can independently send the same message. Merging
-receipts afterward preserves history but cannot undo the duplicate. This is
+receipts afterward preserves history but cannot undo the duplicate. This was
 explicitly reproduced by
 `test_overlapping_hosts_preserve_both_attempt_receipts_without_exactly_once_claim`
-in `tests/test_delivery.py` and is a documented limitation of completed
+in `tests/test_delivery.py` (renamed by OTW-28 to
+`test_uncoordinated_overlapping_hosts_preserve_both_attempt_receipts`, which now
+covers uncoordinated hosts only) and is a documented limitation of completed
 OTW-20/OTW-21, exercised by OTW-08's two news readers.
 **Fix sketch:** establish authoritative permission to send before Telegram is
 called. Prefer the existing shared-state transport if an atomic reservation
@@ -959,3 +1037,86 @@ tested recovery preserves confirmed receipts and quarantined uncertainty before
 normal sends resume. Transport outages remain distinct and the existing safe
 fallback is preserved. Ruff, pytest and isolated dry-runs pass; production
 state edits remain subject to the existing explicit-approval rule.
+
+### OTW-32 · A GitHub outage holds back alerts only the Mac can produce
+**Priority:** P2 · **Effort:** M
+**Problem:** since OTW-28 every Telegram send first wins a reservation pushed to
+`refs/heads/runtime-state`: no confirmed reservation, no send. While GitHub — or
+only the Mac's route to it — is unavailable, nothing goes out. That includes
+alerts only the Mac can produce, because the cloud never calls Pathé or Cinesa:
+sale, new-listing, bookable and wanted-date findings, and Cinesa findings. For
+those keys the only possible duplicate is the cloud recovering an outbox record
+the Mac has already published. A GitHub incident in December would therefore
+delay the one alert the watch exists for, while preventing no possible duplicate.
+**Decision needed:** this narrows OTW-28's rule for one provable class of work.
+The owner approves or rejects it before any implementation.
+**Fix sketch:** let a delivery skip the reservation only when all of these hold:
+(a) this pass is the local owner; (b) every member key is Mac-origin (Pathé- or
+Cinesa-derived); (c) its outbox record has never been part of a push attempt.
+Mark a record "possibly published" before any post-run sync or reservation push
+that could carry it, and treat unknown as published. Everything else keeps the
+reservation, including a merged message that also carries shared work (news,
+reminders). Enforce the premise in code instead of assuming it: a cloud pass,
+including a manual check-mode dispatch, refuses to deliver Mac-origin keys. The
+skip keeps today's outbox, `sending`/`uncertain` transitions and receipts.
+**Files:** `watcher/delivery.py`, `watcher/coalesce.py` if grouping needs a
+flag, `watcher/state_sync.py` (publication marking), `watcher/jobs.py`;
+`tests/test_delivery.py`, `tests/test_sync_integration.py`;
+`docs/current-state.md`.
+**Done when:** with the state ref unreachable, a fresh Pathé finding is sent once
+on its first attempt while news and reminders stay pending; once its record may
+have been pushed it needs a reservation again; a cloud pass never delivers a
+Mac-origin key; OTW-28's two-clone races still make at most one mocked Telegram
+call per logical notification. Ruff, pytest and dry-runs pass.
+
+### OTW-34 · Per-firing liveness timestamps commit to the shared ref ~280 times a day
+**Priority:** P3 · **Effort:** S
+**Problem:** while a wanted date is pending, every 5-min firing runs a Pathé
+check, so `last_check_ok` and `last_catalogue_ok` change on every firing and the
+post-run sync commits and pushes them. `refs/heads/runtime-state` received 1,933
+commits from 2026-09-17 to 2026-09-24 — 250–280 a day, each changing only those
+two lines. AGENTS.md forbids exactly this for Cinesa (a per-run timestamp in
+shared state). Each such push also competes with OTW-28's reservation pushes on
+the same ref, so a cloud claim more often loses the compare-and-swap and has to
+retry or decline.
+**Fix sketch:** publish liveness at a bounded resolution. When a sync's only
+difference from the ref is a liveness timestamp that moved by less than N
+minutes, skip the push (N about 30, far below the 18 h staleness thresholds).
+The live file keeps full precision for the cadence guard, and merges keep the
+later timestamp. Receipts, baselines, reservations, outbox changes and a
+liveness age past N still push in the same firing.
+**Files:** `watcher/state_sync.py`, `watcher/state_merge.py` if merge rules
+change, `tests/test_state_sync.py`, `tests/test_sync_integration.py`,
+`docs/current-state.md`.
+**Done when:** twelve firings that change only liveness produce at most one push
+per N minutes; any other change still pushes in its firing; the cloud's
+staleness check sees liveness no older than N; the Mac's cadence guard and
+OTW-28's reservation tests are unchanged. Ruff, pytest and an affected-flow
+dry-run pass. Cuts OTW-26's growth about tenfold.
+
+### OTW-35 · Plan the end of the watch: stop after 20 December, decide Cinesa's future
+**Priority:** P2 · **Effort:** S
+**Problem:** the watch has a fixed end. Its remaining Pathé purpose is the IMAX
+70 mm alert for `target_dates` 2026-12-19/20. The Cinesa target (*La odisea* at
+Diagonal Mar) passed in August, and `cinesa.enabled = false` since. Nothing ends
+either watch. After 20 December the launchd job would keep firing every 5
+minutes, Pathé checks would continue at the post-ticket cadence, the Actions
+cron and weekly heartbeat would continue, and the state ref would keep growing.
+Meanwhile the dormant Cinesa half still carries the headed-Chrome token step, a
+Chrome profile and a credential cache under `.cache/`, two open items (OTW-04,
+OTW-24) and a large share of AGENTS.md and current-state.md.
+**Fix sketch:** (1) Cinesa — decide now: retire it (remove the half, its caches
+and docs; close OTW-04/OTW-24 as superseded), or keep it dormant for a named
+future target (OTW-24 then stays a prerequisite). (2) Pathé — once every wanted
+date has passed, send one silent "watch complete" summary, then make no network
+call and send nothing more, heartbeats included. Document an owner-run
+decommission procedure in README: unload the LaunchAgent, disable `watch.yml`,
+keep or tag the final state ref, delete local caches. Launchd and workflow
+changes need the owner's approval under AGENTS.md.
+**Files:** `watcher/jobs.py`/`watcher/runner.py` (the dormant check),
+`config.toml`, `README.md` (procedure), `docs/current-state.md`; `AGENTS.md`,
+the Cinesa modules and their tests if Cinesa retires.
+**Done when:** a dry run with the clock after 2026-12-20 makes no network call
+and sends only the one-time summary; the decommission procedure is documented
+and reviewed; the Cinesa disposition is recorded in this backlog. Ready by
+2026-12-15; the stop itself is run by the owner.

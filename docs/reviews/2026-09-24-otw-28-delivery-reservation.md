@@ -22,5 +22,6 @@ NOTES: none
 
 ## Outcome
 <!-- cross-review-merge-state: APPROVED -->
-Approved after 3 rounds by Codex (gpt-6-sol); eligible for merge pending GitHub confirmation. Done-when: met
+Approved after 3 rounds by Codex (gpt-6-sol); eligible for merge pending GitHub confirmation.
+Done-when: met
 Follow-ups: the `.github/workflows/watch.yml` step change (exit-code 5/6 handling; cron untouched) still needs the owner-approved live Actions check after merge; code still on schema 4 cannot sync the upgraded state ref, so deploy the Mac clone promptly; each send adds one extra commit to `runtime-state` (relevant to OTW-26); the BACKLOG prose still names the renamed overlap test.
