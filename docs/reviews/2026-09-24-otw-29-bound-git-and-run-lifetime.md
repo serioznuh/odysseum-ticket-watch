@@ -18,4 +18,5 @@ NOTES:
 8. Claude: the operator procedure for clearing a survivor record lives in stderr messages and current-state.md only, and the new current-state bullet is one long line. [accepted] The message names the exact file to clear; README wording can follow with OTW-28's operator notes.
 ## Outcome
 <!-- cross-review-merge-state: APPROVED -->
-Approved after 1 round by Codex, plus a post-approval Claude pass; eligible for merge pending GitHub confirmation. Done-when: met.
+Approved after 1 round by Codex, plus a post-approval Claude pass; eligible for merge pending GitHub confirmation.
+Done-when: met
