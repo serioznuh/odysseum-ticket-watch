@@ -73,18 +73,16 @@ estimates include implementation and verification.
 | 8 | OTW-17 | Merged new/moved sale wording; low value after the sale opened. | S · 2–4 h |
 | 9 | OTW-36 | Lets loops verify a workflow change without the owner; needed before the next `watch.yml` change, not sooner. | S · 2–4 h |
 
-**Owner involvement:** the owner wants this repository to run without them
-except for real decisions. Items here are built and merged by the loops unless
-they touch the approval list in AGENTS.md: real Telegram sends, production state
-edits, launchd/plist or cron changes, repository visibility, force-pushes,
-loosening news matching. The defaults recorded in OTW-31, OTW-32 and OTW-35 stand unless the
-owner objects; no sign-off is needed to start them.
+**Owner involvement:** items here are built and merged by the review loops; the
+owner is needed only for the approval list in AGENTS.md: real Telegram sends,
+production state edits, launchd/plist or cron changes, repository visibility,
+force-pushes, loosening news matching. The defaults recorded in OTW-31, OTW-32
+and OTW-35 stand unless the owner objects; no sign-off is needed to start them.
 
 **Loop safety:** in `serioznuh/cross-llm-review`, CR-112 and CR-113 (merged
 2026-09-24) removed the failure behind OTW-28's merge, which passed its approval,
-merge and backlog gates with an uncommitted review-log edit. CR-114 will decide
-which changes auto-merge without the owner; OTW-36 gives it a safe automated
-check for workflow changes.
+merge and backlog gates with an uncommitted review-log edit. OTW-36 lets a loop
+test a workflow change without touching production.
 
 **Change freeze:** pushing to `main` deploys to the Mac. From 2026-12-10 until
 both wanted dates have passed, merge only P0 fixes.
@@ -1137,9 +1135,8 @@ and reviewed; the Cinesa disposition is recorded in this backlog. Ready by
 **Problem:** a change to `.github/workflows/watch.yml` can only be exercised by a
 live run, which synchronizes — and may push — the shared `refs/heads/runtime-state`
 ref and may send Telegram messages. So a workflow change ends with a request for
-an owner-approved "live Actions check" (OTW-28 did), and the loop machinery's
-planned automated check for such changes (cross-llm-review CR-114, `verify`
-tier) has nothing safe to run.
+an owner-approved "live Actions check" (OTW-28 did), and no loop can test such a
+change on its own.
 **Fix sketch:** add a `sandbox` input to `workflow_dispatch` that runs the whole
 job against a scratch copy of shared state. The before and after syncs read the
 real ref but write only to a throwaway ref (for example
