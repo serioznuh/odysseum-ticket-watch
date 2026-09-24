@@ -50,6 +50,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-33 | Cloud supervision polls GitHub every firing and is rate-limited a third of the day | P2 | S | Bugs | [ ] |
 | OTW-34 | Per-firing liveness timestamps commit to the shared ref ~280 times a day | P3 | S | Infra, tooling & docs | [ ] |
 | OTW-35 | Plan the end of the watch: stop after 20 December, decide Cinesa's future | P2 | S | Infra, tooling & docs | [ ] |
+| OTW-36 | Let a workflow change be verified without touching production state | P3 | S | Infra, tooling & docs | [ ] |
 
 ## Recommended next work (reviewed 2026-09-24)
 
@@ -70,6 +71,7 @@ estimates include implementation and verification.
 | 6 | OTW-12 | Reminder wording versus the effective ladder; less valuable since the national sale opened on 2026-09-09, but still reproducible. | S · 3–4 h |
 | 7 | OTW-01 | Documentation checks; `docs/current-state.md` is at 179 of its 180-line budget and items 1–5 all touch it. | S · 2–4 h |
 | 8 | OTW-17 | Merged new/moved sale wording; low value after the sale opened. | S · 2–4 h |
+| 9 | OTW-36 | Lets loops verify a workflow change without the owner; needed before the next `watch.yml` change, not sooner. | S · 2–4 h |
 
 **Owner involvement:** the owner wants this repository to run without them
 except for real decisions. Items here are built and merged by the loops unless
@@ -78,11 +80,11 @@ edits, launchd/plist or cron changes, repository visibility, force-pushes,
 loosening news matching. The defaults recorded in OTW-31, OTW-32 and OTW-35 stand unless the
 owner objects; no sign-off is needed to start them.
 
-**Loop safety:** in `serioznuh/cross-llm-review`, CR-112 and CR-113 remove the
-failure behind OTW-28's merge, which passed its approval, merge and backlog
-gates with an uncommitted review-log edit. CR-114 decides which changes may
-auto-merge. OTW work does not wait for them; until they land, a refused loop
-gate is fixed with a commit, never with an uncommitted or PR-body edit.
+**Loop safety:** in `serioznuh/cross-llm-review`, CR-112 and CR-113 (merged
+2026-09-24) removed the failure behind OTW-28's merge, which passed its approval,
+merge and backlog gates with an uncommitted review-log edit. CR-114 will decide
+which changes auto-merge without the owner; OTW-36 gives it a safe automated
+check for workflow changes.
 
 **Change freeze:** pushing to `main` deploys to the Mac. From 2026-12-10 until
 both wanted dates have passed, merge only P0 fixes.
@@ -1129,3 +1131,25 @@ the Cinesa modules and their tests if Cinesa retires.
 and sends only the one-time summary; the decommission procedure is documented
 and reviewed; the Cinesa disposition is recorded in this backlog. Ready by
 2026-12-15; from then on nothing in the stop needs the owner.
+
+### OTW-36 · Let a workflow change be verified without touching production state
+**Priority:** P3 · **Effort:** S
+**Problem:** a change to `.github/workflows/watch.yml` can only be exercised by a
+live run, which synchronizes — and may push — the shared `refs/heads/runtime-state`
+ref and may send Telegram messages. So a workflow change ends with a request for
+an owner-approved "live Actions check" (OTW-28 did), and the loop machinery's
+planned automated check for such changes (cross-llm-review CR-114, `verify`
+tier) has nothing safe to run.
+**Fix sketch:** add a `sandbox` input to `workflow_dispatch` that runs the whole
+job against a scratch copy of shared state. The before and after syncs read the
+real ref but write only to a throwaway ref (for example
+`refs/heads/runtime-state-sandbox-<run id>`, deleted at the end), and the
+watcher runs with `--dry-run`. A loop can then dispatch its branch in sandbox
+mode and read the result instead of asking the owner. The scheduled path and its
+cron stay unchanged.
+**Files:** `.github/workflows/watch.yml`, `watcher/state_sync.py` (state-ref
+override), `tests/test_state_sync.py`, `README.md`.
+**Done when:** a sandbox dispatch of a branch completes the whole job with no
+Telegram call and no write to `refs/heads/runtime-state`; the scratch ref is
+removed afterwards; scheduled runs are unchanged. Ruff, pytest and one sandbox
+dispatch pass.
