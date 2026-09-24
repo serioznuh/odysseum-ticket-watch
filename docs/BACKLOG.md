@@ -72,7 +72,7 @@ estimates include implementation and verification.
 | 8 | OTW-17 | Merged new/moved sale wording; low value after the sale opened. | S · 2–4 h |
 
 **Cross-repository prerequisite:** the loop machinery items CR-112, CR-113 and
-CR-116 in `serioznuh/cross-llm-review` should land before the next OTW loop
+CR-114 in `serioznuh/cross-llm-review` should land before the next OTW loop
 merges. On 2026-09-24 the OTW-28 loop passed its approval, merge and backlog
 gates with an uncommitted review-log edit and merged a one-way state-schema
 migration without asking the owner.
