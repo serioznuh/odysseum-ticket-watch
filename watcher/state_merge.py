@@ -207,23 +207,28 @@ _RESERVATION_PRECEDENCE = {"held": 0, "released": 1, "uncertain": 2}
 def resolve_reservation(upstream: dict | None, local: dict | None) -> dict | None:
     """The one entry two views of a logical delivery's reservation agree on.
 
-    The same token is one holder's reservation seen at two moments, so its most
-    advanced status wins.  Different tokens are two reservations: the higher
-    generation superseded the lower one through the shared ref, and at equal
-    generation the upstream one won the compare-and-swap push — a local entry
-    the ref never accepted cannot outrank one it did.
+    The same token is one holder's reservation seen at two moments, and only
+    that holder moves it, so its most advanced status wins: its own release
+    (it knows it never called Telegram) or its own ``uncertain``.
+
+    Different tokens: the upstream (shared-ref) entry always stands. A
+    reservation only exists once the ref accepted it, so a confirmed local one
+    is already upstream under the same token; a different local token is a
+    claim the ref never accepted — typically a release this process recorded
+    for a push that did not land — and whatever its status or generation it
+    may not replace the shared entry, which another host may be sending under.
     """
     if upstream is None:
         return local
     if local is None or upstream == local:
         return upstream
-    if upstream["token"] == local["token"]:
-        if _RESERVATION_PRECEDENCE[local["status"]] > _RESERVATION_PRECEDENCE[
-            upstream["status"]
-        ]:
-            return local
-        return upstream
-    return local if local["generation"] > upstream["generation"] else upstream
+    same_holder = upstream["token"] == local["token"]
+    if same_holder and (
+        _RESERVATION_PRECEDENCE[local["status"]]
+        > _RESERVATION_PRECEDENCE[upstream["status"]]
+    ):
+        return local
+    return upstream
 
 
 def reservation_settled(state: dict, logical_id: str, unit: dict) -> bool:

@@ -1743,3 +1743,57 @@ def test_a_decline_after_an_earlier_push_of_the_token_releases_it(
     cloud = host(tmp_path / "cloud.json", ref, "cloud:run-9")
     assert delivery.recover(cloud, NOW + timedelta(minutes=5)) is True
     assert len(calls) == 1
+
+
+def test_an_unpublished_release_never_outranks_the_winners_reservation(
+    tmp_path, monkeypatch
+):
+    """Round-2 finding. The Mac's first claim is never accepted and its syncs
+    fail, so the release it records stays local. Its next claim is built on an
+    empty tip, the cloud wins that same generation and sends, and the Mac's
+    push is rejected: it releases again, locally. Neither release may number a
+    new generation nor replace the cloud's held entry when the Mac syncs, or a
+    third holder could send before the cloud publishes its receipt."""
+    from watcher.state_sync import StateSyncTransportError
+
+    ref = SharedRef(DEFAULT_STATE)
+    base = deepcopy(ref.state)
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls)
+
+    mac = host(
+        tmp_path / "local.json", ref, "local:mac",
+        fail=StateSyncTransportError("push rejected: connection reset"),
+    )
+    assert delivery.deliver_alert(mac, alert(finding()), NOW) is False
+    assert ref.state["reservations"] == {}
+    (stray,) = mac.state["reservations"].values()
+    assert stray["status"] == "released" and stray["generation"] == 1
+
+    pushed: list[dict] = []
+
+    class LosesTheRace(RefCoordinator):
+        def reserve(self, claim):
+            entries = claim(deepcopy(self.ref.state))  # built on the empty tip
+            pushed.append(entries)
+            cloud = host(tmp_path / "cloud.json", self.ref, "cloud:run-1")
+            assert delivery.deliver_alert(cloud, alert(finding()), NOW) is True
+            # The compare-and-swap rejects the Mac's push; the retry declines.
+            assert claim(deepcopy(self.ref.state)) is None
+            return False
+
+    later = NOW + timedelta(minutes=5)
+    mac.delivery_attempts.clear()
+    mac.coordinator = LosesTheRace(ref, "local:mac")
+    mac.clock = Clock(later)
+    assert delivery.recover(mac, later) is False
+    assert [e["generation"] for e in pushed[0].values()] == [1]
+    assert len(calls) == 1
+
+    ref.sync(mac, base)
+    (shared,) = ref.state["reservations"].values()
+    assert (shared["holder"], shared["status"]) == ("cloud:run-1", "held")
+    third = host(tmp_path / "third.json", ref, "cloud:run-2", clock=Clock(later))
+    assert delivery.recover(third, later) is False
+    assert delivery.deliver_alert(third, alert(finding()), later) is False
+    assert len(calls) == 1

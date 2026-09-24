@@ -1268,3 +1268,23 @@ def test_recovery_keeps_the_blocking_reservation_of_two_equal_generations(
         "expires_at": None,
     }
     assert delivery._decline_reason(recovered, None, [unit], "local:other", NOW)
+
+
+
+@pytest.mark.parametrize("backup_first", [True, False])
+def test_recovery_never_lets_a_released_claim_at_a_higher_generation_free_work(
+    backup_first,
+):
+    """Round-2 finding, recovery side: a store may hold a release for a claim
+    the ref never accepted, numbered above the winner's entry. Between
+    different tokens recovery keeps whichever still blocks, at any generation."""
+    stray = deepcopy(DEFAULT_STATE)
+    stray_entry = held_reservation("t-stray", "released")
+    stray_entry["generation"] = 2
+    stray["reservations"][IN_FLIGHT_ID] = stray_entry
+    for status in ("held", "uncertain"):
+        winner = deepcopy(DEFAULT_STATE)
+        winner["reservations"][IN_FLIGHT_ID] = held_reservation("t-win", status)
+        stores = [stray, winner] if backup_first else [winner, stray]
+        kept = state_sync.reconcile_stores(stores)["reservations"][IN_FLIGHT_ID]
+        assert (kept["token"], kept["status"]) == ("t-win", status)

@@ -909,31 +909,27 @@ def _reconcile_reservations(snapshots: Sequence[dict], merged: dict) -> dict:
     }
 
 
-# Recovery has no publication order to break a tie with, so it keeps whichever
-# reservation still blocks: one that may have sent outranks one merely held,
-# which outranks a released one.
+# Recovery has no publication order to tell which store's token the ref
+# accepted, so between different tokens it keeps whichever still blocks: one
+# that may have sent outranks one merely held, which outranks a released one.
 _RECOVERY_BLOCKING = {"released": 0, "held": 1, "uncertain": 2}
 
 
 def _recovered_reservation(first: dict | None, second: dict) -> dict:
     """The reservation recovery keeps when two stores disagree.
 
-    One holder's token seen twice, or two tokens at different generations, is
-    decided as in an ordinary merge. Two tokens at the *same* generation are two
-    claims of which the ref accepted only one, and stores that share no base
-    cannot say which: ``resolve_reservation`` would keep the first store's (an
-    older ``--from`` backup, folded before the shared ref), which may be the
-    loser's released token standing in for the winner's uncertain one. The
-    entry that still blocks is kept instead, so recovery never frees work its
-    real holder may already have sent.
+    One holder's token seen twice is decided as in an ordinary merge. Two
+    different tokens cannot be ordered here — stores share no base, an older
+    ``--from`` backup folds before the shared ref, and a store may carry a
+    release (at any generation) for a claim the ref never accepted — so the
+    entry that still blocks is kept, and generation only breaks a tie between
+    equally blocking entries. Recovery may therefore keep work quarantined that
+    was in fact free; it never frees work whose real holder may have sent it.
     """
-    if (
-        first is None
-        or first["token"] == second["token"]
-        or first["generation"] != second["generation"]
-    ):
+    if first is None or first["token"] == second["token"]:
         return resolve_reservation(first, second)
-    if _RECOVERY_BLOCKING[second["status"]] > _RECOVERY_BLOCKING[first["status"]]:
+    rank = (_RECOVERY_BLOCKING[second["status"]], second["generation"])
+    if rank > (_RECOVERY_BLOCKING[first["status"]], first["generation"]):
         return second
     return first
 

@@ -335,10 +335,13 @@ def with_reservation(entry: dict | None, logical_id: str = "telegram:news-a") ->
         (reservation("t1"), reservation("t1", status="released"), "local"),
         (reservation("t1", status="uncertain"), reservation("t1"), "upstream"),
         (reservation("t1", status="released"), reservation("t1", status="uncertain"), "local"),
-        # Two reservations: the later generation superseded the earlier one…
-        (reservation("t1"), reservation("t2", generation=2), "local"),
+        # Two tokens: the shared entry stands, whatever the local one claims.
+        # A local token the ref never accepted — a release recorded for a push
+        # that did not land — cannot replace it at any generation (round 2).
+        (reservation("t1"), reservation("t2", generation=2), "upstream"),
+        (reservation("t1"), reservation("t2", generation=2, status="released"), "upstream"),
+        (reservation("t1", status="uncertain"), reservation("t2", generation=9), "upstream"),
         (reservation("t2", generation=2), reservation("t1", status="released"), "upstream"),
-        # …and at equal generation the one the ref accepted won the push.
         (reservation("t1"), reservation("t2", status="released"), "upstream"),
     ],
 )

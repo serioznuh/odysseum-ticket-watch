@@ -1581,6 +1581,62 @@ def test_a_push_that_landed_but_reported_failure_is_confirmed_not_stranded(
     assert len(telegram) == 1
 
 
+def test_an_unpublished_release_cannot_replace_the_winners_reservation(
+    tmp_path, two_clones, telegram, monkeypatch
+):
+    """Round-2 finding on real Git. The Mac's first push never lands and its
+    syncs fail, so the release it records stays local. Its next claim, built on
+    the stale tip, loses the same generation to the cloud, which sends; the
+    Mac's rejected retry releases again, locally. When the Mac finally syncs,
+    the cloud's held reservation must still be what the ref shows, so a third
+    holder cannot send before the cloud publishes its receipt."""
+    origin, local, cloud = two_clones
+    synchronize(local)
+    synchronize(cloud)
+    third = clone_of(tmp_path, origin, "third")
+
+    shim, pids = hung_git(tmp_path / "never-lands", "push")
+    real_path = os.environ["PATH"]
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{real_path}")
+    bounded_waits(monkeypatch)
+    first = watcher_pass(local, "local:mac")
+    assert delivery.deliver_alert(first, grouped("new_show:a"), RACE_NOW) is False
+    assert_tree_stopped(hung_pids(pids))
+    monkeypatch.setenv("PATH", real_path)
+    assert telegram == []
+    (stray,) = load_state(live_path(local))["reservations"].values()
+    assert (stray["status"], stray["generation"]) == ("released", 1)
+
+    def cloud_wins() -> None:
+        runner_pass = watcher_pass(cloud, "cloud:run-1")
+        assert delivery.deliver_alert(runner_pass, grouped("new_show:a"), RACE_NOW)
+        state_mod.save_state(live_path(cloud), runner_pass.state)  # not yet synced
+
+    later = RACE_NOW + timedelta(minutes=5)
+    racing = RacingCoordinator(local, holder="local:mac", race=cloud_wins)
+    second = watcher_pass(local, "local:mac", now=later, coordinator=racing)
+    assert delivery.deliver_alert(second, grouped("new_show:a"), later) is False
+    assert racing.claims == 2  # rejected, then declined on the cloud's tip
+    assert len(telegram) == 1
+    (released,) = second.state["reservations"].values()
+    assert (released["status"], released["generation"]) == ("released", 1)
+
+    synchronize(local)  # the Mac's sync finally succeeds
+    shared = json.loads(git(origin, "show", f"{DEFAULT_STATE_REF}:{STATE_REF_FILE}"))
+    (entry,) = shared["reservations"].values()
+    assert (entry["holder"], entry["status"]) == ("cloud:run-1", "held")
+
+    synchronize(third)
+    bystander = watcher_pass(third, "cloud:run-2", now=later)
+    assert delivery.deliver_alert(bystander, grouped("new_show:a"), later) is False
+    assert len(telegram) == 1
+
+    synchronize(cloud)  # the winner's receipt settles everything
+    synchronize(local)
+    assert sends_per_key(local, cloud) == {"new_show:a": 1}
+    assert load_state(live_path(local))["reservations"] == {}
+
+
 def test_a_missing_ref_during_the_pass_refuses_every_send(two_clones, telegram):
     origin, local, _ = two_clones
     synchronize(local)

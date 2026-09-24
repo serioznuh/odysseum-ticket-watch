@@ -581,18 +581,14 @@ def _reserve(ctx: Any, delivery_id: str, record: dict) -> _Grant | None:
         lease = at + RESERVATION_LEASE
         entries = {}
         for unit in units:
-            previous = [
-                entry
-                for entry in (
-                    upstream["reservations"].get(unit["id"]),
-                    ctx.state.get("reservations", {}).get(unit["id"]),
-                )
-                if entry is not None
-            ]
+            # Numbered from the tip this claim extends, never from a local entry
+            # the ref may not hold (a release recorded for a push that did not
+            # land): the generation is what the compare-and-swap decides on.
+            previous = upstream["reservations"].get(unit["id"])
             entry = {
                 "token": token,
                 "holder": coordinator.holder,
-                "generation": 1 + max((e["generation"] for e in previous), default=0),
+                "generation": 1 + (0 if previous is None else previous["generation"]),
                 "status": "held",
                 "reserved_at": at.isoformat(),
                 "lease_expires_at": lease.isoformat(),
