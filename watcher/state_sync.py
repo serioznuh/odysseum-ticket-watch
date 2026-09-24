@@ -218,15 +218,59 @@ def _signal_group(pid: int, signum: int) -> bool:
     """Signal one process group, reporting whether anything signalable is left.
 
     The supervised child leads its own session, so ``pid`` is also its process
-    group id and that group is exactly the tree this invocation owns.  EPERM
-    counts as gone alongside ESRCH: a group whose only remaining member is the
-    unreaped child reports EPERM, while one live member still answers 0
-    (measured on macOS), so nothing still running is ever read as stopped.
+    group id and that group is exactly the tree this invocation owns.  A group
+    whose remaining members are all unreaped zombies has nothing left running:
+    macOS reports it as EPERM, which counts as gone alongside ESRCH, while Linux
+    still answers 0 and is asked ``/proc`` instead.  One live member keeps the
+    group alive on both, so nothing still running is ever read as stopped.
     """
     try:
         os.killpg(pid, signum)
     except (ProcessLookupError, PermissionError):
         return False
+    return not _only_zombies_left(pid)
+
+
+PROC_ROOT = Path("/proc")
+
+
+def _group_member_states(pgid: int) -> list[str] | None:
+    """The state letter of every process in ``pgid``, or None without ``/proc``.
+
+    Reads each ``/proc/<pid>/stat``; the fields after the command name, which may
+    itself contain spaces and parentheses, are state, ppid, pgrp.  A process that
+    exits mid-scan is skipped.
+    """
+    try:
+        entries = os.listdir(PROC_ROOT)
+    except OSError:
+        return None
+    states: list[str] = []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            text = (PROC_ROOT / entry / "stat").read_text(encoding="utf-8", errors="replace")
+            fields = text[text.rindex(")") + 1 :].split()
+            if int(fields[2]) == pgid:
+                states.append(fields[0])
+        except (OSError, ValueError, IndexError):
+            continue
+    return states
+
+
+def _only_zombies_left(pgid: int) -> bool:
+    """True only when ``/proc`` shows members in ``pgid`` and all are zombies.
+
+    Anything short of that proof — no ``/proc`` (macOS), no member found, or any
+    member in another state — answers False, so the caller keeps treating the
+    group as alive.  The scan runs twice: a member that forked just before it
+    became a zombie cannot hide from both passes.
+    """
+    for _ in range(2):
+        states = _group_member_states(pgid)
+        if not states or any(state not in ("Z", "X") for state in states):
+            return False
     return True
 
 

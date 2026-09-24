@@ -554,12 +554,20 @@ def cleanup_fails_for(pgid: int):
 
 @contextmanager
 def live_group() -> Iterator[int]:
-    """A real process group of its own, killed and reaped on the way out."""
-    process = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+    """A real process group of its own, killed and reaped on the way out.
+
+    The whole group is killed, not just the shell: a shell that forks `sleep`
+    instead of exec'ing it (dash on Linux) would otherwise leave that group
+    running for real after the test says it is gone.
+    """
+    process = subprocess.Popen(["/bin/sh", "-c", "exec sleep 30"], start_new_session=True)
     try:
         yield process.pid
     finally:
-        process.kill()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         process.wait()
 
 
@@ -1084,3 +1092,74 @@ def test_a_second_survivor_is_never_hidden_behind_an_existing_record(tmp_path):
 
     assert code == state_sync.UNGUARDED_TREE_EXIT
     assert json.loads(marker.read_text(encoding="utf-8"))["pgid"] == 0
+
+
+# ---------------------------------------------------------------------------
+# OTW-29: a group of zombies is gone, a group with one live member is not
+# ---------------------------------------------------------------------------
+
+
+def fake_proc(root: Path, members: dict[int, tuple[str, int]]) -> None:
+    """A `/proc` holding one `stat` per pid: {pid: (state, pgrp)}."""
+    for pid, (state, pgrp) in members.items():
+        (root / str(pid)).mkdir(parents=True)
+        # The command name may contain spaces and parentheses, as real ones do.
+        (root / str(pid) / "stat").write_text(
+            f"{pid} (odd) name) {state} 1 {pgrp} {pgrp} 0 -1 4194560 0 0\n",
+            encoding="utf-8",
+        )
+    (root / "self").mkdir(exist_ok=True)
+
+
+def killpg_answers(monkeypatch) -> None:
+    """Linux's answer for a group whose members are all unreaped zombies: 0."""
+    monkeypatch.setattr(state_sync.os, "killpg", lambda pgid, signum: None)
+
+
+def test_a_group_of_only_zombies_counts_as_gone(tmp_path, monkeypatch):
+    """CI finding: on Linux, killpg(pgid, 0) succeeds for a group whose members
+    are all zombies (macOS reports EPERM). A killed, finished child is not a
+    survivor, so reading it as one blocked healthy firings with exit 5."""
+    fake_proc(tmp_path, {100: ("Z", 4242), 101: ("Z", 4242), 200: ("S", 999)})
+    monkeypatch.setattr(state_sync, "PROC_ROOT", tmp_path)
+    killpg_answers(monkeypatch)
+
+    assert state_sync._signal_group(4242, 0) is False
+    assert state_sync._drain_group(4242, grace=0) is True
+
+
+def test_one_live_member_keeps_the_group_a_survivor(tmp_path, monkeypatch):
+    """…and the survivor guard stays precise: a single member that is not a
+    zombie means something of that group still runs."""
+    fake_proc(tmp_path, {100: ("Z", 4242), 101: ("D", 4242)})
+    monkeypatch.setattr(state_sync, "PROC_ROOT", tmp_path)
+    killpg_answers(monkeypatch)
+
+    assert state_sync._signal_group(4242, 0) is True
+    assert state_sync._drain_group(4242, grace=0) is False
+
+
+def test_without_proc_an_answering_group_stays_alive(tmp_path, monkeypatch):
+    """No `/proc` (macOS), or no member found: nothing proves the group gone, so
+    the answer to killpg stands."""
+    killpg_answers(monkeypatch)
+    monkeypatch.setattr(state_sync, "PROC_ROOT", tmp_path / "absent")
+    assert state_sync._signal_group(4242, 0) is True
+
+    fake_proc(tmp_path / "proc", {100: ("S", 999)})
+    monkeypatch.setattr(state_sync, "PROC_ROOT", tmp_path / "proc")
+    assert state_sync._signal_group(4242, 0) is True
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="Linux /proc only")
+def test_a_real_unreaped_child_is_not_a_survivor():
+    """The real thing on Linux: a finished child nobody has reaped yet."""
+    child = subprocess.Popen(["/bin/sh", "-c", "exit 0"], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 5
+        while state_sync._group_member_states(child.pid) != ["Z"]:
+            assert time.monotonic() < deadline, "the child never became a zombie"
+            time.sleep(0.02)
+        assert state_sync._signal_group(child.pid, 0) is False
+    finally:
+        child.wait()
