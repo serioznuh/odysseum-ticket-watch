@@ -15,6 +15,12 @@ cannot be told apart from deletion of an established ref, so ``synchronize``
 refuses it and the operator runs ``init`` (a genuinely new installation) or
 ``recover`` (an existing one, reconciling every surviving store first).
 
+Permission to send is arbitrated here too (OTW-28).  ``reserve`` extends the
+fetched tip of the shared ref with a reservation and pushes it as a plain
+fast-forward, which the remote accepts only while that tip is still current:
+a compare-and-swap that a host racing from an older tip cannot win.  The
+policy — what may be reserved, and when — lives in ``watcher/delivery.py``.
+
 Every child process started here waits for a bounded time (OTW-29).  The local
 wrapper holds one overlap lock across deployment, both state syncs and the
 watcher, so a Git child that never answers used to silence the reminder ladder
@@ -34,6 +40,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
@@ -42,7 +49,13 @@ from pathlib import Path
 
 from . import state as state_mod
 from .detect import TZ_PARIS
-from .state_merge import StateMergeError, ack_satisfied, merge_states
+from .state_merge import (
+    StateMergeError,
+    ack_satisfied,
+    merge_states,
+    reservation_settled,
+    resolve_reservation,
+)
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +67,11 @@ STATE_REF_FILE = "state.json"
 TRANSPORT_FAILURE_FILE = "transport-failure.json"
 TRANSPORT_FAILURE_THRESHOLD = 3
 DEFAULT_SEED_PATH = "state/state.json"
+# This store's reservation-holder id (OTW-28). It lives beside the live file it
+# describes: only a process of the same store can prove from that file that an
+# earlier reservation of its own never reached Telegram. A fresh cloud runner
+# gets a fresh store and so a fresh id, and never takes over a predecessor.
+HOLDER_FILE = "holder"
 # `sync` exits with this on every confirmed absence of the shared ref: no local
 # snapshot can show a receipt that lived only in the ref, so the startup wrappers
 # must stop rather than let the watcher deliver from an unverified history.
@@ -865,7 +883,28 @@ def reconcile_stores(stores: Sequence[dict]) -> dict:
             f"surviving runtime-state stores could not be reconciled: {exc}"
         ) from exc
     merged["outbox"] = _reconcile_outbox(snapshots, merged)
+    merged["reservations"] = _reconcile_reservations(snapshots, merged)
     return state_mod.migrate_state(merged)
+
+
+def _reconcile_reservations(snapshots: Sequence[dict], merged: dict) -> dict:
+    """Union every store's reservations, like the outbox above.
+
+    The fold would read an entry a later store lacks as deleted, and dropping a
+    live reservation during recovery would let a second host claim work whose
+    first holder may already have sent it.  Only a proof of delivery retires one.
+    """
+    rebuilt: dict[str, dict] = {}
+    for snapshot in snapshots:
+        for logical_id, entry in snapshot["reservations"].items():
+            rebuilt[logical_id] = deepcopy(
+                resolve_reservation(rebuilt.get(logical_id), entry)
+            )
+    return {
+        logical_id: entry
+        for logical_id, entry in rebuilt.items()
+        if not reservation_settled(merged, logical_id, entry)
+    }
 
 
 def _reconcile_outbox(snapshots: Sequence[dict], merged: dict) -> dict:
@@ -1117,6 +1156,145 @@ def synchronize(
             f"could not push shared state after {max(1, push_attempts)} attempt(s): "
             f"{last_error}"
         )
+
+
+def reserve(
+    repo: str | Path = ".",
+    *,
+    claim: Callable[[dict], dict | None],
+    store: str | Path = DEFAULT_STORE_PATH,
+    remote: str = "origin",
+    state_ref: str = DEFAULT_STATE_REF,
+    push_attempts: int = 3,
+) -> bool:
+    """Publish a delivery reservation on the shared ref, or report why not.
+
+    ``claim`` is shown a copy of the shared tip and returns the reservation
+    entries to add, or None to decline.  The entries are committed on top of
+    exactly that tip and pushed as a fast-forward, so the remote accepts them
+    only if nobody moved the ref in between: whoever pushes first wins, and a
+    loser is re-shown the new tip — holding the winner's reservation — on its
+    next attempt.  True means this call's entries are on the ref.
+
+    Nothing local is written: the pass's own changes still travel with the
+    post-run sync, whose merge honours what was reserved here.  Every Git wait
+    is bounded (OTW-29); a timeout raises the ordinary transport error, which
+    is *not* an answer — the push may have landed — so the caller must neither
+    send nor treat the work as refused.  A confirmed absence of the ref raises
+    as it does for ``synchronize`` (OTW-30): no send from an unverified history.
+    """
+    paths = _Store(repo, store)
+    with file_lock(paths.lock, blocking=True):
+        last_error = "reservation push was rejected"
+        for _ in range(max(1, push_attempts)):
+            remote_commit, upstream = _remote_state(paths.repo, remote, state_ref)
+            if upstream is None:
+                raise _ref_absent_error(state_ref, _store_evidence(paths))
+            entries = claim(deepcopy(upstream))
+            if entries is None:
+                return False
+            candidate = deepcopy(upstream)
+            candidate["reservations"].update(deepcopy(entries))
+            commit = _state_commit(paths.repo, candidate, remote_commit)
+            pushed = _git(
+                paths.repo,
+                "push",
+                "--quiet",
+                remote,
+                f"{commit}:{state_ref}",
+                check=False,
+            )
+            if pushed.returncode == 0:
+                return True
+            # Rejected: the ref moved since it was fetched (or the remote
+            # refused outright). Nothing landed; decide again from the new tip.
+            last_error = (pushed.stderr or pushed.stdout).strip() or last_error
+        raise StateSyncTransportError(
+            f"delivery reservation not confirmed after {max(1, push_attempts)} "
+            f"attempt(s): {last_error}"
+        )
+
+
+def store_holder(repo: str | Path = ".", store: str | Path = DEFAULT_STORE_PATH) -> str:
+    """This store's reservation-holder id, created on first use.
+
+    If it cannot be persisted the id is scoped to this process, which only ever
+    makes the store more cautious: it then cannot prove an earlier reservation
+    was its own, and waits for that one's receipt, release or expiry instead.
+    """
+    kind = "cloud" if os.environ.get("GITHUB_ACTIONS") else "local"
+    path = _Store(repo, store).dir / HOLDER_FILE
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+    except FileNotFoundError:
+        pass
+    except OSError:
+        log.exception("could not read the reservation holder id at %s", path)
+    holder = f"{kind}:{uuid.uuid4().hex[:16]}"
+    try:
+        with path.open("x", encoding="utf-8") as handle:
+            handle.write(holder + "\n")
+    except FileExistsError:
+        return path.read_text(encoding="utf-8").strip() or holder
+    except OSError:
+        log.exception("could not persist the reservation holder id at %s", path)
+    return holder
+
+
+class DeliveryCoordinator:
+    """The watcher's handle on shared delivery reservations (OTW-28).
+
+    A Git child of a reservation that outlives every attempt to stop it is
+    recorded exactly where the wrapper's next firing looks (OTW-29), and this
+    coordinator then refuses every later reservation of the pass rather than
+    start a second Git writer beside it; ``blocked_exit`` is the status the
+    watcher exits with, which both startup wrappers treat as a hard stop.
+    """
+
+    def __init__(
+        self,
+        repo: str | Path = ".",
+        *,
+        store: str | Path = DEFAULT_STORE_PATH,
+        remote: str = "origin",
+        state_ref: str = DEFAULT_STATE_REF,
+        lock: str | Path = DEFAULT_LOCK_PATH,
+        holder: str | None = None,
+    ) -> None:
+        self.repo = Path(repo).resolve()
+        self.store = store
+        self.remote = remote
+        self.state_ref = state_ref
+        self.lock = lock
+        self.holder = holder or store_holder(self.repo, store)
+        self.blocked_exit: int | None = None
+
+    def reserve(self, claim: Callable[[dict], dict | None]) -> bool:
+        if self.blocked_exit is not None:
+            raise StateSyncError(
+                "an earlier reservation left a Git process group running; no further "
+                "reservation starts beside it"
+            )
+        try:
+            return reserve(
+                self.repo,
+                claim=claim,
+                store=self.store,
+                remote=self.remote,
+                state_ref=self.state_ref,
+            )
+        except StateSyncCleanupError as exc:
+            lock_path, marker = _survivor_paths(self.repo, self.lock)
+            self.blocked_exit = _report_unconfirmed_tree(
+                exc,
+                marker,
+                "delivery reservation",
+                lock=lock_path,
+                hold=SURVIVOR_RECORD_ALLOWANCE_SECONDS,
+            )
+            raise
 
 
 def _survivor_record(pgid: int, detail: str, now: datetime | None) -> dict[str, object]:

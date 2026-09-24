@@ -5,6 +5,29 @@ saved before the request, and a confirmed receipt plus its acknowledgement are
 saved immediately afterwards.  It cannot make Telegram exactly-once.  A crash
 or timeout after an attempt begins is quarantined as ``uncertain`` and is not
 automatically replayed, because the message may already be on the phone.
+
+Across hosts (OTW-28), a coordinated pass must also hold a reservation on the
+shared state ref for every logical delivery a message carries before it calls
+Telegram — one per member key and its episode identity, so the Mac and the
+cloud grouping the same finding differently still contend for the same thing.
+The ref's compare-and-swap push decides the winner.  The rules:
+
+* No confirmed reservation, no send.  A declined, lost or unanswered claim
+  leaves the work pending and every baseline where it was.
+* Only the holding process moves its reservation out of ``held``: to
+  ``released`` when it knows Telegram was never called (a definite failure, or
+  a lease that ran out before the send began), to ``uncertain`` when it may
+  have been.  A receipt retires it.
+* A reservation's lease binds its holder only: it never begins a send once the
+  lease is nearly spent (a laptop that slept mid-pass, say), so a late send can
+  never overlap a successor.  An expired lease grants nobody else anything —
+  its holder may have sent — so another host stays blocked; the entry stays
+  quarantined until its receipt, its release or the expiry of the work.
+* The one takeover is by the same store once the lease is over.  The holder
+  saves its reservation as ``uncertain`` in its own live file in the same
+  atomic write as ``sending``, before Telegram is called, so a store whose file
+  shows neither never reached Telegram under that reservation.  It takes over
+  with a new token at the next generation, through the same compare-and-swap.
 """
 
 from __future__ import annotations
@@ -15,17 +38,31 @@ import logging
 import os
 import uuid
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
-from . import coalesce, detect, notify
+from . import coalesce, detect, notify, state_sync
 from . import state as state_mod
 from .coalesce import Alert
 from .detect import TZ_PARIS, Finding, as_aware, parse_iso
+from .state_merge import reservation_settled, resolve_reservation
 
 log = logging.getLogger("watcher.delivery")
 
 _CONDITION_PREFIX = "condition:"
+
+# OTW-28. How long a reservation lets its holder begin the send. The holder
+# needs seconds; this is generous so a slow but bounded push (OTW-29) never
+# costs a send, and short enough that the store's own successor — the only
+# process that may ever take a reservation over — waits about two firings.
+RESERVATION_LEASE = timedelta(minutes=10)
+# A holder never *begins* a send with less than this left on its lease, so the
+# gap between that check and the request cannot reach the successor's takeover.
+RESERVATION_SEND_MARGIN = timedelta(minutes=2)
+# Released or expired reservations are dropped only this long afterwards, far
+# beyond any plausible clock skew between the two hosts.
+RESERVATION_RETENTION = timedelta(days=7)
 
 
 class DeliveryPersistenceError(state_mod.StateError):
@@ -416,16 +453,213 @@ def _retire_obsolete(
         _persist(ctx)
 
 
+@dataclass
+class _Grant:
+    """A confirmed reservation: this process alone may send these units."""
+
+    token: str
+    entries: dict[str, dict]
+    lease_expires_at: datetime
+
+
+def _units(record: dict) -> list[dict]:
+    """The logical deliveries one outbox record carries, one per member key.
+
+    Each id is the delivery id that member would have alone — its key plus its
+    episode identity — so two differently grouped messages naming the same
+    finding contend for the same reservation.
+    """
+    expires_at = record.get("expires_at")
+    if record.get("members"):
+        return [
+            {
+                "id": _member_delivery_id(member),
+                "ack": {"type": "alerts", "keys": [member["key"]]},
+                "force": record["force"],
+                "expires_at": member.get("expires_at", expires_at),
+            }
+            for member in record["members"]
+        ]
+    ack = record["ack"]
+    if ack["type"] != "alerts":
+        # A reminder rung or heartbeat is one key, and its acknowledgement is
+        # exactly the proof another host's delivery of it leaves behind.
+        return [
+            {
+                "id": _delivery_id(record["keys"]),
+                "ack": deepcopy(ack),
+                "force": record["force"],
+                "expires_at": expires_at,
+            }
+        ]
+    identity = _alert_identity(record["kinds"], record.get("topics", []))
+    return [
+        {
+            "id": _delivery_id([key], identity),
+            "ack": {"type": "alerts", "keys": [key]},
+            "force": record["force"],
+            "expires_at": expires_at,
+        }
+        for key in record["keys"]
+    ]
+
+
+def _in_flight(state: dict, logical_id: str) -> bool:
+    """True when ``state`` holds an attempt of ``logical_id`` that may have sent."""
+    return any(
+        record["status"] in {"sending", "uncertain"}
+        and any(unit["id"] == logical_id for unit in _units(record))
+        for record in state.get("outbox", {}).values()
+    )
+
+
+def _decline_reason(
+    local: dict,
+    upstream: dict | None,
+    units: list[dict],
+    holder: str,
+    now: datetime,
+) -> str | None:
+    """Why these units may not be reserved now, or None when they may."""
+    views = [local] if upstream is None else [local, upstream]
+    for unit in units:
+        if any(reservation_settled(view, unit["id"], unit) for view in views):
+            return f"{unit['id']} was already delivered"
+        entry = resolve_reservation(
+            None if upstream is None else upstream["reservations"].get(unit["id"]),
+            local.get("reservations", {}).get(unit["id"]),
+        )
+        if entry is None or entry["status"] == "released":
+            continue
+        if entry["status"] == "uncertain":
+            return f"{unit['id']} is quarantined: an earlier attempt may have sent it"
+        if entry["holder"] != holder:
+            # Never taken over, whatever the lease says: that holder may be
+            # mid-send, or may have sent and not yet published the receipt.
+            return f"{unit['id']} is reserved by {entry['holder']}"
+        lease = as_aware(parse_iso(entry["lease_expires_at"]))
+        if now < lease:
+            return f"{unit['id']} is reserved by an earlier pass of this store"
+        if any(_in_flight(view, unit["id"]) for view in views):
+            return (
+                f"{unit['id']} was reserved by an earlier pass of this store that "
+                "may have sent it"
+            )
+        # This store's earlier pass reserved it and provably never sent it:
+        # taken over below with a new token at the next generation.
+    return None
+
+
+def _set_entries(ctx: Any, grant: _Grant, status: str | None) -> None:
+    """Record this process's own transition of its reservation (None: settled)."""
+    reservations = ctx.state.setdefault("reservations", {})
+    for logical_id, entry in grant.entries.items():
+        if status is None:
+            reservations.pop(logical_id, None)
+        else:
+            reservations[logical_id] = {**deepcopy(entry), "status": status}
+
+
+def _reserve(ctx: Any, delivery_id: str, record: dict) -> _Grant | None:
+    """Win the shared reservation for every unit of ``record``, or explain why not."""
+    coordinator = ctx.coordinator
+    units = _units(record)
+    reason = _decline_reason(ctx.state, None, units, coordinator.holder, ctx.clock())
+    if reason is not None:
+        log.info("delivery %s waits: %s", delivery_id, reason)
+        return None
+
+    token = uuid.uuid4().hex
+    decided: dict[str, Any] = {}
+
+    def claim(upstream: dict) -> dict | None:
+        at = ctx.clock()
+        reason = _decline_reason(ctx.state, upstream, units, coordinator.holder, at)
+        if reason is not None:
+            decided["reason"] = reason
+            return None
+        lease = at + RESERVATION_LEASE
+        entries = {}
+        for unit in units:
+            previous = [
+                entry
+                for entry in (
+                    upstream["reservations"].get(unit["id"]),
+                    ctx.state.get("reservations", {}).get(unit["id"]),
+                )
+                if entry is not None
+            ]
+            entry = {
+                "token": token,
+                "holder": coordinator.holder,
+                "generation": 1 + max((e["generation"] for e in previous), default=0),
+                "status": "held",
+                "reserved_at": at.isoformat(),
+                "lease_expires_at": lease.isoformat(),
+                "delivery_id": delivery_id,
+                "ack": deepcopy(unit["ack"]),
+                "force": unit["force"],
+            }
+            if unit["expires_at"] is not None:
+                entry["expires_at"] = unit["expires_at"]
+            entries[unit["id"]] = entry
+        decided["grant"] = _Grant(token, entries, lease)
+        return deepcopy(entries)
+
+    try:
+        confirmed = coordinator.reserve(claim)
+    except (state_sync.StateSyncError, state_mod.StateError, OSError) as exc:
+        log.warning(
+            "delivery %s not sent: its reservation could not be confirmed (%s); "
+            "the work stays pending",
+            delivery_id,
+            exc,
+        )
+        grant = decided.get("grant")
+        if grant is not None:
+            # The push may have landed without an answer. This process knows it
+            # will not send under this token, so it says so; the post-run sync
+            # publishes that, and it outranks the held entry if one did land.
+            _set_entries(ctx, grant, "released")
+            try:
+                _persist(ctx)
+            except Exception:
+                log.exception("could not persist the released reservation")
+        return None
+    if not confirmed:
+        log.info("delivery %s not sent: %s", delivery_id, decided.get("reason"))
+        return None
+    return decided["grant"]
+
+
 def _attempt(ctx: Any, delivery_id: str, now: datetime) -> bool:
-    record = ctx.state["outbox"][delivery_id]
-    if record["status"] != "pending" or delivery_id in ctx.delivery_attempts:
+    record = ctx.state.setdefault("outbox", {}).get(delivery_id)
+    if (
+        record is None
+        or record["status"] != "pending"
+        or delivery_id in ctx.delivery_attempts
+    ):
         return False
     ctx.delivery_attempts.add(delivery_id)
 
-    claim_token = uuid.uuid4().hex
+    grant: _Grant | None = None
+    if getattr(ctx, "coordinator", None) is not None:
+        grant = _reserve(ctx, delivery_id, record)
+        if grant is None:
+            return False
+        claim_token = grant.token
+    else:
+        claim_token = uuid.uuid4().hex
     before_claim = deepcopy(record)
     record["status"] = "sending"
     record["claim"] = {"owner": _owner(), "token": claim_token, "at": now.isoformat()}
+    if grant is not None:
+        # Written in the same atomic save as ``sending``: from here on this
+        # store's own record of the reservation says Telegram may have been
+        # called, and that outlives any later retirement of the outbox record.
+        # Only confirmation, a definite failure or the lease check below can
+        # take it back, because only this process knows the send's fate.
+        _set_entries(ctx, grant, "uncertain")
     try:
         _persist(ctx)
     except Exception:
@@ -434,7 +668,26 @@ def _attempt(ctx: Any, delivery_id: str, now: datetime) -> bool:
         # interrupted send and quarantine it permanently.
         record.clear()
         record.update(before_claim)
+        if grant is not None:
+            _set_entries(ctx, grant, "released")
         raise
+
+    if grant is not None and ctx.clock() >= (
+        grant.lease_expires_at - RESERVATION_SEND_MARGIN
+    ):
+        # The pass stalled (a sleeping laptop resumes here) between winning the
+        # reservation and sending. Telegram has not been called; a late send
+        # could overlap the successor the lease makes room for.
+        log.warning(
+            "delivery %s not sent: its reservation lease ran out before the send "
+            "began; it stays pending and is released",
+            delivery_id,
+        )
+        record.clear()
+        record.update(before_claim)
+        _set_entries(ctx, grant, "released")
+        _persist(ctx)
+        return False
 
     try:
         outcome = _result(
@@ -450,6 +703,8 @@ def _attempt(ctx: Any, delivery_id: str, now: datetime) -> bool:
         # prove whether Telegram accepted the request, so quarantine it.
         log.exception("notification attempt ended without a known outcome")
         record["status"] = "uncertain"
+        if grant is not None:
+            _set_entries(ctx, grant, "uncertain")
         try:
             _persist(ctx)
         except Exception:
@@ -468,6 +723,9 @@ def _attempt(ctx: Any, delivery_id: str, now: datetime) -> bool:
         ctx.state.setdefault("delivery_receipts", {})[claim_token] = receipt
         _apply_ack(ctx.state, record["ack"], now)
         ctx.state["outbox"].pop(delivery_id, None)
+        if grant is not None:
+            # Settled: the receipt now answers every later claim on these units.
+            _set_entries(ctx, grant, None)
         try:
             _persist(ctx)
         except Exception as exc:
@@ -477,6 +735,8 @@ def _attempt(ctx: Any, delivery_id: str, now: datetime) -> bool:
             ctx.state.clear()
             ctx.state.update(before_confirmation)
             ctx.state["outbox"][delivery_id]["status"] = "uncertain"
+            if grant is not None:
+                _set_entries(ctx, grant, "uncertain")
             try:
                 _persist(ctx)
             except Exception:
@@ -490,10 +750,15 @@ def _attempt(ctx: Any, delivery_id: str, now: datetime) -> bool:
     if outcome.status == "failed":
         record["status"] = "pending"
         record.pop("claim", None)
+        if grant is not None:
+            # Telegram definitely refused it: any host may reserve it anew.
+            _set_entries(ctx, grant, "released")
         _persist(ctx)
         return False
 
     record["status"] = "uncertain"
+    if grant is not None:
+        _set_entries(ctx, grant, "uncertain")
     _persist(ctx)
     return False
 
@@ -1049,6 +1314,30 @@ def reconcile_source_observations(
         _persist(ctx)
 
 
+def _prune_reservations(ctx: Any, now: datetime) -> bool:
+    """Drop reservations nothing can contend for any more.
+
+    A delivered one is answered by its receipt. A released one, or one whose
+    work has expired, is kept a further ``RESERVATION_RETENTION`` so neither
+    host's clock skew can make it vanish while the other still acts on it.
+    An unreleased reservation of live work is never dropped here: it is the
+    quarantine of an attempt that may have reached Telegram.
+    """
+    reservations = ctx.state.setdefault("reservations", {})
+    changed = False
+    for logical_id, entry in list(reservations.items()):
+        lease = as_aware(parse_iso(entry["lease_expires_at"]))
+        expiry = parse_iso(entry.get("expires_at"))
+        if (
+            reservation_settled(ctx.state, logical_id, entry)
+            or (entry["status"] == "released" and now >= lease + RESERVATION_RETENTION)
+            or (expiry is not None and now >= as_aware(expiry) + RESERVATION_RETENTION)
+        ):
+            reservations.pop(logical_id)
+            changed = True
+    return changed
+
+
 def recover(
     ctx: Any,
     now: datetime,
@@ -1058,7 +1347,7 @@ def recover(
     """Retire stale work, quarantine interrupted attempts, retry safe pending work."""
     blocked_condition_domains = blocked_condition_domains or set()
     sent = False
-    changed = False
+    changed = _prune_reservations(ctx, now)
     for delivery_id, record in list(ctx.state.setdefault("outbox", {}).items()):
         if _has_receipt(ctx.state, delivery_id) or _open_ping_bookable(
             ctx.state, ctx.cfg, record, now

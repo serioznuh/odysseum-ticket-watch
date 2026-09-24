@@ -469,11 +469,15 @@ def test_local_check_bounds_the_deployment_pull_and_the_whole_firing():
     stops = [
         index for index, line in enumerate(lines) if line.startswith(("if surviving_group", "  if surviving_group"))
     ]
-    assert len(stops) == 3, "deployment, pre-run sync and post-run sync each stop on it"
+    assert len(stops) == 4, (
+        "deployment, pre-run sync, the watcher's reservations (OTW-28) and the "
+        "post-run sync each stop on it"
+    )
+    watcher = line_of("--mode check --adaptive-cadence")
     post_sync = line_of("sync_state || sync_status")
-    assert stops[0] < pre_sync and stops[1] < post_sync
+    assert stops[0] < pre_sync < stops[1] < watcher < stops[2] < post_sync
     # …and the post-run check comes before the folding that could mask it.
-    assert stops[2] < line_of('"$status" -eq 0')
+    assert post_sync < stops[3] < line_of('"$status" -eq 0')
 
 
 def test_termination_stays_forwarded_while_the_tree_is_cleaned_up():
