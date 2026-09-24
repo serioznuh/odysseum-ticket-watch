@@ -86,6 +86,10 @@ class RunContext:
     # pass, but a definite failure must wait for the next firing rather than
     # being attempted twice back-to-back.
     delivery_attempts: set[str] = field(default_factory=set)
+    # OTW-28: the shared-reservation handle (`state_sync.DeliveryCoordinator`).
+    # None only where no shared state exists — dry runs and state files outside
+    # the synchronized store — and then delivery keeps OTW-20's local claims.
+    coordinator: Any = None
 
     def budget(self, seconds: float, label: str) -> Budget:
         return Budget(seconds, monotonic=self.monotonic, sleep=self.sleeper, label=label)

@@ -198,6 +198,82 @@ def _merge_outbox(
     return merged
 
 
+# OTW-28. Only the process holding a reservation moves it out of "held", and
+# only forward: to "released" once it knows Telegram was never called for it,
+# or to "uncertain" once it may have been. The later word always wins.
+_RESERVATION_PRECEDENCE = {"held": 0, "released": 1, "uncertain": 2}
+
+
+def resolve_reservation(upstream: dict | None, local: dict | None) -> dict | None:
+    """The one entry two views of a logical delivery's reservation agree on.
+
+    The same token is one holder's reservation seen at two moments, and only
+    that holder moves it, so its most advanced status wins: its own release
+    (it knows it never called Telegram) or its own ``uncertain``.
+
+    Different tokens: the upstream (shared-ref) entry always stands. A
+    reservation only exists once the ref accepted it, so a confirmed local one
+    is already upstream under the same token; a different local token is a
+    claim the ref never accepted — typically a release this process recorded
+    for a push that did not land — and whatever its status or generation it
+    may not replace the shared entry, which another host may be sending under.
+    """
+    if upstream is None:
+        return local
+    if local is None or upstream == local:
+        return upstream
+    same_holder = upstream["token"] == local["token"]
+    if same_holder and (
+        _RESERVATION_PRECEDENCE[local["status"]]
+        > _RESERVATION_PRECEDENCE[upstream["status"]]
+    ):
+        return local
+    return upstream
+
+
+def reservation_settled(state: dict, logical_id: str, unit: dict) -> bool:
+    """True when ``state`` proves the logical delivery ``unit`` was delivered.
+
+    A receipt for exactly this logical id settles it; otherwise its
+    acknowledgement does, unless the work is forced, which by definition
+    re-sends over an existing acknowledgement and is deduplicated by receipt.
+    """
+    if any(
+        receipt["delivery_id"] == logical_id
+        for receipt in state["delivery_receipts"].values()
+    ):
+        return True
+    return not unit["force"] and ack_satisfied(state, unit["ack"])
+
+
+def _merge_reservations(
+    base: dict, upstream: dict, local: dict, merged_state: dict
+) -> dict:
+    """Three-way per entry, conflicts by ``resolve_reservation``.
+
+    A deletion is honoured like any three-way change (a settled entry, or one a
+    host pruned long after its work expired); an entry the merged state proves
+    delivered is dropped, since its receipt now answers every later claim.
+    """
+    merged: dict[str, dict] = {}
+    for logical_id in sorted(set(base) | set(upstream) | set(local)):
+        old = base.get(logical_id, _MISSING)
+        theirs = upstream.get(logical_id, _MISSING)
+        ours = local.get(logical_id, _MISSING)
+        if theirs is _MISSING and ours is _MISSING:
+            continue
+        if theirs is _MISSING:
+            choice = _MISSING if old == ours else ours
+        elif ours is _MISSING:
+            choice = _MISSING if old == theirs else theirs
+        else:
+            choice = resolve_reservation(theirs, ours)
+        if choice is _MISSING or reservation_settled(merged_state, logical_id, choice):
+            continue
+        merged[logical_id] = deepcopy(choice)
+    return merged
+
+
 def _merge_reminders(upstream: dict, local: dict) -> dict:
     merged: dict[str, list[str]] = {}
     for target in sorted(set(upstream) | set(local)):
@@ -285,6 +361,7 @@ def merge_states(
         "formats_seen",
         "outbox",
         "reminders_sent",
+        "reservations",
         "sales",
         "shows_seen",
         "tickets_available",
@@ -324,6 +401,12 @@ def merge_states(
         upstream["outbox"],
         local["outbox"],
         merged["delivery_receipts"],
+        merged,
+    )
+    merged["reservations"] = _merge_reservations(
+        base["reservations"],
+        upstream["reservations"],
+        local["reservations"],
         merged,
     )
     return migrate_state(merged)

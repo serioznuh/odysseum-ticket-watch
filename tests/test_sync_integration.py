@@ -11,19 +11,26 @@ import sys
 import time
 from collections.abc import Sequence
 from copy import deepcopy
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
-from watcher import state_sync
+from watcher import delivery, jobs, notify, state_sync
+from watcher import state as state_mod
+from watcher.coalesce import Alert
+from watcher.detect import TZ_PARIS, Finding
 from watcher.state import DEFAULT_STATE, load_state, save_state
 from watcher.state_sync import (
     BOOTSTRAP_REQUIRED_EXIT,
     DEFAULT_MARKER_PATH,
     DEFAULT_STATE_REF,
     DEFAULT_STORE_PATH,
+    STATE_REF_FILE,
     TRANSPORT_FAILURE_FILE,
     TRANSPORT_FAILURE_THRESHOLD,
+    DeliveryCoordinator,
     StateSyncError,
     StateSyncRefAbsentError,
     failure_key,
@@ -700,7 +707,10 @@ def install_local_check(repo: Path) -> Path:
         "  fi\n"
         '  exec "$REAL_PYTHON" "$@"\n'
         "fi\n"
-        "printf '%s\\n' \"$*\" >> watcher-invocations\n",
+        "printf '%s\\n' \"$*\" >> watcher-invocations\n"
+        # OTW_FAKE_WATCHER_EXIT: the status a real pass returns when one of its
+        # delivery reservations left a Git group it could not stop (OTW-28).
+        'exit "${OTW_FAKE_WATCHER_EXIT:-0}"\n',
         encoding="utf-8",
     )
     stub.chmod(0o755)
@@ -1165,6 +1175,32 @@ def test_a_surviving_group_after_the_watcher_is_not_masked_by_another_failure(
     assert "the next firing stops until that group is gone" in fired.stderr
 
 
+@pytest.mark.parametrize(
+    "code", [state_sync.UNCONFIRMED_TREE_EXIT, state_sync.UNGUARDED_TREE_EXIT]
+)
+def test_a_reservation_survivor_stops_the_firing_before_the_post_run_sync(
+    two_clones, code
+):
+    """OTW-28: the watcher's own reservations are bounded Git pushes too. When
+    one leaves a group running the pass exits with the sync's status, and the
+    firing stops before starting the post-run sync beside that group."""
+    _, local, _ = two_clones
+    synchronize(local)
+
+    fired = fire_local_check(
+        local,
+        OTW_FAKE_WATCHER_EXIT=str(code),
+        # Count sync calls without faking any of them.
+        OTW_FAKE_SYNC_EXIT="99",
+        OTW_FAKE_SYNC_EXIT_ON="99",
+    )
+
+    assert fired.returncode == code
+    assert "a delivery reservation left a Git process group running" in fired.stderr
+    assert (local / "watcher-invocations").exists()
+    assert (local / "sync-calls").read_text(encoding="utf-8") == "1"  # pre-run only
+
+
 def nested_level_that_announces(tmp_path: Path) -> tuple[list[str], Path]:
     """A child playing a nested sync whose Git group survived and was recorded
     nowhere: it leaves a group of its own session running, announces it the way
@@ -1270,3 +1306,396 @@ def test_a_stop_signal_still_records_a_group_a_nested_level_announced(tmp_path):
             firing.kill()
             firing.wait()
         kill_group(survivor)
+
+
+# ---------------------------------------------------------------------------
+# OTW-28: a send needs a reservation the shared ref accepted
+# ---------------------------------------------------------------------------
+
+RACE_NOW = datetime(2026, 9, 24, 12, 0, tzinfo=TZ_PARIS)
+
+
+class WatchCfg:
+    silent_kinds: ClassVar = list(notify.DEFAULT_SILENT_KINDS)
+    telegram_token = "secret-token"
+    telegram_chat_id = "private-chat"
+    reminder_offsets_minutes: ClassVar = [1440, 120, 15]
+    cinema_name = "Pathé Odysseum"
+    cinema_city = "Montpellier"
+    film_title = "Dune : Troisième partie"
+    pathe_target_format = "imax70"
+    pathe_target_dates: ClassVar = []
+    primary_slug = "dune"
+    cinema_slug = "odysseum"
+    pathe_page_url = "https://example.invalid/event"
+    film_page_url = "https://example.invalid/film"
+    cinesa_target_dates: ClassVar = []
+
+
+def listing(key: str) -> Finding:
+    return Finding(
+        kind="NEW_LISTING",
+        key=key,
+        confidence="high",
+        title="New listing",
+        lines=["Dune : Troisième partie · Pathé Odysseum"],
+        url="https://example.invalid",
+        merge_item=key.rsplit(":", 1)[-1],
+    )
+
+
+def grouped(*keys: str) -> Alert:
+    members = [listing(key) for key in keys]
+    return Alert(members[0], list(keys), [m.kind for m in members], members)
+
+
+def watcher_pass(repo: Path, holder: str, *, now: datetime = RACE_NOW, coordinator=None):
+    """One coordinated pass on a clone, from its synchronized live file."""
+    return jobs.RunContext(
+        cfg=WatchCfg,
+        state=load_state(live_path(repo)),
+        clock=lambda: now,
+        state_path=str(live_path(repo)),
+        coordinator=coordinator or DeliveryCoordinator(repo, holder=holder),
+    )
+
+
+class RacingCoordinator(DeliveryCoordinator):
+    """Runs ``race`` after this host has read the shared tip and decided, but
+    before its push: the other host reserves, sends and publishes in between."""
+
+    def __init__(self, repo: Path, *, holder: str, race) -> None:
+        super().__init__(repo, holder=holder)
+        self.race = race
+        self.claims = 0
+
+    def reserve(self, claim):
+        def racing_claim(upstream: dict):
+            self.claims += 1
+            decided = claim(upstream)
+            if self.claims == 1:
+                self.race()
+            return decided
+
+        return super().reserve(racing_claim)
+
+
+@pytest.fixture
+def telegram(monkeypatch):
+    """Every mocked Telegram call, as (holder-visible) message text."""
+    calls: list[str] = []
+    message_ids = iter(range(700, 800))
+
+    def send(cfg, text, **kwargs):
+        calls.append(text)
+        return notify.SendResult("confirmed", next(message_ids))
+
+    monkeypatch.setattr(notify, "send_telegram", send)
+    return calls
+
+
+def sends_per_key(*repos: Path) -> dict[str, int]:
+    receipts: dict[str, dict] = {}
+    for repo in repos:
+        receipts.update(load_state(live_path(repo))["delivery_receipts"])
+    counts: dict[str, int] = {}
+    for receipt in receipts.values():
+        for key in receipt["keys"]:
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def test_racing_clones_send_each_logical_notification_once(two_clones, telegram):
+    """Both clones start from the same state and race before either receipt is
+    published, grouping the same finding differently. The cloud decides on the
+    tip it read, but the Mac's reservation lands first: the cloud's push is
+    rejected, it re-reads the tip, sees the Mac holding `b`, and sends nothing.
+    Once the Mac's receipt is published, the cloud sends only `c`."""
+    _, local, cloud = two_clones
+    synchronize(local)
+    synchronize(cloud)
+    mac = watcher_pass(local, "local:mac")
+
+    def mac_wins_the_race() -> None:
+        assert delivery.deliver_alert(mac, grouped("new_show:a", "new_show:b"), RACE_NOW)
+
+    racing = RacingCoordinator(cloud, holder="cloud:run-1", race=mac_wins_the_race)
+    runner_pass = watcher_pass(cloud, "cloud:run-1", coordinator=racing)
+    assert (
+        delivery.deliver_alert(runner_pass, grouped("new_show:b", "new_show:c"), RACE_NOW)
+        is False
+    )
+    assert racing.claims == 2  # rejected once, then declined on the new tip
+    assert len(telegram) == 1
+    assert runner_pass.state["alerts"] == {}  # the loser moved no baseline
+    state_mod.save_state(live_path(cloud), runner_pass.state)
+
+    synchronize(local)
+    synchronize(cloud)
+    later = watcher_pass(cloud, "cloud:run-2", now=RACE_NOW + timedelta(minutes=15))
+    assert delivery.recover(later, RACE_NOW + timedelta(minutes=15)) is True
+    synchronize(cloud)
+    synchronize(local)
+
+    assert len(telegram) == 2
+    assert sends_per_key(local, cloud) == {
+        "new_show:a": 1,
+        "new_show:b": 1,
+        "new_show:c": 1,
+    }
+    for repo in (local, cloud):
+        settled = load_state(live_path(repo))
+        assert settled["outbox"] == {} and settled["reservations"] == {}
+    assert load_state(live_path(local)) == load_state(live_path(cloud))
+
+
+def test_both_eligible_hosts_send_a_reminder_rung_once(two_clones, telegram):
+    _, local, cloud = two_clones
+    synchronize(local)
+    synchronize(cloud)
+    rung = {"target": (RACE_NOW + timedelta(hours=1)).isoformat(), "offset": 120}
+    mac = watcher_pass(local, "local:mac")
+    runner_pass = watcher_pass(cloud, "cloud:run-1")
+
+    assert delivery.deliver_reminder(runner_pass, rung, RACE_NOW) is True
+    assert delivery.deliver_reminder(mac, rung, RACE_NOW) is False
+    assert len(telegram) == 1
+
+
+def test_a_pass_whose_pre_run_sync_failed_reads_the_live_ref(two_clones, telegram):
+    """Mac wake: the pre-run sync failed, so its snapshot shows the rung unsent,
+    but the cloud failover already sent and published it."""
+    _, local, cloud = two_clones
+    synchronize(local)
+    synchronize(cloud)
+    rung = {"target": (RACE_NOW + timedelta(hours=1)).isoformat(), "offset": 120}
+    runner_pass = watcher_pass(cloud, "cloud:run-1")
+    assert delivery.deliver_reminder(runner_pass, rung, RACE_NOW) is True
+    synchronize(cloud)
+
+    woken = watcher_pass(local, "local:mac", now=RACE_NOW + timedelta(minutes=30))
+    assert woken.state["reminders_sent"] == {}  # stale: no pre-run sync
+    assert delivery.deliver_reminder(woken, rung, RACE_NOW + timedelta(minutes=30)) is False
+    assert len(telegram) == 1
+    state_mod.save_state(live_path(local), woken.state)
+    synchronize(local)
+    assert load_state(live_path(local))["outbox"] == {}
+
+
+def landed_then_hung_git(directory: Path) -> Path:
+    """A `git` whose push reaches the remote and then never answers."""
+    directory.mkdir(parents=True, exist_ok=True)
+    shim = directory / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "push" ]; then\n'
+        f'  "{REAL_GIT}" "$@"\n'
+        f"  sleep {HUNG_SECONDS}\n"
+        "fi\n"
+        f'exec "{REAL_GIT}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+def test_an_unanswered_reservation_push_sends_nothing_and_stays_retryable(
+    tmp_path, two_clones, telegram, monkeypatch
+):
+    """The push lands but its answer never comes: the reservation is not
+    confirmed, so nothing is sent. The post-run sync publishes this process's
+    release over the entry that did land, and the work goes out exactly once."""
+    _, local, cloud = two_clones
+    synchronize(local)
+    synchronize(cloud)
+    shim = landed_then_hung_git(tmp_path / "unanswered")
+    real_path = os.environ["PATH"]
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{real_path}")
+    bounded_waits(monkeypatch)
+
+    mac = watcher_pass(local, "local:mac")
+    started = time.monotonic()
+    assert delivery.deliver_alert(mac, grouped("new_show:a"), RACE_NOW) is False
+    assert time.monotonic() - started < PATIENCE
+    assert telegram == []
+    assert [r["status"] for r in mac.state["outbox"].values()] == ["pending"]
+    git(cloud, "fetch", "origin", DEFAULT_STATE_REF)
+    landed = json.loads(git(cloud, "show", f"FETCH_HEAD:{STATE_REF_FILE}"))
+    assert [e["status"] for e in landed["reservations"].values()] == ["held"]
+
+    # The other host cannot take it over meanwhile: that holder might have sent.
+    blocked = watcher_pass(cloud, "cloud:run-1")
+    assert delivery.deliver_alert(blocked, grouped("new_show:a"), RACE_NOW) is False
+    assert telegram == []
+
+    # Only the transport heals; `undo()` would also drop the mocked Telegram.
+    monkeypatch.setenv("PATH", real_path)
+    synchronize(local)
+    retried = watcher_pass(local, "local:mac", now=RACE_NOW + timedelta(minutes=5))
+    assert delivery.recover(retried, RACE_NOW + timedelta(minutes=5)) is True
+    assert len(telegram) == 1
+
+
+def landed_then_failed_git(directory: Path) -> Path:
+    """A `git` whose push reaches the remote, then reports a dropped connection."""
+    directory.mkdir(parents=True, exist_ok=True)
+    shim = directory / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "push" ]; then\n'
+        f'  "{REAL_GIT}" "$@" || exit $?\n'
+        '  echo "fatal: the remote end hung up unexpectedly" >&2\n'
+        "  exit 128\n"
+        "fi\n"
+        f'exec "{REAL_GIT}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+def test_a_push_that_landed_but_reported_failure_is_confirmed_not_stranded(
+    tmp_path, two_clones, telegram, monkeypatch
+):
+    """Round-1 finding: a non-zero `git push` is no proof nothing landed. The
+    retry used to meet its own held entry, decline, and leave it unreleased — so
+    work known to be unsent stayed blocked for every other holder (a fresh cloud
+    runner always is one). The retry now recognises its own entries on the tip:
+    the reservation is confirmed and the work is sent, exactly once."""
+    _, local, cloud = two_clones
+    synchronize(local)
+    synchronize(cloud)
+    shim = landed_then_failed_git(tmp_path / "hung-up")
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
+
+    runner_pass = watcher_pass(cloud, "cloud:run-1")
+    assert delivery.deliver_alert(runner_pass, grouped("new_show:a"), RACE_NOW) is True
+    assert len(telegram) == 1
+    state_mod.save_state(live_path(cloud), runner_pass.state)
+    synchronize(cloud)
+    synchronize(local)
+    assert load_state(live_path(local))["reservations"] == {}  # settled
+
+    fresh = watcher_pass(local, "cloud:run-2")
+    assert delivery.deliver_alert(fresh, grouped("new_show:a"), RACE_NOW) is False
+    assert len(telegram) == 1
+
+
+def test_an_unpublished_release_cannot_replace_the_winners_reservation(
+    tmp_path, two_clones, telegram, monkeypatch
+):
+    """Round-2 finding on real Git. The Mac's first push never lands and its
+    syncs fail, so the release it records stays local. Its next claim, built on
+    the stale tip, loses the same generation to the cloud, which sends; the
+    Mac's rejected retry releases again, locally. When the Mac finally syncs,
+    the cloud's held reservation must still be what the ref shows, so a third
+    holder cannot send before the cloud publishes its receipt."""
+    origin, local, cloud = two_clones
+    synchronize(local)
+    synchronize(cloud)
+    third = clone_of(tmp_path, origin, "third")
+
+    shim, pids = hung_git(tmp_path / "never-lands", "push")
+    real_path = os.environ["PATH"]
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{real_path}")
+    bounded_waits(monkeypatch)
+    first = watcher_pass(local, "local:mac")
+    assert delivery.deliver_alert(first, grouped("new_show:a"), RACE_NOW) is False
+    assert_tree_stopped(hung_pids(pids))
+    monkeypatch.setenv("PATH", real_path)
+    assert telegram == []
+    (stray,) = load_state(live_path(local))["reservations"].values()
+    assert (stray["status"], stray["generation"]) == ("released", 1)
+
+    def cloud_wins() -> None:
+        runner_pass = watcher_pass(cloud, "cloud:run-1")
+        assert delivery.deliver_alert(runner_pass, grouped("new_show:a"), RACE_NOW)
+        state_mod.save_state(live_path(cloud), runner_pass.state)  # not yet synced
+
+    later = RACE_NOW + timedelta(minutes=5)
+    racing = RacingCoordinator(local, holder="local:mac", race=cloud_wins)
+    second = watcher_pass(local, "local:mac", now=later, coordinator=racing)
+    assert delivery.deliver_alert(second, grouped("new_show:a"), later) is False
+    assert racing.claims == 2  # rejected, then declined on the cloud's tip
+    assert len(telegram) == 1
+    (released,) = second.state["reservations"].values()
+    assert (released["status"], released["generation"]) == ("released", 1)
+
+    synchronize(local)  # the Mac's sync finally succeeds
+    shared = json.loads(git(origin, "show", f"{DEFAULT_STATE_REF}:{STATE_REF_FILE}"))
+    (entry,) = shared["reservations"].values()
+    assert (entry["holder"], entry["status"]) == ("cloud:run-1", "held")
+
+    synchronize(third)
+    bystander = watcher_pass(third, "cloud:run-2", now=later)
+    assert delivery.deliver_alert(bystander, grouped("new_show:a"), later) is False
+    assert len(telegram) == 1
+
+    synchronize(cloud)  # the winner's receipt settles everything
+    synchronize(local)
+    assert sends_per_key(local, cloud) == {"new_show:a": 1}
+    assert load_state(live_path(local))["reservations"] == {}
+
+
+def test_a_missing_ref_during_the_pass_refuses_every_send(two_clones, telegram):
+    origin, local, _ = two_clones
+    synchronize(local)
+    mac = watcher_pass(local, "local:mac")
+    delete_state_ref(origin)
+
+    assert delivery.deliver_alert(mac, grouped("new_show:a"), RACE_NOW) is False
+    assert telegram == []
+    assert remote_state_commit(origin) is None  # a reservation never creates it
+
+
+def test_a_stale_holder_cannot_race_its_successor_on_real_git(
+    two_clones, telegram
+):
+    """The Mac wins and stalls before its `sending` save. The cloud never takes
+    over; the Mac's next pass does, after the lease; the stalled pass resumes
+    past its lease and sends nothing."""
+    _, local, cloud = two_clones
+    synchronize(local)
+    synchronize(cloud)
+    after_lease = RACE_NOW + delivery.RESERVATION_LEASE + timedelta(minutes=1)
+    stalled_now = [RACE_NOW]
+    outcome: dict[str, bool] = {}
+
+    class Stalling(DeliveryCoordinator):
+        def reserve(self, claim):
+            confirmed = super().reserve(claim)
+            runner_pass = watcher_pass(cloud, "cloud:run-1", now=after_lease)
+            outcome["cloud"] = delivery.deliver_alert(
+                runner_pass, grouped("new_show:a"), after_lease
+            )
+            successor = watcher_pass(local, "local:mac", now=after_lease)
+            outcome["successor"] = delivery.recover(successor, after_lease)
+            stalled_now[0] = after_lease
+            return confirmed
+
+    stalled = watcher_pass(
+        local, "local:mac", coordinator=Stalling(local, holder="local:mac")
+    )
+    stalled.clock = lambda: stalled_now[0]
+    assert delivery.deliver_alert(stalled, grouped("new_show:a"), RACE_NOW) is False
+    assert outcome == {"cloud": False, "successor": True}
+    assert len(telegram) == 1
+
+
+def test_coordination_survives_a_schema_upgrade_of_the_shared_ref(two_clones):
+    """Rollout: a ref written before OTW-28 (schema 4) migrates on the first
+    sync with every receipt intact, and the new field starts empty."""
+    origin, local, cloud = two_clones
+    deliver(local, HISTORIC_ALERT, "attempt-historic")
+    synchronize(local)
+    legacy = json.loads(git(origin, "show", f"{DEFAULT_STATE_REF}:{STATE_REF_FILE}"))
+    legacy["version"] = 4
+    legacy.pop("reservations")
+    push_raw_state(local, json.dumps(legacy, indent=2, sort_keys=True) + "\n")
+
+    synchronize(cloud)
+    upgraded = load_state(live_path(cloud))
+    assert upgraded["version"] == state_mod.CURRENT_STATE_VERSION
+    assert upgraded["reservations"] == {}
+    assert HISTORIC_ALERT in upgraded["alerts"]
+    assert "attempt-historic" in upgraded["delivery_receipts"]

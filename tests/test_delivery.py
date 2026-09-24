@@ -326,9 +326,13 @@ def test_merged_group_failure_then_success_acknowledges_every_key_atomically(
     assert receipt["keys"] == ["new_show:a", "new_show:b"]
 
 
-def test_overlapping_hosts_preserve_both_attempt_receipts_without_exactly_once_claim(
+def test_uncoordinated_overlapping_hosts_preserve_both_attempt_receipts(
     tmp_path, monkeypatch
 ):
+    """Without a coordinator (a dry run, or state outside the synchronized
+    store) claims stay local, exactly as OTW-20 documented: merging preserves
+    both receipts but cannot undo the duplicate. Production passes are
+    coordinated; see the OTW-28 tests below."""
     base = deepcopy(DEFAULT_STATE)
     local_path = tmp_path / "local.json"
     cloud_path = tmp_path / "cloud.json"
@@ -1196,3 +1200,600 @@ def test_unknown_sale_withdrawal_preserves_failed_open_ping(tmp_path, monkeypatc
     restarted = context(state_path, state=load_state(state_path))
     assert delivery.recover(restarted, NOW + timedelta(minutes=1)) is True
     assert calls == ["attempt", "attempt"]
+
+
+# ---------------------------------------------------------------------------
+# OTW-28: shared reservations decide which host may call Telegram
+# ---------------------------------------------------------------------------
+
+
+class SharedRef:
+    """The runtime-state ref, reduced to what arbitration needs: one shared
+    snapshot that only a compare-and-swap reservation or a sync changes."""
+
+    def __init__(self, state: dict) -> None:
+        self.state = deepcopy(state)
+
+    def sync(self, ctx: jobs.RunContext, base: dict) -> dict:
+        """The post-run sync: three-way merge, publish, adopt. Returns new base."""
+        merged = merge_states(base, self.state, ctx.state, now=NOW)
+        self.state = deepcopy(merged)
+        ctx.state.clear()
+        ctx.state.update(deepcopy(merged))
+        save_state(ctx.state_path, ctx.state)
+        return deepcopy(merged)
+
+
+class RefCoordinator:
+    """A `state_sync.DeliveryCoordinator` over a `SharedRef`.
+
+    ``fail`` is raised instead of an answer; with ``landed`` the entries reach
+    the ref first — a push whose acknowledgement was lost.
+    """
+
+    blocked_exit = None
+
+    def __init__(
+        self, ref, holder, *, fail=None, landed=False, before_claim=None,
+        after_confirm=None,
+    ):
+        self.ref = ref
+        self.holder = holder
+        self.fail = fail
+        self.landed = landed
+        self.before_claim = before_claim
+        self.after_confirm = after_confirm
+        self.claims = 0
+
+    def reserve(self, claim):
+        if self.before_claim is not None and self.claims == 0:
+            self.before_claim()
+        self.claims += 1
+        entries = claim(deepcopy(self.ref.state))
+        if entries is None:
+            return False
+        if self.fail is not None:
+            if self.landed:
+                self.ref.state["reservations"].update(deepcopy(entries))
+            raise self.fail
+        self.ref.state["reservations"].update(deepcopy(entries))
+        if self.after_confirm is not None:
+            self.after_confirm()
+        return True
+
+
+class Clock:
+    def __init__(self, now: datetime = NOW) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def host(path, ref, holder, *, clock=None, writer=None, **coordinator):
+    """One host's pass, starting from the shared snapshot (its pre-run sync)."""
+    ctx = context(path, state=deepcopy(ref.state), writer=writer)
+    ctx.coordinator = RefCoordinator(ref, holder, **coordinator)
+    if clock is not None:
+        ctx.clock = clock
+    return ctx
+
+
+def recording_sender(monkeypatch, calls, status="confirmed"):
+    message_ids = iter(range(500, 600))
+
+    def send(cfg, text, **kwargs):
+        calls.append(text)
+        return notify.SendResult(status, next(message_ids))
+
+    monkeypatch.setattr(notify, "send_telegram", send)
+
+
+def receipts_per_key(*states: dict) -> dict[str, int]:
+    """Telegram calls per logical key, read from every host's receipts."""
+    seen: dict[str, dict] = {}
+    for state in states:
+        seen.update(state["delivery_receipts"])
+    counts: dict[str, int] = {}
+    for receipt in seen.values():
+        for key in receipt["keys"]:
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def test_the_losing_host_does_not_send_and_its_work_stays_pending(
+    tmp_path, monkeypatch
+):
+    ref = SharedRef(DEFAULT_STATE)
+    local = host(tmp_path / "local.json", ref, "local:mac")
+    cloud = host(tmp_path / "cloud.json", ref, "cloud:run-1")
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls)
+
+    assert delivery.deliver_alert(local, alert(finding()), NOW) is True
+    assert delivery.deliver_alert(cloud, alert(finding()), NOW) is False
+
+    assert len(calls) == 1
+    record = next(iter(cloud.state["outbox"].values()))
+    assert record["status"] == "pending"
+    assert cloud.state["alerts"] == {}  # no baseline moved on the loser
+    assert load_state(tmp_path / "cloud.json")["outbox"] == cloud.state["outbox"]
+
+
+def test_differently_grouped_findings_still_send_each_key_once(tmp_path, monkeypatch):
+    """The Mac groups {a, b}; the cloud, from the same snapshot, {b, c}. The
+    arbitration is per member key, so b cannot go out twice, and c still goes
+    out once the Mac's receipt shows b was covered."""
+    ref = SharedRef(DEFAULT_STATE)
+    base = deepcopy(ref.state)
+    local = host(tmp_path / "local.json", ref, "local:mac")
+    cloud = host(tmp_path / "cloud.json", ref, "cloud:run-1")
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls)
+    a, b, c = finding("new_show:a"), finding("new_show:b"), finding("new_show:c")
+
+    assert delivery.deliver_alert(local, alert(a, b), NOW) is True
+    assert delivery.deliver_alert(cloud, alert(b, c), NOW) is False
+    assert len(calls) == 1
+
+    ref.sync(local, base)
+    cloud_base = deepcopy(base)
+    cloud_base = ref.sync(cloud, cloud_base)
+    later = host(tmp_path / "cloud.json", ref, "cloud:run-2")
+    assert delivery.recover(later, NOW + timedelta(minutes=15)) is True
+
+    assert len(calls) == 2
+    assert receipts_per_key(local.state, later.state) == {
+        "new_show:a": 1,
+        "new_show:b": 1,
+        "new_show:c": 1,
+    }
+
+
+def test_reminder_failover_with_both_hosts_eligible_sends_the_rung_once(
+    tmp_path, monkeypatch
+):
+    ref = SharedRef(DEFAULT_STATE)
+    target = (NOW + timedelta(hours=1)).isoformat()
+    rung = {"target": target, "offset": 120}
+    cloud = host(tmp_path / "cloud.json", ref, "cloud:run-1")
+    local = host(tmp_path / "local.json", ref, "local:mac")
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls)
+
+    assert delivery.deliver_reminder(cloud, rung, NOW) is True
+    assert delivery.deliver_reminder(local, rung, NOW) is False
+    assert len(calls) == 1
+    assert local.state["reminders_sent"] == {}
+
+
+def test_a_blocked_unit_does_not_hold_up_independent_work(tmp_path, monkeypatch):
+    """Cloud news keeps flowing while the Mac holds a different reservation."""
+    ref = SharedRef(DEFAULT_STATE)
+    local = host(tmp_path / "local.json", ref, "local:mac")
+    cloud = host(tmp_path / "cloud.json", ref, "cloud:run-1")
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls)
+    news = finding("news:leak-1", kind="NEWS_LEAD", title="Press lead")
+
+    assert delivery.deliver_alert(local, alert(finding()), NOW) is True
+    assert delivery.deliver_alert(cloud, alert(finding()), NOW) is False
+    assert delivery.deliver_alert(cloud, alert(news), NOW) is True
+    assert len(calls) == 2
+    assert "news:leak-1" in cloud.state["alerts"]
+
+
+def test_work_published_elsewhere_is_not_resent_after_a_failed_pre_run_sync(
+    tmp_path, monkeypatch
+):
+    """The Mac wakes, its pre-run sync fails, and it still holds a snapshot in
+    which the rung looks unsent. The reservation reads the live ref, which
+    already carries the cloud's receipt."""
+    ref = SharedRef(DEFAULT_STATE)
+    stale = deepcopy(ref.state)
+    base = deepcopy(ref.state)
+    target = (NOW + timedelta(hours=1)).isoformat()
+    rung = {"target": target, "offset": 120}
+    cloud = host(tmp_path / "cloud.json", ref, "cloud:run-1")
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls)
+    assert delivery.deliver_reminder(cloud, rung, NOW) is True
+    ref.sync(cloud, base)
+
+    woken = context(tmp_path / "local.json", state=stale)
+    woken.coordinator = RefCoordinator(ref, "local:mac")
+    assert delivery.deliver_reminder(woken, rung, NOW + timedelta(minutes=30)) is False
+    assert len(calls) == 1
+    assert next(iter(woken.state["outbox"].values()))["status"] == "pending"
+
+
+def test_an_unconfirmed_reservation_does_not_send_and_releases_its_token(
+    tmp_path, monkeypatch
+):
+    """A push that timed out may or may not have landed. Nothing is sent, the
+    work stays pending, and the release this process publishes outranks the
+    held entry if the push did land — so the work is not stranded."""
+    from watcher.state_sync import StateSyncTransportError
+
+    ref = SharedRef(DEFAULT_STATE)
+    base = deepcopy(ref.state)
+    fail = StateSyncTransportError("git push did not answer within 45s")
+    local = host(tmp_path / "local.json", ref, "local:mac", fail=fail, landed=True)
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls)
+
+    assert delivery.deliver_alert(local, alert(finding()), NOW) is False
+    assert calls == []
+    assert next(iter(local.state["outbox"].values()))["status"] == "pending"
+    (held,) = ref.state["reservations"].values()
+    assert held["status"] == "held"
+    assert [e["status"] for e in local.state["reservations"].values()] == ["released"]
+
+    ref.sync(local, base)
+    assert [e["status"] for e in ref.state["reservations"].values()] == ["released"]
+    cloud = host(tmp_path / "cloud.json", ref, "cloud:run-1")
+    assert delivery.recover(cloud, NOW + timedelta(minutes=15)) is True
+    assert len(calls) == 1
+    (retaken,) = ref.state["reservations"].values()
+    assert retaken["generation"] == 2 and retaken["holder"] == "cloud:run-1"
+
+
+def test_a_refused_or_absent_ref_never_permits_a_send(tmp_path, monkeypatch):
+    from watcher.state_sync import StateSyncError, StateSyncRefAbsentError
+
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls)
+    for index, fail in enumerate(
+        (
+            StateSyncRefAbsentError("shared state ref is missing", established=True),
+            StateSyncError("shared state is incompatible or invalid"),
+            OSError("disk full"),
+        )
+    ):
+        ref = SharedRef(DEFAULT_STATE)
+        ctx = host(tmp_path / f"state-{index}.json", ref, "local:mac", fail=fail)
+        assert delivery.deliver_alert(ctx, alert(finding()), NOW) is False
+        assert next(iter(ctx.state["outbox"].values()))["status"] == "pending"
+    assert calls == []
+
+
+def test_a_definite_failure_releases_the_reservation_for_either_host(
+    tmp_path, monkeypatch
+):
+    ref = SharedRef(DEFAULT_STATE)
+    base = deepcopy(ref.state)
+    local = host(tmp_path / "local.json", ref, "local:mac")
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls, status="failed")
+    assert delivery.deliver_alert(local, alert(finding()), NOW) is False
+    assert [e["status"] for e in local.state["reservations"].values()] == ["released"]
+    ref.sync(local, base)
+
+    recording_sender(monkeypatch, calls)
+    cloud = host(tmp_path / "cloud.json", ref, "cloud:run-1")
+    assert delivery.recover(cloud, NOW + timedelta(minutes=15)) is True
+    assert len(calls) == 2  # the refused attempt, then exactly one delivery
+    assert "new_show:dune-imax" in cloud.state["alerts"]
+
+
+@pytest.mark.parametrize("outcome", ["uncertain", "crash", "receipt-write"])
+def test_an_ambiguous_attempt_is_quarantined_on_every_host(
+    tmp_path, monkeypatch, outcome
+):
+    ref = SharedRef(DEFAULT_STATE)
+    base = deepcopy(ref.state)
+    calls: list[str] = []
+    writes = 0
+
+    def fail_receipt_write(path, state):
+        nonlocal writes
+        writes += 1
+        if outcome == "receipt-write" and not state["outbox"] and state["alerts"]:
+            raise OSError("disk full after Telegram confirmation")
+        save_state(path, state)
+
+    local = host(tmp_path / "local.json", ref, "local:mac", writer=fail_receipt_write)
+    if outcome == "crash":
+
+        def crash(cfg, text, **kwargs):
+            calls.append(text)
+            raise RuntimeError("connection reset mid-request")
+
+        monkeypatch.setattr(notify, "send_telegram", crash)
+    else:
+        recording_sender(
+            monkeypatch, calls, "uncertain" if outcome == "uncertain" else "confirmed"
+        )
+
+    with pytest.raises(Exception) if outcome != "uncertain" else _nothing():
+        delivery.deliver_alert(local, alert(finding()), NOW)
+    assert len(calls) == 1
+    durable = load_state(tmp_path / "local.json")
+    assert [r["status"] for r in durable["outbox"].values()] == ["uncertain"]
+    assert [e["status"] for e in durable["reservations"].values()] == ["uncertain"]
+
+    local.state.clear()
+    local.state.update(durable)
+    ref.sync(local, base)
+    recording_sender(monkeypatch, calls)
+    later = NOW + timedelta(days=2)
+    for name, holder in (("cloud", "cloud:run-1"), ("local-next", "local:mac")):
+        again = host(tmp_path / f"{name}.json", ref, holder, clock=Clock(later))
+        delivery.deliver_alert(again, alert(finding()), later)
+        delivery.recover(again, later)
+    assert len(calls) == 1
+
+
+class _nothing:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_a_lease_spent_before_the_send_began_sends_nothing(tmp_path, monkeypatch):
+    """A laptop that slept between winning the reservation and calling Telegram
+    wakes to a spent lease: it does not send late, keeps the work pending and
+    releases the reservation for the next attempt."""
+    ref = SharedRef(DEFAULT_STATE)
+    clock = Clock()
+
+    def sleep_through_the_lease(path, state):
+        save_state(path, state)
+        if any(r["status"] == "sending" for r in state["outbox"].values()):
+            clock.now = NOW + delivery.RESERVATION_LEASE
+
+    local = host(
+        tmp_path / "local.json", ref, "local:mac", clock=clock,
+        writer=sleep_through_the_lease,
+    )
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls)
+
+    assert delivery.deliver_alert(local, alert(finding()), NOW) is False
+    assert calls == []
+    durable = load_state(tmp_path / "local.json")
+    assert [r["status"] for r in durable["outbox"].values()] == ["pending"]
+    assert [e["status"] for e in durable["reservations"].values()] == ["released"]
+
+
+def test_a_stale_holder_cannot_race_the_store_that_took_over(tmp_path, monkeypatch):
+    """The Mac wins a reservation and stalls before its `sending` save. The
+    cloud, seeing the lease expire, still does not take over: that holder may
+    have sent. The Mac's own next pass may, once the lease is over, because its
+    live file shows the earlier pass never reached Telegram. The stalled pass
+    then resumes past its lease and sends nothing: one message in total."""
+    ref = SharedRef(DEFAULT_STATE)
+    stalled_clock = Clock()
+    after_lease = NOW + delivery.RESERVATION_LEASE + timedelta(minutes=1)
+    calls: list[str] = []
+    others: dict[str, bool] = {}
+    state_path = tmp_path / "local.json"
+
+    def meanwhile():
+        cloud = host(tmp_path / "cloud.json", ref, "cloud:run-1", clock=Clock(after_lease))
+        others["cloud"] = delivery.deliver_alert(cloud, alert(finding()), after_lease)
+        # The store's next pass reads the live file the stalled one left.
+        successor = context(state_path, state=load_state(state_path))
+        successor.coordinator = RefCoordinator(ref, "local:mac")
+        successor.clock = Clock(after_lease)
+        others["successor"] = delivery.recover(successor, after_lease)
+        stalled_clock.now = after_lease
+
+    stalled = host(
+        state_path, ref, "local:mac", clock=stalled_clock, after_confirm=meanwhile
+    )
+    recording_sender(monkeypatch, calls)
+
+    assert delivery.deliver_alert(stalled, alert(finding()), NOW) is False
+    assert others == {"cloud": False, "successor": True}
+    assert len(calls) == 1
+    (entry,) = ref.state["reservations"].values()
+    assert entry["generation"] == 2 and entry["holder"] == "local:mac"
+    # The stale pass rolled back to pending and released its own token only.
+    (mine,) = stalled.state["reservations"].values()
+    assert mine["status"] == "released" and mine["generation"] == 1
+
+
+def test_a_crashed_holder_blocks_other_hosts_until_its_store_takes_over(
+    tmp_path, monkeypatch
+):
+    """A process that dies after its reservation landed, before persisting
+    `sending`, never called Telegram — but only its own store can prove that."""
+    ref = SharedRef(DEFAULT_STATE)
+
+    def die_before_sending(path, state):
+        if any(r["status"] == "sending" for r in state["outbox"].values()):
+            raise SystemExit("killed by the overall deadline")
+        save_state(path, state)
+
+    dying = host(tmp_path / "local.json", ref, "local:mac", writer=die_before_sending)
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls)
+    with pytest.raises(SystemExit):
+        delivery.deliver_alert(dying, alert(finding()), NOW)
+    assert calls == []
+    durable = load_state(tmp_path / "local.json")
+    assert [r["status"] for r in durable["outbox"].values()] == ["pending"]
+
+    for when, holder in (
+        (NOW + timedelta(minutes=5), "local:mac"),  # lease still running
+        (NOW + timedelta(hours=3), "cloud:run-2"),  # any lease, another host
+        (NOW - timedelta(hours=3), "cloud:run-3"),  # a clock skewed either way
+    ):
+        other = context(tmp_path / "other.json", state=deepcopy(durable))
+        other.coordinator = RefCoordinator(ref, holder)
+        other.clock = Clock(when)
+        assert delivery.recover(other, when) is False
+    assert calls == []
+
+    later = NOW + delivery.RESERVATION_LEASE
+    successor = context(tmp_path / "local.json", state=deepcopy(durable))
+    successor.coordinator = RefCoordinator(ref, "local:mac")
+    successor.clock = Clock(later)
+    assert delivery.recover(successor, later) is True
+    assert len(calls) == 1
+
+
+def test_a_store_never_takes_over_an_attempt_that_may_have_sent(tmp_path, monkeypatch):
+    """Killed mid-request: the ref still says `held` (the post-run sync never
+    ran), and a regrouped finding has since retired the uncertain record. The
+    reservation this store saved with `sending` still quarantines the key."""
+    ref = SharedRef(DEFAULT_STATE)
+    local = host(tmp_path / "local.json", ref, "local:mac")
+    calls: list[str] = []
+
+    def crash(cfg, text, **kwargs):
+        calls.append(text)
+        raise RuntimeError("process killed mid-request")
+
+    monkeypatch.setattr(notify, "send_telegram", crash)
+    with pytest.raises(RuntimeError):
+        delivery.deliver_alert(local, alert(finding()), NOW)
+    durable = load_state(tmp_path / "local.json")
+    assert [e["status"] for e in ref.state["reservations"].values()] == ["held"]
+    assert [e["status"] for e in durable["reservations"].values()] == ["uncertain"]
+    durable["outbox"] = {}
+
+    recording_sender(monkeypatch, calls)
+    later = NOW + timedelta(hours=1)
+    successor = context(tmp_path / "local.json", state=durable)
+    successor.coordinator = RefCoordinator(ref, "local:mac")
+    successor.clock = Clock(later)
+    regrouped = alert(finding(), finding("new_show:dune-imax-sibling"))
+    assert delivery.deliver_alert(successor, regrouped, later) is False
+    assert len(calls) == 1
+
+
+def test_a_reservation_git_child_that_survives_stops_every_later_reservation(
+    tmp_path, monkeypatch
+):
+    from watcher.state_sync import StateSyncCleanupError
+
+    ref = SharedRef(DEFAULT_STATE)
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls)
+    ctx = host(tmp_path / "local.json", ref, "local:mac")
+
+    class Surviving(RefCoordinator):
+        def reserve(self, claim):
+            if self.blocked_exit is not None:
+                raise delivery.state_sync.StateSyncError("blocked")
+            claim(deepcopy(self.ref.state))
+            self.blocked_exit = delivery.state_sync.UNCONFIRMED_TREE_EXIT
+            raise StateSyncCleanupError("group 4242 survived", pgid=4242)
+
+    ctx.coordinator = Surviving(ref, "local:mac")
+    assert delivery.deliver_alert(ctx, alert(finding("new_show:a")), NOW) is False
+    assert delivery.deliver_alert(ctx, alert(finding("new_show:b")), NOW) is False
+    assert calls == []
+    assert runner.execute(ctx, str(tmp_path / "local.json")) == (
+        delivery.state_sync.UNCONFIRMED_TREE_EXIT
+    )
+
+
+def test_settled_and_long_expired_reservations_are_pruned(tmp_path, monkeypatch):
+    ref = SharedRef(DEFAULT_STATE)
+    local = host(tmp_path / "local.json", ref, "local:mac")
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls, status="failed")
+    news = finding("news:leak-1", kind="NEWS_LEAD", title="Press lead")
+    delivery.deliver_alert(local, alert(news), NOW)
+    assert [e["status"] for e in local.state["reservations"].values()] == ["released"]
+
+    retained = NOW + timedelta(days=7, minutes=30)
+    delivery.recover(local, retained - timedelta(days=1))
+    assert local.state["reservations"]  # still inside the retention window
+    delivery.recover(local, retained + timedelta(days=7))
+    assert local.state["reservations"] == {}
+
+
+def test_a_decline_after_an_earlier_push_of_the_token_releases_it(
+    tmp_path, monkeypatch
+):
+    """Defence in depth for the same round-1 finding: whenever a reservation
+    ends unconfirmed after this token was pushed at least once, the process
+    publishes that it will not send under it, so the entry cannot strand the
+    work for other holders."""
+    ref = SharedRef(DEFAULT_STATE)
+    base = deepcopy(ref.state)
+
+    class LandsThenDeclines(RefCoordinator):
+        def reserve(self, claim):
+            entries = claim(deepcopy(self.ref.state))
+            self.ref.state["reservations"].update(deepcopy(entries))  # landed
+            # A later attempt that declines (here: the tip changed under it).
+            self.ref.state["alerts"]["new_show:dune-imax"] = NOW.isoformat()
+            assert claim(deepcopy(self.ref.state)) is None
+            self.ref.state["alerts"].clear()
+            return False
+
+    local = host(tmp_path / "local.json", ref, "local:mac")
+    local.coordinator = LandsThenDeclines(ref, "local:mac")
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls)
+
+    assert delivery.deliver_alert(local, alert(finding()), NOW) is False
+    assert calls == []
+    assert [e["status"] for e in load_state(tmp_path / "local.json")[
+        "reservations"
+    ].values()] == ["released"]
+    ref.sync(local, base)
+    cloud = host(tmp_path / "cloud.json", ref, "cloud:run-9")
+    assert delivery.recover(cloud, NOW + timedelta(minutes=5)) is True
+    assert len(calls) == 1
+
+
+def test_an_unpublished_release_never_outranks_the_winners_reservation(
+    tmp_path, monkeypatch
+):
+    """Round-2 finding. The Mac's first claim is never accepted and its syncs
+    fail, so the release it records stays local. Its next claim is built on an
+    empty tip, the cloud wins that same generation and sends, and the Mac's
+    push is rejected: it releases again, locally. Neither release may number a
+    new generation nor replace the cloud's held entry when the Mac syncs, or a
+    third holder could send before the cloud publishes its receipt."""
+    from watcher.state_sync import StateSyncTransportError
+
+    ref = SharedRef(DEFAULT_STATE)
+    base = deepcopy(ref.state)
+    calls: list[str] = []
+    recording_sender(monkeypatch, calls)
+
+    mac = host(
+        tmp_path / "local.json", ref, "local:mac",
+        fail=StateSyncTransportError("push rejected: connection reset"),
+    )
+    assert delivery.deliver_alert(mac, alert(finding()), NOW) is False
+    assert ref.state["reservations"] == {}
+    (stray,) = mac.state["reservations"].values()
+    assert stray["status"] == "released" and stray["generation"] == 1
+
+    pushed: list[dict] = []
+
+    class LosesTheRace(RefCoordinator):
+        def reserve(self, claim):
+            entries = claim(deepcopy(self.ref.state))  # built on the empty tip
+            pushed.append(entries)
+            cloud = host(tmp_path / "cloud.json", self.ref, "cloud:run-1")
+            assert delivery.deliver_alert(cloud, alert(finding()), NOW) is True
+            # The compare-and-swap rejects the Mac's push; the retry declines.
+            assert claim(deepcopy(self.ref.state)) is None
+            return False
+
+    later = NOW + timedelta(minutes=5)
+    mac.delivery_attempts.clear()
+    mac.coordinator = LosesTheRace(ref, "local:mac")
+    mac.clock = Clock(later)
+    assert delivery.recover(mac, later) is False
+    assert [e["generation"] for e in pushed[0].values()] == [1]
+    assert len(calls) == 1
+
+    ref.sync(mac, base)
+    (shared,) = ref.state["reservations"].values()
+    assert (shared["holder"], shared["status"]) == ("cloud:run-1", "held")
+    third = host(tmp_path / "third.json", ref, "cloud:run-2", clock=Clock(later))
+    assert delivery.recover(third, later) is False
+    assert delivery.deliver_alert(third, alert(finding()), later) is False
+    assert len(calls) == 1

@@ -21,7 +21,10 @@ log = logging.getLogger(__name__)
 # on every firing (see update_from_cinesa).
 IMAX_ABSENT_CONFIRM = 2
 OPEN_PING_VALIDITY = timedelta(hours=6)
-CURRENT_STATE_VERSION = 4
+CURRENT_STATE_VERSION = 5
+# Values a delivery reservation's status may take (OTW-28). Only the process
+# holding a reservation moves it from "held"; see watcher/delivery.py.
+RESERVATION_STATUSES = ("held", "released", "uncertain")
 
 DEFAULT_STATE: dict = {
     "version": CURRENT_STATE_VERSION,
@@ -34,6 +37,9 @@ DEFAULT_STATE: dict = {
     # chat ids and raw API responses never belong in either collection.
     "outbox": {},
     "delivery_receipts": {},
+    # Shared permission to send (OTW-28): logical delivery id -> the one
+    # reservation that may call Telegram for it. Arbitrated on the shared ref.
+    "reservations": {},
     # Current observed opening used by the reminder ladder.  Unlike `sales`,
     # this is not a delivery acknowledgement baseline.
     "sale_target": None,
@@ -80,7 +86,7 @@ _CORE_FIELDS = {
     "last_check_ok",
     "last_heartbeat",
 }
-_CURRENT_ONLY_FIELDS = {"last_catalogue_ok", "outbox", "delivery_receipts"}
+_CURRENT_ONLY_FIELDS = {"last_catalogue_ok", "outbox", "delivery_receipts", "reservations"}
 _TOP_LEVEL_FIELDS = _CORE_FIELDS | _CURRENT_ONLY_FIELDS | {
     "version",
     "last_error",
@@ -311,6 +317,37 @@ def _validate_delivery_receipts(value: Any) -> None:
             )
 
 
+def _validate_reservations(value: Any) -> None:
+    reservations = _require_mapping(value, "reservations")
+    allowed = {
+        "token", "holder", "generation", "status", "reserved_at",
+        "lease_expires_at", "delivery_id", "ack", "force", "expires_at",
+    }
+    for logical_id, entry_value in reservations.items():
+        _require_string(logical_id, "reservations key")
+        field = f"reservations[{logical_id!r}]"
+        entry = _require_mapping(entry_value, field)
+        unknown = set(entry) - allowed
+        missing = (allowed - {"expires_at"}) - set(entry)
+        if unknown or missing:
+            raise StateError(f"{field}: invalid fields")
+        for name in ("token", "holder", "delivery_id"):
+            if not _require_string(entry[name], f"{field}.{name}"):
+                raise StateError(f"{field}.{name}: expected a non-empty string")
+        generation = entry["generation"]
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            _fail(f"{field}.generation", "positive integer", generation)
+        status = _require_string(entry["status"], f"{field}.status")
+        if status not in RESERVATION_STATUSES:
+            raise StateError(f"{field}.status: invalid value {status!r}")
+        _parse_timestamp(entry["reserved_at"], f"{field}.reserved_at")
+        _parse_timestamp(entry["lease_expires_at"], f"{field}.lease_expires_at")
+        if "expires_at" in entry:
+            _parse_timestamp(entry["expires_at"], f"{field}.expires_at")
+        _require_bool(entry["force"], f"{field}.force")
+        _validate_ack(entry["ack"], f"{field}.ack")
+
+
 def _validate_cinesa(value: Any, *, require_all: bool) -> None:
     cin = _require_mapping(value, "cinesa")
     unknown = set(cin) - _CINESA_FIELDS
@@ -360,6 +397,8 @@ def _validate_fields(state: dict, *, require_all: bool) -> None:
         _validate_outbox(state["outbox"])
     if "delivery_receipts" in state:
         _validate_delivery_receipts(state["delivery_receipts"])
+    if "reservations" in state:
+        _validate_reservations(state["reservations"])
     _parse_optional_timestamp(state["sale_target"], "sale_target")
     _require_bool(state["tickets_available"], "tickets_available")
     _require_nonnegative_int(state["failure_streak"], "failure_streak")
@@ -406,11 +445,21 @@ def _migrate_v3_to_v4(state: dict) -> dict:
     return migrated
 
 
+def _migrate_v4_to_v5(state: dict) -> dict:
+    # No reservation predates OTW-28: every earlier send was already arbitrated
+    # (or not) and is recorded by its receipt, which this leaves untouched.
+    migrated = deepcopy(state)
+    migrated.setdefault("reservations", {})
+    migrated["version"] = 5
+    return migrated
+
+
 _MIGRATIONS = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
+    4: _migrate_v4_to_v5,
 }
 
 

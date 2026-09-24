@@ -301,6 +301,13 @@ def execute(ctx: RunContext, state_path: str) -> int:
         # reports its own diagnostic and is recorded here.
         failed.append("state-save")
 
+    blocked_exit = getattr(ctx.coordinator, "blocked_exit", None)
+    if blocked_exit is not None:
+        # A reservation's Git child outlived every attempt to stop it. It is
+        # recorded (or could not be), and the wrappers stop on this status
+        # instead of starting the post-run sync beside it (OTW-29, OTW-28).
+        log.error("a delivery reservation left a Git process group running")
+        return blocked_exit
     if failed:
         log.error("run completed with failed job(s): %s", ", ".join(sorted(set(failed))))
         return 1

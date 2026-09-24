@@ -25,8 +25,9 @@ import argparse
 import logging
 import sys
 from datetime import datetime
+from pathlib import Path
 
-from . import __version__, notify, runner
+from . import __version__, notify, runner, state_sync
 from . import state as state_mod
 from .alerts import (  # noqa: F401  (re-exported: the alert builders' public home)
     blind_since,
@@ -108,6 +109,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def delivery_coordinator(state_path: str, *, dry_run: bool):
+    """The shared-reservation handle, when this pass delivers from shared state.
+
+    Both wrappers run from the repository root against the synchronized store's
+    live file, and every send there must first win a reservation on the shared
+    ref (OTW-28). A dry run sends nothing; any other state file is not shared.
+    """
+    if dry_run:
+        return None
+    repo = Path.cwd()
+    live = repo / state_sync.DEFAULT_STORE_PATH / state_sync.STATE_REF_FILE
+    if Path(state_path).resolve() != live.resolve():
+        log.info("state %s is not the synchronized store: delivery is not coordinated", state_path)
+        return None
+    return state_sync.DeliveryCoordinator(repo)
+
+
 def run(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -167,6 +185,7 @@ def run(argv: list[str] | None = None) -> int:
         adaptive_cadence=args.adaptive_cadence,
         skip_if_checked_within=args.skip_if_checked_within,
         reminder_grace_minutes=args.reminder_grace_minutes,
+        coordinator=delivery_coordinator(state_path, dry_run=args.dry_run),
     )
     return runner.execute(ctx, state_path)
 

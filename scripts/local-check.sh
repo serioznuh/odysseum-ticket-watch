@@ -121,9 +121,19 @@ fi
 # Decides whether a Pathé + news check is due. The reminder ladder and Cinesa
 # half still run on every firing. Capture failure so a delivered reminder's
 # newly saved receipt is synchronized even when a later job failed.
+#
+# Every send in it first wins a reservation on the shared state ref (OTW-28), a
+# bounded Git push like the syncs'. Should one of those leave a Git process group
+# it could not stop, the watcher exits with the same status a sync would, and
+# this firing stops here rather than start the post-run sync beside it.
 .venv/bin/python -m watcher \
   --state .cache/state-sync/state.json \
   --mode check --adaptive-cadence || status=$?
+if surviving_group "$status"; then
+  echo "ERROR: a delivery reservation left a Git process group running; stopping" \
+       "this firing before the post-run sync runs beside it" >&2
+  exit "$status"
+fi
 
 # Pull/merge/push ALWAYS after the watcher. This retries a prior rejected push
 # and preserves every local receipt before reporting the final run status.

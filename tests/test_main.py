@@ -320,7 +320,7 @@ def test_dry_run_migrates_only_in_memory_and_leaves_state_bytes_unchanged(tmp_pa
     assert result == 0
     assert state.read_bytes() == before
     assert json.loads(state.read_text())["version"] == 1
-    assert CURRENT_STATE_VERSION == 4
+    assert CURRENT_STATE_VERSION == 5
 
 
 class PatheCheckRunner:
@@ -1904,3 +1904,24 @@ def test_a_crash_in_analysis_cannot_bank_a_recovery_it_threw_away(
     assert recovered["error_alerted"] is False
     assert "last_error" not in recovered
     assert recovered["last_check_ok"] != "2026-07-18T07:11:00+02:00"
+
+
+def test_only_real_passes_on_the_synchronized_store_are_coordinated(
+    tmp_path, monkeypatch
+):
+    """OTW-28: both wrappers deliver from the store's live file, so every send
+    there must win a shared reservation; a dry run sends nothing, and a state
+    file outside the store has no shared ref to arbitrate on."""
+    from watcher import state_sync
+
+    monkeypatch.chdir(tmp_path)
+    live = tmp_path / state_sync.DEFAULT_STORE_PATH / state_sync.STATE_REF_FILE
+
+    coordinator = cli.delivery_coordinator(str(live), dry_run=False)
+    assert isinstance(coordinator, state_sync.DeliveryCoordinator)
+    assert coordinator.holder.startswith("local:")
+    assert cli.delivery_coordinator(
+        ".cache/state-sync/state.json", dry_run=False
+    ) is not None
+    assert cli.delivery_coordinator(str(live), dry_run=True) is None
+    assert cli.delivery_coordinator(str(tmp_path / "state.json"), dry_run=False) is None

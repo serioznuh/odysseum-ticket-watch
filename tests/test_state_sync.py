@@ -469,11 +469,15 @@ def test_local_check_bounds_the_deployment_pull_and_the_whole_firing():
     stops = [
         index for index, line in enumerate(lines) if line.startswith(("if surviving_group", "  if surviving_group"))
     ]
-    assert len(stops) == 3, "deployment, pre-run sync and post-run sync each stop on it"
+    assert len(stops) == 4, (
+        "deployment, pre-run sync, the watcher's reservations (OTW-28) and the "
+        "post-run sync each stop on it"
+    )
+    watcher = line_of("--mode check --adaptive-cadence")
     post_sync = line_of("sync_state || sync_status")
-    assert stops[0] < pre_sync and stops[1] < post_sync
+    assert stops[0] < pre_sync < stops[1] < watcher < stops[2] < post_sync
     # …and the post-run check comes before the folding that could mask it.
-    assert stops[2] < line_of('"$status" -eq 0')
+    assert post_sync < stops[3] < line_of('"$status" -eq 0')
 
 
 def test_termination_stays_forwarded_while_the_tree_is_cleaned_up():
@@ -848,6 +852,19 @@ def test_both_wrappers_block_on_every_blocking_exit_code():
                 : section.index("run:")
             ], f"{gated} must be skipped on exit {code}"
 
+    # OTW-28: the watcher's reservations are bounded Git pushes too, so a
+    # surviving group reported by the pass itself also keeps the post-run sync
+    # from starting beside it.
+    watcher_step = workflow[workflow.index("- name: Run watcher") :]
+    watcher_step = watcher_step[: watcher_step.index("- name:", 1)]
+    assert "id: watch" in watcher_step
+    assert 'echo "code=$code" >> "$GITHUB_OUTPUT"' in watcher_step
+    post_sync = workflow[workflow.index("Synchronize runtime state (after)") :]
+    for code in (state_sync.UNCONFIRMED_TREE_EXIT, state_sync.UNGUARDED_TREE_EXIT):
+        assert f"steps.watch.outputs.code != '{code}'" in post_sync[
+            : post_sync.index("run:")
+        ]
+
 
 def test_the_lock_file_carries_the_record_when_the_marker_cannot_be_written(
     tmp_path, monkeypatch
@@ -1163,3 +1180,111 @@ def test_a_real_unreaped_child_is_not_a_survivor():
         assert state_sync._signal_group(child.pid, 0) is False
     finally:
         child.wait()
+
+
+# ---------------------------------------------------------------------------
+# OTW-28: recovery and the store's reservation-holder id
+# ---------------------------------------------------------------------------
+
+
+def held_reservation(token: str, status: str = "held") -> dict:
+    return {
+        "token": token,
+        "holder": "cloud:run-1",
+        "generation": 1,
+        "status": status,
+        "reserved_at": NOW.isoformat(),
+        "lease_expires_at": NOW.isoformat(),
+        "delivery_id": IN_FLIGHT_ID,
+        "ack": {"type": "alerts", "keys": ["news:leak-42"]},
+        "force": False,
+    }
+
+
+def test_recovery_keeps_every_live_reservation_a_store_holds():
+    """Stores share no base, so a store that lacks a reservation is no proof it
+    was released: dropping it would let another host claim work its first holder
+    may already have sent. The most advanced word of one holder still wins."""
+    ref_copy = deepcopy(DEFAULT_STATE)
+    ref_copy["reservations"][IN_FLIGHT_ID] = held_reservation("t1")
+    ref_copy["reservations"]["telegram:other"] = held_reservation("t2")
+    mac = deepcopy(DEFAULT_STATE)
+    mac["reservations"]["telegram:other"] = held_reservation("t2", "uncertain")
+
+    merged = state_sync.reconcile_stores([ref_copy, mac])
+
+    assert merged["reservations"][IN_FLIGHT_ID]["status"] == "held"
+    assert merged["reservations"]["telegram:other"]["status"] == "uncertain"
+
+
+def test_a_store_keeps_one_holder_id_and_a_fresh_store_gets_its_own(
+    tmp_path, monkeypatch
+):
+    first = state_sync.store_holder(tmp_path)
+    assert first.startswith("local:")
+    assert state_sync.store_holder(tmp_path) == first
+
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    runner_store = tmp_path / "runner"
+    runner_store.mkdir()
+    assert state_sync.store_holder(runner_store).startswith("cloud:")
+    assert state_sync.store_holder(runner_store) != first
+
+
+@pytest.mark.parametrize("backup_first", [True, False])
+def test_recovery_keeps_the_blocking_reservation_of_two_equal_generations(
+    backup_first,
+):
+    """Round-1 finding: two tokens at one generation are two claims of which the
+    ref accepted one, and recovery cannot tell which. A `--from` backup is folded
+    before the shared ref, so taking the first store's entry let the loser's
+    released token replace the winner's uncertain one — and let another host
+    reserve work the winner may already have sent. Whatever the order, the
+    entry that still blocks survives."""
+    loser = deepcopy(DEFAULT_STATE)
+    loser["reservations"][IN_FLIGHT_ID] = held_reservation("t-lose", "released")
+    winner = deepcopy(DEFAULT_STATE)
+    winner["reservations"][IN_FLIGHT_ID] = held_reservation("t-win", "uncertain")
+    stores = [loser, winner] if backup_first else [winner, loser]
+
+    recovered = state_sync.reconcile_stores(stores)
+
+    kept = recovered["reservations"][IN_FLIGHT_ID]
+    assert (kept["token"], kept["status"]) == ("t-win", "uncertain")
+
+    held = deepcopy(DEFAULT_STATE)
+    held["reservations"][IN_FLIGHT_ID] = held_reservation("t-win")
+    stores = [loser, held] if backup_first else [held, loser]
+    kept = state_sync.reconcile_stores(stores)["reservations"][IN_FLIGHT_ID]
+    assert (kept["token"], kept["status"]) == ("t-win", "held")
+
+    # …and the recovered state still refuses the key to every other host.
+    from watcher import delivery
+
+    unit = {
+        "id": IN_FLIGHT_ID,
+        "ack": {"type": "alerts", "keys": ["news:leak-42"]},
+        "force": False,
+        "expires_at": None,
+    }
+    assert delivery._decline_reason(recovered, None, [unit], "local:other", NOW)
+
+
+
+@pytest.mark.parametrize("backup_first", [True, False])
+def test_recovery_never_lets_a_released_claim_at_a_higher_generation_free_work(
+    backup_first,
+):
+    """Round-2 finding, recovery side: a store may hold a release for a claim
+    the ref never accepted, numbered above the winner's entry. Between
+    different tokens recovery keeps whichever still blocks, at any generation."""
+    stray = deepcopy(DEFAULT_STATE)
+    stray_entry = held_reservation("t-stray", "released")
+    stray_entry["generation"] = 2
+    stray["reservations"][IN_FLIGHT_ID] = stray_entry
+    for status in ("held", "uncertain"):
+        winner = deepcopy(DEFAULT_STATE)
+        winner["reservations"][IN_FLIGHT_ID] = held_reservation("t-win", status)
+        stores = [stray, winner] if backup_first else [winner, stray]
+        kept = state_sync.reconcile_stores(stores)["reservations"][IN_FLIGHT_ID]
+        assert (kept["token"], kept["status"]) == ("t-win", status)
