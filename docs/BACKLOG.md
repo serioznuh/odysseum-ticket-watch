@@ -64,18 +64,25 @@ estimates include implementation and verification.
 | --- | --- | --- | --- |
 | 1 | OTW-31 | A blocked Pathé check must be reported within about 30 minutes while a wanted date is pending, not after 6 h; this silence recurred on 2026-09-18. | S · 2–4 h |
 | 2 | OTW-33 | Cloud supervision has been blind on roughly a third of firings since 2026-09-21; throttling fixes it without a new secret. | S · 2–3 h |
-| 3 | OTW-32 | Owner decision first: may Mac-only alerts that were never published skip the shared reservation? If yes, land it before December. | M · about 1 day |
+| 3 | OTW-32 | Decided by default (implement, premise enforced in code) so a GitHub outage cannot delay the wanted-date alert; land it before December. | M · about 1 day |
 | 4 | OTW-34 | Bring ~280 daily state-ref commits down to a bounded liveness resolution; this also reduces reservation contention and OTW-26's growth. | S · 3–4 h |
-| 5 | OTW-35 | Ready by 2026-12-15, executed after 2026-12-20; the Cinesa decision inside it can be taken now. | S · 3–4 h |
+| 5 | OTW-35 | Ready by 2026-12-15; the watch then goes quiet on its own after 2026-12-20, and Cinesa retires with it unless a new target is named. | S · 3–4 h |
 | 6 | OTW-12 | Reminder wording versus the effective ladder; less valuable since the national sale opened on 2026-09-09, but still reproducible. | S · 3–4 h |
 | 7 | OTW-01 | Documentation checks; `docs/current-state.md` is at 179 of its 180-line budget and items 1–5 all touch it. | S · 2–4 h |
 | 8 | OTW-17 | Merged new/moved sale wording; low value after the sale opened. | S · 2–4 h |
 
-**Cross-repository prerequisite:** the loop machinery items CR-112, CR-113 and
-CR-114 in `serioznuh/cross-llm-review` should land before the next OTW loop
-merges. On 2026-09-24 the OTW-28 loop passed its approval, merge and backlog
-gates with an uncommitted review-log edit and merged a one-way state-schema
-migration without asking the owner.
+**Owner involvement:** the owner wants this repository to run without them
+except for real decisions. Items here are built and merged by the loops unless
+they touch the approval list in AGENTS.md: real Telegram sends, production state
+edits, launchd/plist or cron changes, repository visibility, force-pushes,
+loosening news matching. The defaults recorded in OTW-31, OTW-32 and OTW-35 stand unless the
+owner objects; no sign-off is needed to start them.
+
+**Loop safety:** in `serioznuh/cross-llm-review`, CR-112 and CR-113 remove the
+failure behind OTW-28's merge, which passed its approval, merge and backlog
+gates with an uncommitted review-log edit. CR-114 decides which changes may
+auto-merge. OTW work does not wait for them; until they land, a refused loop
+gate is fixed with a commit, never with an uncommitted or PR-body edit.
 
 **Change freeze:** pushing to `main` deploys to the Mac. From 2026-12-10 until
 both wanted dates have passed, merge only P0 fixes.
@@ -438,8 +445,8 @@ of a fixed 6 h. While `adaptive_staleness_hours` is at the every-firing floor (a
 pending wanted date or the opening window), alert once consecutive failed
 firings span about 30 minutes; slower tiers keep the 6 h rule. Reuse the
 existing loud alert and its 403/VPN wording, one alert per episode, the silent
-recovery and the degraded→blind re-arming; add no new alert kind. The value
-changes when a loud alert fires, so confirm it with the owner before merging.
+recovery and the degraded→blind re-arming; add no new alert kind. Ship with a
+30-minute default; if it proves noisy, raise it later — no sign-off needed.
 **Files:** `watcher/alerts.py`, `watcher/state.py` or `watcher/jobs.py` for the
 tier, `config.toml` if the tolerance becomes configurable, `tests/test_main.py`,
 `README.md` alert catalogue, `docs/current-state.md`.
@@ -1048,8 +1055,9 @@ sale, new-listing, bookable and wanted-date findings, and Cinesa findings. For
 those keys the only possible duplicate is the cloud recovering an outbox record
 the Mac has already published. A GitHub incident in December would therefore
 delay the one alert the watch exists for, while preventing no possible duplicate.
-**Decision needed:** this narrows OTW-28's rule for one provable class of work.
-The owner approves or rejects it before any implementation.
+**Decision (2026-09-24, by default):** implement. It narrows OTW-28's rule for
+one provable class of work only. If the tests cannot prove the premise below,
+close this item as won't-do rather than weaken OTW-28.
 **Fix sketch:** let a delivery skip the reservation only when all of these hold:
 (a) this pass is the local owner; (b) every member key is Mac-origin (Pathé- or
 Cinesa-derived); (c) its outbox record has never been part of a push attempt.
@@ -1105,18 +1113,19 @@ cron and weekly heartbeat would continue, and the state ref would keep growing.
 Meanwhile the dormant Cinesa half still carries the headed-Chrome token step, a
 Chrome profile and a credential cache under `.cache/`, two open items (OTW-04,
 OTW-24) and a large share of AGENTS.md and current-state.md.
-**Fix sketch:** (1) Cinesa — decide now: retire it (remove the half, its caches
-and docs; close OTW-04/OTW-24 as superseded), or keep it dormant for a named
-future target (OTW-24 then stays a prerequisite). (2) Pathé — once every wanted
-date has passed, send one silent "watch complete" summary, then make no network
-call and send nothing more, heartbeats included. Document an owner-run
-decommission procedure in README: unload the LaunchAgent, disable `watch.yml`,
-keep or tag the final state ref, delete local caches. Launchd and workflow
-changes need the owner's approval under AGENTS.md.
+**Fix sketch:** (1) Cinesa — default: retire it when the Pathé watch ends
+(remove the half, its caches and docs; close OTW-04/OTW-24 as superseded). Keep
+it only if the owner names a new target before then; OTW-24 then stays a
+prerequisite. (2) Pathé — once every wanted date has passed, send one silent
+"watch complete" summary, then go dormant on its own: no network call and no
+message, heartbeats included. That is the whole stop; nothing waits for the
+owner. Unloading the LaunchAgent and disabling `watch.yml` afterwards is
+optional cleanup, documented in README and run by the owner whenever convenient
+(both are launchd/workflow changes under AGENTS.md).
 **Files:** `watcher/jobs.py`/`watcher/runner.py` (the dormant check),
 `config.toml`, `README.md` (procedure), `docs/current-state.md`; `AGENTS.md`,
 the Cinesa modules and their tests if Cinesa retires.
 **Done when:** a dry run with the clock after 2026-12-20 makes no network call
 and sends only the one-time summary; the decommission procedure is documented
 and reviewed; the Cinesa disposition is recorded in this backlog. Ready by
-2026-12-15; the stop itself is run by the owner.
+2026-12-15; from then on nothing in the stop needs the owner.
