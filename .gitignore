@@ -9,3 +9,5 @@ state/*.tmp
 logs/
 # Cinesa API token (a credential) and the throwaway Chrome profile used to mint it.
 .cache/
+# Local Claude Code settings and cross-review loop state; never commit it.
+.claude/
