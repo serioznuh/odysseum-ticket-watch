@@ -660,6 +660,15 @@ AKAMAI_403 = RuntimeError(
     "Pathé API request failed for https://www.pathe.fr/api/shows: "
     "Client error '403 Forbidden' for url 'https://www.pathe.fr/api/shows'"
 )
+# Top-level fields the schema-5 code already deployed accepts. The runtime-state
+# ref is shared with Actions runs that may still be on that code, so OTW-31 must
+# not write anything else (Codex round 2); growing this needs a staged rollout.
+DEPLOYED_V5_FIELDS = {
+    "version", "alerts", "sales", "formats_seen", "shows_seen", "reminders_sent",
+    "outbox", "delivery_receipts", "reservations", "sale_target",
+    "tickets_available", "failure_streak", "error_alerted", "last_check_ok",
+    "last_catalogue_ok", "last_heartbeat", "last_error", "cinesa",
+}
 HEALTHY_SNAPSHOT = Snapshot(
     matched_shows=[
         {
@@ -682,9 +691,9 @@ class TierRunner(PatheCheckRunner):
         state.update(last_check_ok=last_ok.isoformat(), last_catalogue_ok=last_ok.isoformat())
         self.state.write_text(json.dumps(state), encoding="utf-8")
 
-    def fire(self, at: datetime, result) -> dict:
+    def fire(self, at: datetime, result, *, delivered=True, expect_exit: int = 0) -> dict:
         self.monkeypatch.setattr(cli, "datetime", _scripted_clock(at, at))
-        return self.run(result, delivered=True)
+        return self.run(result, delivered=delivered, expect_exit=expect_exit)
 
     def fire_every_firing(self, start: datetime, minutes: range, result) -> list[str]:
         """Fire at each offset (in minutes) and collect everything sent."""
@@ -714,8 +723,11 @@ def test_a_block_with_a_wanted_date_pending_alerts_once_after_thirty_minutes(
     assert "Cause: Pathé is blocking your IP (403)." in runner.sent[0]
     assert "No sale detection since Fri 18 Sep, 19:24 (35 min)." in runner.sent[0]
     assert st["error_alerted"] is True
-    assert st["failing_since"] == BLOCK_STARTS.isoformat()
-    assert f"error:{BLOCK_STARTS.isoformat()}" in st["alerts"]
+    assert st["failure_streak"] == 7  # 30 minutes of failed firings
+    # The key earlier code produced, so its in-flight work for an outage still
+    # running at deployment is the same logical message (see below).
+    assert "error:2026-09-18" in st["alerts"]
+    assert set(st) <= DEPLOYED_V5_FIELDS
 
     # The rest of the block stays quiet, and state settles instead of churning.
     settled = runner.state.read_bytes()
@@ -728,10 +740,9 @@ def test_a_block_with_a_wanted_date_pending_alerts_once_after_thirty_minutes(
     assert runner.silent == [True]
     assert st["error_alerted"] is False
     assert st["failure_streak"] == 0
-    assert "failing_since" not in st
 
 
-def test_war_room_tolerance_runs_from_the_first_failure_not_the_last_healthy_check(
+def test_a_mac_waking_with_an_old_healthy_check_still_waits_thirty_minutes(
     tmp_path, monkeypatch
 ):
     """A Mac that slept through the night wakes with a healthy check 9 h old.
@@ -743,24 +754,26 @@ def test_war_room_tolerance_runs_from_the_first_failure_not_the_last_healthy_che
     )
 
     assert runner.fire_every_firing(wake, range(0, 30, 5), AKAMAI_403) == []
-    assert json.loads(runner.state.read_text())["failure_streak"] == 3  # capped
+    assert json.loads(runner.state.read_text())["failure_streak"] == 6
 
     runner.fire(wake + timedelta(minutes=30), AKAMAI_403)
     assert len(runner.sent) == 1
     assert "Pathé watch is BLIND" in runner.sent[0]
 
 
-def test_war_room_tolerance_is_a_span_not_a_count_of_firings(tmp_path, monkeypatch):
-    """Firings skipped while the Mac slept do not stretch the wait: three
-    failures spanning 45 minutes are past the tolerance, whatever 3 x 5 min says."""
+def test_firings_slept_through_delay_the_war_room_alert_never_advance_it(
+    tmp_path, monkeypatch
+):
+    """Precision first: an outage the Mac mostly slept through has not been
+    observed for 30 minutes, so the alert waits for the failures it does see."""
     runner = TierRunner(
         tmp_path, monkeypatch, war_room=True, last_ok=BLOCK_STARTS - timedelta(minutes=5)
     )
 
-    for minutes in (0, 40):
-        runner.fire(BLOCK_STARTS + timedelta(minutes=minutes), AKAMAI_403)
-        assert runner.sent == []
-    runner.fire(BLOCK_STARTS + timedelta(minutes=45), AKAMAI_403)
+    runner.fire(BLOCK_STARTS, AKAMAI_403)
+    wake = BLOCK_STARTS + timedelta(hours=3)
+    assert runner.fire_every_firing(wake, range(0, 25, 5), AKAMAI_403) == []
+    runner.fire(wake + timedelta(minutes=25), AKAMAI_403)  # the 7th failed check
 
     assert len(runner.sent) == 1
     assert "Pathé watch is BLIND" in runner.sent[0]
@@ -774,6 +787,7 @@ def test_a_baseline_tier_outage_keeps_the_six_hour_rule(tmp_path, monkeypatch):
 
     quiet = runner.fire_every_firing(BLOCK_STARTS, range(0, 6 * 60 - 5, 5), AKAMAI_403)
     assert quiet == []
+    assert json.loads(runner.state.read_text())["failure_streak"] == 3  # capped as before
 
     runner.fire(last_ok + timedelta(hours=6), AKAMAI_403)
     assert len(runner.sent) == 1
@@ -781,14 +795,16 @@ def test_a_baseline_tier_outage_keeps_the_six_hour_rule(tmp_path, monkeypatch):
 
 
 def test_recovery_rearms_a_second_block_the_same_day(tmp_path, monkeypatch):
-    """The alert used to be keyed on the calendar day, so a second outage that
-    day matched the first one's receipt and ended in silence — ordinary once
-    the tolerance is 30 minutes. Each episode now has its own key."""
+    """The alert is keyed on the calendar day, so a second outage that day
+    matched the first one's receipt and ended in silence — ordinary once the
+    tolerance is 30 minutes. A later outage is keyed on the healthy check that
+    closed the earlier one; the first of the day keeps the historical key."""
     runner = TierRunner(
         tmp_path, monkeypatch, war_room=True, last_ok=BLOCK_STARTS - timedelta(minutes=5)
     )
     first = runner.fire_every_firing(BLOCK_STARTS, range(0, 31, 5), AKAMAI_403)
-    runner.fire(BLOCK_STARTS + timedelta(minutes=40), HEALTHY_SNAPSHOT)
+    recovered_at = BLOCK_STARTS + timedelta(minutes=40)
+    runner.fire(recovered_at, HEALTHY_SNAPSHOT)
     assert [text.splitlines()[0] for text in first] == ["🔴 <b>Pathé watch is BLIND</b>"]
     assert "Pathé watch is back" in runner.sent[0]
 
@@ -801,9 +817,64 @@ def test_recovery_rearms_a_second_block_the_same_day(tmp_path, monkeypatch):
     assert runner.silent == [False]
     assert st["error_alerted"] is True
     assert sorted(k for k in st["alerts"] if k.startswith("error:")) == [
-        f"error:{BLOCK_STARTS.isoformat()}",
-        f"error:{again.isoformat()}",
+        "error:2026-09-18",
+        f"error:2026-09-18:{recovered_at.isoformat()}",
     ]
+    assert set(st) <= DEPLOYED_V5_FIELDS
+
+    # A third outage that day gets a key of its own as well.
+    third = BLOCK_STARTS + timedelta(hours=4)
+    runner.fire(third - timedelta(minutes=10), HEALTHY_SNAPSHOT)
+    assert runner.fire_every_firing(third, range(0, 31, 5), AKAMAI_403) != []
+
+
+def test_an_alert_delivered_before_its_bookkeeping_was_saved_is_not_sent_again(
+    tmp_path, monkeypatch
+):
+    """Codex round 2: the receipt is durable at confirmation, but `error_alerted`
+    only lands with the final save. If that save is lost, the next firing must
+    find the same key — for the first outage of a day, the one earlier code
+    wrote too — and bank the receipt instead of sending a second alert."""
+    runner = TierRunner(
+        tmp_path, monkeypatch, war_room=True, last_ok=BLOCK_STARTS - timedelta(minutes=5)
+    )
+    assert runner.fire_every_firing(BLOCK_STARTS, range(0, 30, 5), AKAMAI_403) == []
+    repair = _break_save_after_supervision(monkeypatch, OSError("disk full"))
+    stranded = runner.fire(BLOCK_STARTS + timedelta(minutes=30), AKAMAI_403, expect_exit=1)
+    assert len(runner.sent) == 1
+    assert "error:2026-09-18" in stranded["alerts"]
+    assert stranded["error_alerted"] is False  # the lost bookkeeping
+
+    repair()
+    st = runner.fire(BLOCK_STARTS + timedelta(minutes=35), AKAMAI_403)
+
+    assert runner.sent == []
+    assert st["error_alerted"] is True
+
+
+def test_a_pending_alert_from_before_deployment_is_sent_once(tmp_path, monkeypatch):
+    """Codex round 2, the deployment window: earlier code (the 6 h rule, which
+    the baseline tier still runs unchanged) queued this outage's alert under
+    `error:<date>` and its send failed. The upgraded code needs 7 failed checks
+    before its own finding, so outbox recovery delivers the old item first; the
+    finding then resolves to the same key and banks it instead of re-sending."""
+    runner = TierRunner(
+        tmp_path, monkeypatch, war_room=False, last_ok=BLOCK_STARTS - timedelta(hours=7)
+    )
+    for minutes in (0, 5, 10):  # streak 3, blind 7 h: the old rule's alert, which fails
+        runner.fire(BLOCK_STARTS + timedelta(minutes=minutes), AKAMAI_403, delivered=False)
+    queued = json.loads(runner.state.read_text())
+    assert [record["keys"] for record in queued["outbox"].values()] == [["error:2026-09-18"]]
+    assert queued["error_alerted"] is False
+
+    runner.config.write_text(WAR_ROOM_CONFIG_TOML, encoding="utf-8")  # deployed, date pending
+    sent = runner.fire_every_firing(BLOCK_STARTS, range(15, 45, 5), AKAMAI_403)
+
+    assert [text.splitlines()[0] for text in sent] == ["🔴 <b>Pathé watch is BLIND</b>"]
+    st = json.loads(runner.state.read_text())
+    assert st["failure_streak"] == 7
+    assert st["error_alerted"] is True
+    assert st["outbox"] == {}
 
 
 def test_war_room_degraded_watch_still_escalates_to_blind(tmp_path, monkeypatch):

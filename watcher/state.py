@@ -89,10 +89,7 @@ _CORE_FIELDS = {
 _CURRENT_ONLY_FIELDS = {"last_catalogue_ok", "outbox", "delivery_receipts", "reservations"}
 _TOP_LEVEL_FIELDS = _CORE_FIELDS | _CURRENT_ONLY_FIELDS | {
     "version",
-    # Written only while a Pathé failure episode is live, so a healthy watch
-    # carries neither and state from before them loads without a migration.
     "last_error",
-    "failing_since",  # first failed check of the episode (OTW-31)
     "cinesa",
 }
 _CINESA_FIELDS = {
@@ -412,8 +409,6 @@ def _validate_fields(state: dict, *, require_all: bool) -> None:
     _parse_optional_timestamp(state["last_heartbeat"], "last_heartbeat")
     if "last_error" in state:
         _require_string(state["last_error"], "last_error")
-    if "failing_since" in state:
-        _parse_optional_timestamp(state["failing_since"], "failing_since")
     if "cinesa" in state:
         _validate_cinesa(state["cinesa"], require_all=require_all)
 

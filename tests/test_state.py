@@ -123,26 +123,6 @@ def test_invalid_timestamp_is_rejected(tmp_path):
         load_state(path)
 
 
-def test_pathe_episode_start_is_optional_and_validated():
-    """OTW-31's episode stamp exists only while Pathé is failing, so state
-    without it (every healthy or older file) loads unchanged; a present one
-    must still be a real offset-aware timestamp."""
-    assert "failing_since" not in migrate_state(fresh_state())
-
-    live = fresh_state()
-    live["failing_since"] = "2026-09-18T19:29:00+02:00"
-    assert migrate_state(live)["failing_since"] == "2026-09-18T19:29:00+02:00"
-
-    for bad, message in (
-        ("an hour ago", "invalid ISO-8601 timestamp"),
-        ("2026-09-18T19:29:00", "UTC offset"),
-    ):
-        broken = fresh_state()
-        broken["failing_since"] = bad
-        with pytest.raises(StateError, match=message):
-            migrate_state(broken)
-
-
 @pytest.mark.parametrize("version", [-1, CURRENT_STATE_VERSION + 1, 999])
 def test_unsupported_versions_are_rejected(tmp_path, version):
     state = fresh_state()

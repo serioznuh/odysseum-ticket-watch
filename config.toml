@@ -73,9 +73,9 @@ stale_hours = 18
 heartbeat_days = 7
 # Alert after N consecutive failed Pathé checks (watcher is blind), once the
 # outage has also outlasted its cadence tier's tolerance: 6 h without a healthy
-# check normally, or this many minutes of failed checks while a wanted date is
-# pending or a sale opening is near (Pathé re-checked every firing). Raise it
-# if it proves noisy.
+# check normally, or this many minutes without one, seen as consecutive failed
+# firings (7 for 30 min), while a wanted date is pending or a sale opening is
+# near (Pathé re-checked every firing). Raise it if it proves noisy.
 failure_streak_threshold = 3
 war_room_blind_minutes = 30
 # Alert (from the cloud reminder pass) if the last successful Pathé check is

@@ -13,6 +13,7 @@ themselves.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from datetime import datetime, timedelta
@@ -130,6 +131,27 @@ def pathe_cause(error: str, *, ci: bool = False) -> tuple[str, str]:
     )
 
 
+def pathe_error_key(st: dict, now: datetime) -> str:
+    """Dedup key of the current Pathé outage's loud alert.
+
+    The first outage of a day keeps the historical `error:<date>` key — what
+    earlier code produced, so a receipt or pending outbox item it left for an
+    outage still running matches it and is never sent twice. A later outage
+    the same day needs its own key (OTW-31), or that receipt swallows its
+    alert. It is recognised by the day key having been sent before the last
+    fully healthy check, since which a recovery has closed that outage, and is
+    keyed on that check: no failure moves it, so the key holds for the whole
+    outage and a failed send is retried rather than forked. Degraded -> blind
+    shares the key and is told apart by its delivery condition, as before.
+    """
+    day_key = f"error:{now:%Y-%m-%d}"
+    sent = detect.parse_iso(st.get("alerts", {}).get(day_key))
+    healthy = detect.parse_iso(st.get("last_check_ok"))
+    if sent is None or healthy is None or detect.as_aware(sent) > detect.as_aware(healthy):
+        return day_key
+    return f"{day_key}:{st['last_check_ok']}"
+
+
 def build_error_finding(cfg, st: dict, error: str, now: datetime) -> Finding:
     """Fired once the local half is confidently blind or persistently degraded."""
     cause, tail = pathe_cause(error, ci=running_in_ci())
@@ -141,17 +163,9 @@ def build_error_finding(cfg, st: dict, error: str, now: datetime) -> Finding:
         else f"No sale detection since {when}"
     )
     since += f" ({blind_for})." if blind_for else "."
-    # Keyed on the episode, not the calendar day (OTW-31): with a 30-minute
-    # tolerance a second outage the same day is ordinary, and a day key would
-    # match the first one's receipt and end in silence. Within one episode the
-    # key is stable, so a failed send is retried rather than forked, and the
-    # degraded -> blind escalation is told apart by its delivery condition.
-    # The key is never a send-once baseline — `error_alerted` gates it and it
-    # is force-delivered — so older `error:<date>` receipts need no migration.
-    episode = st.get("failing_since") or now.isoformat()
     return Finding(
         kind="WATCHER_ERROR",
-        key=f"error:{episode}",
+        key=pathe_error_key(st, now),
         confidence="high",
         title="Pathé watch is DEGRADED" if degraded else "Pathé watch is BLIND",
         lines=[watch_label(cfg), since, cause, tail],
@@ -207,23 +221,33 @@ def build_state_sync_failure_finding(cfg, marker: dict[str, str]) -> Finding:
 SLOW_TIER_BLIND_HOURS = 6.0
 
 
-def blind_tolerance_reached(cfg, st: dict, now: datetime) -> bool:
-    """Whether the current Pathé failure episode has lasted long enough to report.
+def war_room_failures(cfg) -> int:
+    """Consecutive failed checks that span `war_room_blind_minutes` at the
+    launchd interval: 7 for 30 minutes (the first, then one every 5 min)."""
+    span = math.ceil(cfg.war_room_blind_minutes / state_mod.LOCAL_FIRING_INTERVAL_MINUTES)
+    return max(cfg.failure_streak_threshold, span + 1)
+
+
+def blind_tolerance_reached(cfg, st: dict, now: datetime, *, war_room: bool) -> bool:
+    """Whether the current Pathé outage has lasted long enough to report.
 
     The tolerance follows the adaptive cadence tier (OTW-31). On the war-room
     tiers — a pending wanted date, or the window around a sale opening — Pathé
     is re-checked on every firing, and a block the owner can clear in minutes
-    (Akamai refusing the Mac's current route) must not stay silent for hours.
-    There the span runs from the episode's first failed check, so neither a
-    healthy check from before the Mac slept nor skipped firings distort it.
+    (Akamai refusing the Mac's current route) must not stay silent for hours:
+    the alert waits for `war_room_blind_minutes` without a healthy check, seen
+    as that many minutes of consecutive failed firings. The count keeps a Mac
+    waking with an hours-old healthy check from alerting on its first few
+    failures; firings it slept through can only delay the alert, never bring
+    it forward. Both come from fields every deployed version already reads.
     Slower tiers keep 6 h without a fully healthy snapshot.
     """
-    if state_mod.war_room_cadence(st, cfg, now):
-        since = detect.parse_iso(st.get("failing_since"))
-        return since is not None and now - detect.as_aware(since) >= timedelta(
-            minutes=cfg.war_room_blind_minutes
-        )
-    return not state_mod.is_check_fresh(st, SLOW_TIER_BLIND_HOURS, now)
+    streak = st.get("failure_streak", 0)
+    if war_room:
+        needed, blind_hours = war_room_failures(cfg), cfg.war_room_blind_minutes / 60
+    else:
+        needed, blind_hours = cfg.failure_streak_threshold, SLOW_TIER_BLIND_HOURS
+    return streak >= needed and not state_mod.is_check_fresh(st, blind_hours, now)
 
 
 def record_pathe_failure(cfg, st: dict, error: str, now: datetime) -> Finding | None:
@@ -236,13 +260,14 @@ def record_pathe_failure(cfg, st: dict, error: str, now: datetime) -> Finding | 
         detect.PARTIAL_PATHE_FAILURE
     )
     current_partial = error.startswith(detect.PARTIAL_PATHE_FAILURE)
-    # Stamped once per episode and cleared only by a fully healthy snapshot,
-    # so a long outage still settles in state instead of rewriting it.
-    if not st.get("failing_since"):
-        st["failing_since"] = now.isoformat()
-    st["failure_streak"] = min(
-        st.get("failure_streak", 0) + 1, cfg.failure_streak_threshold
-    )
+    war_room = state_mod.war_room_cadence(st, cfg, now)
+    # Capped where the tier's alert rule stops reading it, so a long outage
+    # settles in state instead of rewriting it every firing. Never lowered: a
+    # tier change mid-outage must neither restart the count nor churn state.
+    cap = war_room_failures(cfg) if war_room else cfg.failure_streak_threshold
+    streak = st.get("failure_streak", 0)
+    if streak < cap:
+        st["failure_streak"] = streak + 1
     summary, status = summarize_pathe_error(error)
     # Store no endpoint URL for ordinary outages, and only stable endpoint/slug
     # names for partial failures, so an unchanged outage settles in state.
@@ -265,10 +290,8 @@ def record_pathe_failure(cfg, st: dict, error: str, now: datetime) -> Finding | 
 
     # With adaptive cadence, retries come every 5 min — require both a failure
     # streak AND the tier's blind tolerance before crying wolf.
-    if (
-        st["failure_streak"] >= cfg.failure_streak_threshold
-        and not st.get("error_alerted")
-        and blind_tolerance_reached(cfg, st, now)
+    if not st.get("error_alerted") and blind_tolerance_reached(
+        cfg, st, now, war_room=war_room
     ):
         return build_error_finding(cfg, st, error, now)
     return None
