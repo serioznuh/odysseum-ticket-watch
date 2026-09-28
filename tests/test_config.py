@@ -77,3 +77,19 @@ def test_shipped_config_silences_every_kind_the_code_treats_as_quiet():
         f"config.toml alerts.silent_kinds is missing {missing} — these kinds "
         "will notify loudly in production"
     )
+
+
+def test_war_room_blind_tolerance_defaults_to_thirty_minutes(tmp_path):
+    """OTW-31 ships a 30-minute blind tolerance for the war-room tiers, both
+    as the code default and in the shipped config."""
+    from pathlib import Path
+
+    config = tmp_path / "config.toml"
+    config.write_text(MINIMAL_TOML, encoding="utf-8")
+    tuned = tmp_path / "tuned.toml"
+    tuned.write_text(MINIMAL_TOML + "\n[alerts]\nwar_room_blind_minutes = 45\n", encoding="utf-8")
+
+    assert load_config(config).war_room_blind_minutes == 30
+    assert load_config(tuned).war_room_blind_minutes == 45
+    shipped = load_config(Path(__file__).resolve().parent.parent / "config.toml")
+    assert shipped.war_room_blind_minutes == 30

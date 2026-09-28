@@ -906,6 +906,16 @@ def adaptive_staleness_hours(state: dict, cfg: Any, now: datetime) -> float:
     return cfg.cadence_baseline_hours
 
 
+def war_room_cadence(state: dict, cfg: Any, now: datetime) -> bool:
+    """True on the tiers that re-check Pathé on (about) every firing: a pending
+    wanted date, or the window around a sale opening.
+
+    The Pathé blind tolerance follows this (OTW-31): there a failed check is
+    minutes of missed evidence, not the hours the slower tiers are sized for.
+    """
+    return adaptive_staleness_hours(state, cfg, now) <= cfg.cadence_opening_window_minutes / 60
+
+
 def is_check_fresh(state: dict, hours: float, now: datetime) -> bool:
     """True when the last successful Pathé check is newer than `hours`.
 
