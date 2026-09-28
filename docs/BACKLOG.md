@@ -45,7 +45,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-28 | Coordinate Mac/cloud delivery before sending shared notifications | P1 | L | Infra, tooling & docs | [x] |
 | OTW-29 | Bound Git operations and the local run's lifetime | P1 | M | Infra, tooling & docs | [x] |
 | OTW-30 | Require explicit bootstrap when the shared runtime-state ref is missing | P2 | M | Infra, tooling & docs | [x] |
-| OTW-31 | A blocked Pathé check stays silent for 6 h while a wanted date is pending | P1 | S | Bugs | [ ] |
+| OTW-31 | A blocked Pathé check stays silent for 6 h while a wanted date is pending | P1 | S | Bugs | [x] |
 | OTW-32 | A GitHub outage holds back alerts only the Mac can produce | P2 | M | Infra, tooling & docs | [ ] |
 | OTW-33 | Cloud supervision polls GitHub every firing and is rate-limited a third of the day | P2 | S | Bugs | [ ] |
 | OTW-34 | Per-firing liveness timestamps commit to the shared ref ~280 times a day | P3 | S | Infra, tooling & docs | [ ] |
