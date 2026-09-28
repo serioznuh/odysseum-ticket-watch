@@ -207,7 +207,10 @@ def run_pathe_job(
         ctx.state["error_alerted"] = False
         # Stale cause + spent stale keys must not survive into the next
         # outage: they would make the cloud pass report the wrong reason.
+        # Nor may the episode start: the next outage is a new episode, with
+        # its own blind tolerance and its own alert key (OTW-31).
         ctx.state.pop("last_error", None)
+        ctx.state.pop("failing_since", None)
         for spent in [k for k in ctx.state.get("alerts", {}) if k.startswith("stale:")]:
             ctx.state["alerts"].pop(spent, None)
         ctx.state["last_check_ok"] = now.isoformat()

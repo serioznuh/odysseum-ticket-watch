@@ -45,6 +45,7 @@ class Config:
     # [alerts]
     heartbeat_days: int
     failure_streak_threshold: int
+    war_room_blind_minutes: float
     stale_check_hours: int
     silent_kinds: list[str]
     # [cadence]
@@ -158,6 +159,7 @@ def load_config(path: str | Path) -> Config:
         cloud_stale_hours=int(cloud.get("stale_hours", 0)),
         heartbeat_days=int(alerts.get("heartbeat_days", 7)),
         failure_streak_threshold=int(alerts.get("failure_streak_threshold", 3)),
+        war_room_blind_minutes=float(alerts.get("war_room_blind_minutes", 30)),
         stale_check_hours=int(alerts.get("stale_check_hours", 72)),
         silent_kinds=[
             str(k).upper()

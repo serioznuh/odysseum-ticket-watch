@@ -346,9 +346,11 @@ class PatheCheckRunner:
 
         self.monkeypatch.setattr(pathe, "fetch_snapshot", fake_fetch)
         self.sent = []
+        self.silent = []
 
         def fake_send(cfg, text, **kw):
             self.sent.append(text)
+            self.silent.append(bool(kw.get("silent")))
             return delivered(text) if callable(delivered) else delivered
 
         self.monkeypatch.setattr(notify, "send_telegram", fake_send)
@@ -641,6 +643,195 @@ def test_degraded_watch_escalating_to_catalogue_blindness_alerts_again(
     runner.run(blind, delivered=True)
     assert runner.sent == []
     assert runner.state.read_bytes() == settled
+
+
+# ------------------------------------ blind tolerance by cadence tier (OTW-31)
+
+# Wanted dates still in the future keep the adaptive cadence at every firing.
+WAR_ROOM_CONFIG_TOML = CONFIG_TOML.replace(
+    'primary_slug = "dune-troisieme-partie"\n',
+    'primary_slug = "dune-troisieme-partie"\n'
+    'target_format = "imax70"\n'
+    'target_dates = ["2026-12-19", "2026-12-20"]\n',
+)
+# The production block OTW-31 was filed for: 403s from 19:29 to 21:48.
+BLOCK_STARTS = datetime(2026, 9, 18, 19, 29, tzinfo=TZ_PARIS)
+AKAMAI_403 = RuntimeError(
+    "Pathé API request failed for https://www.pathe.fr/api/shows: "
+    "Client error '403 Forbidden' for url 'https://www.pathe.fr/api/shows'"
+)
+HEALTHY_SNAPSHOT = Snapshot(
+    matched_shows=[
+        {
+            "slug": "dune-troisieme-partie",
+            "title": "Dune : Troisième partie",
+            "isMovie": True,
+        }
+    ]
+)
+
+
+class TierRunner(PatheCheckRunner):
+    """One scripted firing per `fire`, from a healthy check at `last_ok`."""
+
+    def __init__(self, tmp_path, monkeypatch, *, war_room: bool, last_ok: datetime):
+        super().__init__(tmp_path, monkeypatch)
+        if war_room:
+            self.config.write_text(WAR_ROOM_CONFIG_TOML, encoding="utf-8")
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        state.update(last_check_ok=last_ok.isoformat(), last_catalogue_ok=last_ok.isoformat())
+        self.state.write_text(json.dumps(state), encoding="utf-8")
+
+    def fire(self, at: datetime, result) -> dict:
+        self.monkeypatch.setattr(cli, "datetime", _scripted_clock(at, at))
+        return self.run(result, delivered=True)
+
+    def fire_every_firing(self, start: datetime, minutes: range, result) -> list[str]:
+        """Fire at each offset (in minutes) and collect everything sent."""
+        sent = []
+        for offset in minutes:
+            self.fire(start + timedelta(minutes=offset), result)
+            sent += self.sent
+        return sent
+
+
+def test_a_block_with_a_wanted_date_pending_alerts_once_after_thirty_minutes(
+    tmp_path, monkeypatch
+):
+    """OTW-31, replaying 2026-09-18: 27 failed checks over 2 h 19 m said nothing,
+    because the 6 h tolerance was sized for the 4 h baseline. While a wanted date
+    is pending every firing checks Pathé, so 30 minutes of failures is the news."""
+    runner = TierRunner(
+        tmp_path, monkeypatch, war_room=True, last_ok=BLOCK_STARTS - timedelta(minutes=5)
+    )
+
+    assert runner.fire_every_firing(BLOCK_STARTS, range(0, 30, 5), AKAMAI_403) == []
+
+    st = runner.fire(BLOCK_STARTS + timedelta(minutes=30), AKAMAI_403)
+    assert len(runner.sent) == 1
+    assert runner.silent == [False]  # the loud alert, not a new quiet kind
+    assert "Pathé watch is BLIND" in runner.sent[0]
+    assert "Cause: Pathé is blocking your IP (403)." in runner.sent[0]
+    assert "No sale detection since Fri 18 Sep, 19:24 (35 min)." in runner.sent[0]
+    assert st["error_alerted"] is True
+    assert st["failing_since"] == BLOCK_STARTS.isoformat()
+    assert f"error:{BLOCK_STARTS.isoformat()}" in st["alerts"]
+
+    # The rest of the block stays quiet, and state settles instead of churning.
+    settled = runner.state.read_bytes()
+    assert runner.fire_every_firing(BLOCK_STARTS, range(35, 139, 5), AKAMAI_403) == []
+    assert runner.state.read_bytes() == settled
+
+    st = runner.fire(BLOCK_STARTS + timedelta(minutes=139), HEALTHY_SNAPSHOT)
+    assert len(runner.sent) == 1
+    assert "Pathé watch is back" in runner.sent[0]
+    assert runner.silent == [True]
+    assert st["error_alerted"] is False
+    assert st["failure_streak"] == 0
+    assert "failing_since" not in st
+
+
+def test_war_room_tolerance_runs_from_the_first_failure_not_the_last_healthy_check(
+    tmp_path, monkeypatch
+):
+    """A Mac that slept through the night wakes with a healthy check 9 h old.
+    Three failures in ten minutes are not 30 minutes of blindness it observed —
+    the old rule would have fired here, on its first 10 minutes awake."""
+    wake = BLOCK_STARTS
+    runner = TierRunner(
+        tmp_path, monkeypatch, war_room=True, last_ok=wake - timedelta(hours=9)
+    )
+
+    assert runner.fire_every_firing(wake, range(0, 30, 5), AKAMAI_403) == []
+    assert json.loads(runner.state.read_text())["failure_streak"] == 3  # capped
+
+    runner.fire(wake + timedelta(minutes=30), AKAMAI_403)
+    assert len(runner.sent) == 1
+    assert "Pathé watch is BLIND" in runner.sent[0]
+
+
+def test_war_room_tolerance_is_a_span_not_a_count_of_firings(tmp_path, monkeypatch):
+    """Firings skipped while the Mac slept do not stretch the wait: three
+    failures spanning 45 minutes are past the tolerance, whatever 3 x 5 min says."""
+    runner = TierRunner(
+        tmp_path, monkeypatch, war_room=True, last_ok=BLOCK_STARTS - timedelta(minutes=5)
+    )
+
+    for minutes in (0, 40):
+        runner.fire(BLOCK_STARTS + timedelta(minutes=minutes), AKAMAI_403)
+        assert runner.sent == []
+    runner.fire(BLOCK_STARTS + timedelta(minutes=45), AKAMAI_403)
+
+    assert len(runner.sent) == 1
+    assert "Pathé watch is BLIND" in runner.sent[0]
+
+
+def test_a_baseline_tier_outage_keeps_the_six_hour_rule(tmp_path, monkeypatch):
+    """Nothing pending: checks are hours apart by design, so a short block is
+    not news. The alert still waits for 6 h without a healthy check."""
+    last_ok = BLOCK_STARTS - timedelta(minutes=5)
+    runner = TierRunner(tmp_path, monkeypatch, war_room=False, last_ok=last_ok)
+
+    quiet = runner.fire_every_firing(BLOCK_STARTS, range(0, 6 * 60 - 5, 5), AKAMAI_403)
+    assert quiet == []
+
+    runner.fire(last_ok + timedelta(hours=6), AKAMAI_403)
+    assert len(runner.sent) == 1
+    assert "Pathé watch is BLIND" in runner.sent[0]
+
+
+def test_recovery_rearms_a_second_block_the_same_day(tmp_path, monkeypatch):
+    """The alert used to be keyed on the calendar day, so a second outage that
+    day matched the first one's receipt and ended in silence — ordinary once
+    the tolerance is 30 minutes. Each episode now has its own key."""
+    runner = TierRunner(
+        tmp_path, monkeypatch, war_room=True, last_ok=BLOCK_STARTS - timedelta(minutes=5)
+    )
+    first = runner.fire_every_firing(BLOCK_STARTS, range(0, 31, 5), AKAMAI_403)
+    runner.fire(BLOCK_STARTS + timedelta(minutes=40), HEALTHY_SNAPSHOT)
+    assert [text.splitlines()[0] for text in first] == ["🔴 <b>Pathé watch is BLIND</b>"]
+    assert "Pathé watch is back" in runner.sent[0]
+
+    again = BLOCK_STARTS + timedelta(hours=2)
+    assert runner.fire_every_firing(again, range(0, 30, 5), AKAMAI_403) == []
+    st = runner.fire(again + timedelta(minutes=30), AKAMAI_403)
+
+    assert len(runner.sent) == 1
+    assert "Pathé watch is BLIND" in runner.sent[0]
+    assert runner.silent == [False]
+    assert st["error_alerted"] is True
+    assert sorted(k for k in st["alerts"] if k.startswith("error:")) == [
+        f"error:{BLOCK_STARTS.isoformat()}",
+        f"error:{again.isoformat()}",
+    ]
+
+
+def test_war_room_degraded_watch_still_escalates_to_blind(tmp_path, monkeypatch):
+    """Partial degradation alerts on the same 30-minute span; a later
+    catalogue-wide failure in that episode escalates at once, then settles."""
+    runner = TierRunner(
+        tmp_path, monkeypatch, war_room=True, last_ok=BLOCK_STARTS - timedelta(minutes=5)
+    )
+    slug = "dune-troisieme-partie"
+    degraded = Snapshot(
+        matched_shows=[{"slug": slug, "title": "Dune : Troisième partie", "isMovie": True}],
+        listing_results={
+            slug: {"showtimes": detect.FetchResult.failed("HTTP 500 from showtimes")}
+        },
+    )
+
+    assert runner.fire_every_firing(BLOCK_STARTS, range(0, 30, 5), degraded) == []
+    runner.fire(BLOCK_STARTS + timedelta(minutes=30), degraded)
+    assert len(runner.sent) == 1
+    assert "Pathé watch is DEGRADED" in runner.sent[0]
+
+    st = runner.fire(BLOCK_STARTS + timedelta(minutes=35), AKAMAI_403)
+    assert len(runner.sent) == 1
+    assert "Pathé watch is BLIND" in runner.sent[0]
+    assert runner.silent == [False]
+    assert st["error_alerted"] is True
+
+    assert runner.fire_every_firing(BLOCK_STARTS, range(40, 60, 5), AKAMAI_403) == []
 
 
 def test_cloud_reports_a_degraded_then_dark_mac_as_stopped_not_merely_degraded():

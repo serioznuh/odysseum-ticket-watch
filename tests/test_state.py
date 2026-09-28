@@ -123,6 +123,26 @@ def test_invalid_timestamp_is_rejected(tmp_path):
         load_state(path)
 
 
+def test_pathe_episode_start_is_optional_and_validated():
+    """OTW-31's episode stamp exists only while Pathé is failing, so state
+    without it (every healthy or older file) loads unchanged; a present one
+    must still be a real offset-aware timestamp."""
+    assert "failing_since" not in migrate_state(fresh_state())
+
+    live = fresh_state()
+    live["failing_since"] = "2026-09-18T19:29:00+02:00"
+    assert migrate_state(live)["failing_since"] == "2026-09-18T19:29:00+02:00"
+
+    for bad, message in (
+        ("an hour ago", "invalid ISO-8601 timestamp"),
+        ("2026-09-18T19:29:00", "UTC offset"),
+    ):
+        broken = fresh_state()
+        broken["failing_since"] = bad
+        with pytest.raises(StateError, match=message):
+            migrate_state(broken)
+
+
 @pytest.mark.parametrize("version", [-1, CURRENT_STATE_VERSION + 1, 999])
 def test_unsupported_versions_are_rejected(tmp_path, version):
     state = fresh_state()
@@ -787,6 +807,38 @@ def test_passed_reported_opening_keeps_war_room_with_later_future_target():
     st["sale_target"] = future
 
     assert state_mod.adaptive_staleness_hours(st, CadenceCfg, NOW) == 0.25
+
+
+def test_war_room_cadence_is_a_pending_wanted_date_or_the_opening_window():
+    """OTW-31 shortens the Pathé blind tolerance only on the tiers that check
+    every firing; the 30-minute final-48 h tier and slower keep the 6 h rule."""
+
+    class WantedDates(CadenceCfg):
+        pathe_target_format = "imax70"
+        pathe_target_dates = ("2026-07-10",)
+        primary_slug = "dune"
+        cinema_slug = "odysseum"
+
+    st = fresh_state()
+    assert state_mod.war_room_cadence(st, CadenceCfg, NOW) is False  # baseline
+    assert state_mod.war_room_cadence(st, WantedDates, NOW) is True  # pending date
+
+    wanted_key = detect.pathe_date_key(WantedDates, "2026-07-10")
+    mark_sent(st, wanted_key, NOW)
+    assert state_mod.war_room_cadence(st, WantedDates, NOW) is False  # delivered
+    assert state_mod.war_room_cadence(
+        fresh_state(), WantedDates, NOW + timedelta(days=5)
+    ) is False  # the date has passed
+
+    for delta, expected in (
+        (timedelta(days=3), False),     # within the week
+        (timedelta(hours=20), False),   # final 48 h: every 30 min, not every firing
+        (timedelta(hours=2), True),     # opening window
+        (timedelta(hours=-3), True),    # sessions appear right after opening
+    ):
+        st = fresh_state()
+        st["sale_target"] = iso_in(delta)
+        assert state_mod.war_room_cadence(st, CadenceCfg, NOW) is expected, delta
 
 
 def test_is_check_fresh():

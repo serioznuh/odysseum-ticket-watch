@@ -141,9 +141,17 @@ def build_error_finding(cfg, st: dict, error: str, now: datetime) -> Finding:
         else f"No sale detection since {when}"
     )
     since += f" ({blind_for})." if blind_for else "."
+    # Keyed on the episode, not the calendar day (OTW-31): with a 30-minute
+    # tolerance a second outage the same day is ordinary, and a day key would
+    # match the first one's receipt and end in silence. Within one episode the
+    # key is stable, so a failed send is retried rather than forked, and the
+    # degraded -> blind escalation is told apart by its delivery condition.
+    # The key is never a send-once baseline — `error_alerted` gates it and it
+    # is force-delivered — so older `error:<date>` receipts need no migration.
+    episode = st.get("failing_since") or now.isoformat()
     return Finding(
         kind="WATCHER_ERROR",
-        key=f"error:{now:%Y-%m-%d}",
+        key=f"error:{episode}",
         confidence="high",
         title="Pathé watch is DEGRADED" if degraded else "Pathé watch is BLIND",
         lines=[watch_label(cfg), since, cause, tail],
@@ -194,6 +202,30 @@ def build_state_sync_failure_finding(cfg, marker: dict[str, str]) -> Finding:
     )
 
 
+# The slower cadence tiers' blind tolerance, sized for the 4 h baseline: this
+# long without a fully healthy snapshot before the loud alert.
+SLOW_TIER_BLIND_HOURS = 6.0
+
+
+def blind_tolerance_reached(cfg, st: dict, now: datetime) -> bool:
+    """Whether the current Pathé failure episode has lasted long enough to report.
+
+    The tolerance follows the adaptive cadence tier (OTW-31). On the war-room
+    tiers — a pending wanted date, or the window around a sale opening — Pathé
+    is re-checked on every firing, and a block the owner can clear in minutes
+    (Akamai refusing the Mac's current route) must not stay silent for hours.
+    There the span runs from the episode's first failed check, so neither a
+    healthy check from before the Mac slept nor skipped firings distort it.
+    Slower tiers keep 6 h without a fully healthy snapshot.
+    """
+    if state_mod.war_room_cadence(st, cfg, now):
+        since = detect.parse_iso(st.get("failing_since"))
+        return since is not None and now - detect.as_aware(since) >= timedelta(
+            minutes=cfg.war_room_blind_minutes
+        )
+    return not state_mod.is_check_fresh(st, SLOW_TIER_BLIND_HOURS, now)
+
+
 def record_pathe_failure(cfg, st: dict, error: str, now: datetime) -> Finding | None:
     """Advance Pathé supervision and return the alert owed at its threshold.
 
@@ -204,6 +236,10 @@ def record_pathe_failure(cfg, st: dict, error: str, now: datetime) -> Finding | 
         detect.PARTIAL_PATHE_FAILURE
     )
     current_partial = error.startswith(detect.PARTIAL_PATHE_FAILURE)
+    # Stamped once per episode and cleared only by a fully healthy snapshot,
+    # so a long outage still settles in state instead of rewriting it.
+    if not st.get("failing_since"):
+        st["failing_since"] = now.isoformat()
     st["failure_streak"] = min(
         st.get("failure_streak", 0) + 1, cfg.failure_streak_threshold
     )
@@ -228,11 +264,11 @@ def record_pathe_failure(cfg, st: dict, error: str, now: datetime) -> Finding | 
         st["error_alerted"] = False
 
     # With adaptive cadence, retries come every 5 min — require both a failure
-    # streak AND 6h without a fully healthy snapshot before crying wolf.
+    # streak AND the tier's blind tolerance before crying wolf.
     if (
         st["failure_streak"] >= cfg.failure_streak_threshold
-        and not state_mod.is_check_fresh(st, 6.0, now)
         and not st.get("error_alerted")
+        and blind_tolerance_reached(cfg, st, now)
     ):
         return build_error_finding(cfg, st, error, now)
     return None

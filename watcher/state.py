@@ -89,7 +89,10 @@ _CORE_FIELDS = {
 _CURRENT_ONLY_FIELDS = {"last_catalogue_ok", "outbox", "delivery_receipts", "reservations"}
 _TOP_LEVEL_FIELDS = _CORE_FIELDS | _CURRENT_ONLY_FIELDS | {
     "version",
+    # Written only while a Pathé failure episode is live, so a healthy watch
+    # carries neither and state from before them loads without a migration.
     "last_error",
+    "failing_since",  # first failed check of the episode (OTW-31)
     "cinesa",
 }
 _CINESA_FIELDS = {
@@ -409,6 +412,8 @@ def _validate_fields(state: dict, *, require_all: bool) -> None:
     _parse_optional_timestamp(state["last_heartbeat"], "last_heartbeat")
     if "last_error" in state:
         _require_string(state["last_error"], "last_error")
+    if "failing_since" in state:
+        _parse_optional_timestamp(state["failing_since"], "failing_since")
     if "cinesa" in state:
         _validate_cinesa(state["cinesa"], require_all=require_all)
 
@@ -904,6 +909,16 @@ def adaptive_staleness_hours(state: dict, cfg: Any, now: datetime) -> float:
     if detect.target_format_available(state, cfg):
         return cfg.cadence_after_tickets_hours
     return cfg.cadence_baseline_hours
+
+
+def war_room_cadence(state: dict, cfg: Any, now: datetime) -> bool:
+    """True on the tiers that re-check Pathé on (about) every firing: a pending
+    wanted date, or the window around a sale opening.
+
+    The Pathé blind tolerance follows this (OTW-31): there a failed check is
+    minutes of missed evidence, not the hours the slower tiers are sized for.
+    """
+    return adaptive_staleness_hours(state, cfg, now) <= cfg.cadence_opening_window_minutes / 60
 
 
 def is_check_fresh(state: dict, hours: float, now: datetime) -> bool:

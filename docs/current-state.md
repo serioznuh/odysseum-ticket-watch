@@ -93,8 +93,8 @@ A single-user Telegram watcher covering **two independent targets**:
   streak, appears by name in the heartbeat, and raises one degraded-watch alert
   after the supervision threshold. An unchanged condition stays quiet, while a
   later catalogue-wide failure re-arms supervision and raises its own loud
-  blind alert. If the local liveness pulse subsequently goes stale, cloud
-  supervision reports the whole local half dark, never merely degraded.
+  blind alert. Either waits out its cadence tier: 30 min of failed checks from the episode's first (`failing_since`) while a wanted date is pending or the opening window is live, else 6 h without a healthy check; each episode has its own alert key, so recovery re-arms it even the same day.
+  If the local liveness pulse subsequently goes stale, cloud supervision reports the whole local half dark, never merely degraded.
   It also cannot turn a programme-wide `isBookable` bit into guessed format
   evidence, so degradation cannot invent a ticket alert or baseline.
   The showtimes endpoint serves only `isMovie: true` listings and refuses every
