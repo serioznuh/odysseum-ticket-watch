@@ -40,6 +40,14 @@
       ],
       "telegram_message_id": 44
     },
+    "3c9861e460bf457a976099b190e0691c": {
+      "delivered_at": "2026-09-29T00:05:15.121438+02:00",
+      "delivery_id": "telegram:7b8e7f172d2faecaa4741bbf",
+      "keys": [
+        "heartbeat:2026-09-29"
+      ],
+      "telegram_message_id": 46
+    },
     "58e7ac6270974b97b7c030cde564bad1": {
       "delivered_at": "2026-09-21T10:16:52.596607+02:00",
       "delivery_id": "telegram:e0a374c8bf037eeb812d03ee",
@@ -67,32 +75,16 @@
       "imax70"
     ]
   },
-  "last_catalogue_ok": "2026-09-29T00:00:04.742567+02:00",
-  "last_check_ok": "2026-09-29T00:00:04.742567+02:00",
-  "last_heartbeat": "2026-09-22T00:03:41.315560+02:00",
+  "last_catalogue_ok": "2026-09-29T00:05:15.121438+02:00",
+  "last_check_ok": "2026-09-29T00:05:15.121438+02:00",
+  "last_heartbeat": "2026-09-29T00:05:15.121438+02:00",
   "outbox": {},
   "reminders_sent": {
     "2026-09-09T09:00:00+02:00": [
       "1440"
     ]
   },
-  "reservations": {
-    "telegram:7b8e7f172d2faecaa4741bbf": {
-      "ack": {
-        "at": "2026-09-29T00:05:15.121438+02:00",
-        "type": "heartbeat"
-      },
-      "delivery_id": "telegram:7b8e7f172d2faecaa4741bbf",
-      "expires_at": "2026-10-06T00:05:15.121438+02:00",
-      "force": false,
-      "generation": 1,
-      "holder": "local:d4670810a1244cab",
-      "lease_expires_at": "2026-09-29T00:15:20.304359+02:00",
-      "reserved_at": "2026-09-29T00:05:20.304359+02:00",
-      "status": "held",
-      "token": "3c9861e460bf457a976099b190e0691c"
-    }
-  },
+  "reservations": {},
   "sale_target": null,
   "sales": {
     "dune-troisieme-partie-50828": "2026-09-09T09:00:00+02:00",
