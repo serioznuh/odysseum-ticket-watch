@@ -66,7 +66,7 @@
     }
   },
   "error_alerted": false,
-  "failure_streak": 0,
+  "failure_streak": 1,
   "formats_seen": {
     "dune-troisieme-partie-50828": [
       "other"
@@ -77,6 +77,7 @@
   },
   "last_catalogue_ok": "2026-09-29T15:52:03.491595+02:00",
   "last_check_ok": "2026-09-29T15:52:03.491595+02:00",
+  "last_error": "HTTP 403",
   "last_heartbeat": "2026-09-29T00:05:15.121438+02:00",
   "outbox": {},
   "reminders_sent": {
