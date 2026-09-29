@@ -66,7 +66,7 @@
     }
   },
   "error_alerted": false,
-  "failure_streak": 5,
+  "failure_streak": 6,
   "formats_seen": {
     "dune-troisieme-partie-50828": [
       "other"
