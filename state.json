@@ -112,7 +112,24 @@
       "1440"
     ]
   },
-  "reservations": {},
+  "reservations": {
+    "telegram:0418a1dc8ecd7a4d1a469c23": {
+      "ack": {
+        "keys": [
+          "recovered:2026-09-30T2015"
+        ],
+        "type": "alerts"
+      },
+      "delivery_id": "telegram:0418a1dc8ecd7a4d1a469c23",
+      "force": false,
+      "generation": 1,
+      "holder": "local:d4670810a1244cab",
+      "lease_expires_at": "2026-09-30T20:25:38.189362+02:00",
+      "reserved_at": "2026-09-30T20:15:38.189362+02:00",
+      "status": "held",
+      "token": "33cedc90118a4306b2cda49158adb031"
+    }
+  },
   "sale_target": null,
   "sales": {
     "dune-troisieme-partie-50828": "2026-09-09T09:00:00+02:00",
