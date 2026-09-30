@@ -110,13 +110,13 @@ below as superseded by OTW-37 or OTW-41 are reassessed as new items.
 
 **Owner involvement:** create the Healthchecks.io check, link Telegram and put
 the ping URL in `~/.ticket-watch/.env`; approve the `scripts/local-check.sh`
-change in OTW-39; create a Telegram test bot for the shadow and save its
-credentials in `~/.onsale-watch-shadow.env`; approve the launchd and workflow
-steps of the takeover; from 2026-12-01 keep the Mac awake and tighten the
-Healthchecks grace to 60 minutes. The `onsale-watch` repository exists
-(private, created 2026-09-30, cloned at `~/Documents/Projects/onsale-watch`).
-Everything else is built and merged by the review loops under the approval list
-in AGENTS.md.
+change in OTW-39; approve the launchd and workflow steps of the takeover; from
+2026-12-01 keep the Mac awake and tighten the Healthchecks grace to 60 minutes.
+Already in place: the `onsale-watch` repository (private, created 2026-09-30,
+cloned at `~/Documents/Projects/onsale-watch`) and the shadow's test bot, whose
+credentials are in `~/.onsale-watch-shadow.env` and delivered a test message
+on 2026-09-30. Everything else is built and merged by the review loops under
+the approval list in AGENTS.md.
 
 **Loop safety:** in `serioznuh/cross-llm-review`, CR-112 and CR-113 (merged
 2026-09-24) removed the failure behind OTW-28's merge, which passed its approval,
