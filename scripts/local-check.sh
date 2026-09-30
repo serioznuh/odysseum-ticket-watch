@@ -146,6 +146,15 @@ if surviving_group "$sync_status"; then
        "firing stops until that group is gone" >&2
   exit "$sync_status"
 fi
+if [ "$sync_status" -eq "$STATE_BOOTSTRAP_REQUIRED_EXIT" ]; then
+  # The ref vanished after the pre-run sync. Same operator condition and same
+  # hard stop: never masked by an earlier ordinary failure, and never reported to
+  # the dead-man's switch below as a completed firing.
+  echo "ERROR: shared runtime-state ref went missing during this firing; no send" \
+       "may happen until 'watcher.state_sync init' (new install) or 'recover'" \
+       "(existing one) runs" >&2
+  exit "$sync_status"
+fi
 if [ "$sync_status" -ne 0 ] && [ "$status" -eq 0 ]; then
   status=$sync_status
 fi
@@ -163,7 +172,14 @@ fi
 # only its status does. The request runs under the deployment pull's boundary,
 # and its outcome never changes this firing's status or state. Unset or empty:
 # no ping, nothing else changes.
-HEALTHCHECK_PING_TIMEOUT_SECONDS=10
+#
+# The whole ping, stopping a hung request included, fits in 10 s: the request
+# gets 7 s, stopping and reaping its tree at most 2 s more (SIGTERM, then SIGKILL
+# halfway), and the runner's 1 s allowance for recording a tree that outlived both
+# (state_sync.SURVIVOR_RECORD_ALLOWANCE_SECONDS) closes the budget. A test pins
+# the sum.
+HEALTHCHECK_PING_TIMEOUT_SECONDS=7
+HEALTHCHECK_PING_CLEANUP_SECONDS=2
 
 ping_healthcheck() (
   set +x
@@ -174,12 +190,12 @@ ping_healthcheck() (
   printf 'url = "%s"\n' "$HEALTHCHECK_PING_URL" \
     | .venv/bin/python -m watcher.state_sync bounded \
         --timeout "$HEALTHCHECK_PING_TIMEOUT_SECONDS" \
+        --cleanup-budget "$HEALTHCHECK_PING_CLEANUP_SECONDS" \
         -- curl --disable --silent --fail --output /dev/null --config - \
         >/dev/null 2>&1 || ping_status=$?
   if [ "$ping_status" -ne 0 ]; then
-    echo "WARNING: the Healthchecks.io ping failed or took over" \
-         "${HEALTHCHECK_PING_TIMEOUT_SECONDS}s (status $ping_status); this" \
-         "firing's own status is unchanged" >&2
+    echo "WARNING: the Healthchecks.io ping failed or timed out (status" \
+         "$ping_status); this firing's own status is unchanged" >&2
   fi
 )
 

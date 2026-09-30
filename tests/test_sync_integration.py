@@ -1324,7 +1324,10 @@ def test_a_stop_signal_still_records_a_group_a_nested_level_announced(tmp_path):
 
 PING_URL = "https://hc-ping.invalid/00000000-secret-ping-uuid"
 PING_DOTENV = f"export HEALTHCHECK_PING_URL={PING_URL}\n"
-PING_TIMEOUT = 10.0  # the script's HEALTHCHECK_PING_TIMEOUT_SECONDS
+# The whole ping's ceiling, stopping a hung request included; the script splits
+# it into a 7 s request and a 2 s cleanup (test_state_sync pins the arithmetic).
+PING_CEILING = 10.0
+PING_REQUEST_TIMEOUT = 7.0
 
 
 def fake_curl(directory: Path) -> Path:
@@ -1332,13 +1335,16 @@ def fake_curl(directory: Path) -> Path:
 
     `fail` echoes the config it was given (the URL) to both streams before
     failing, so a test can prove neither stream reaches the log; `hang` never
-    answers. It runs in the firing's working directory, the repo.
+    answers; `stubborn` never answers and ignores SIGTERM, so only SIGKILL stops
+    it. It runs in the firing's working directory, the repo.
     """
     directory.mkdir(parents=True, exist_ok=True)
     shim = directory / "curl"
     shim.write_text(
         f"#!{sys.executable}\n"
-        "import json, os, sys, time\n"
+        "import json, os, signal, sys, time\n"
+        "if os.environ.get('OTW_FAKE_CURL') == 'stubborn':\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "config = sys.stdin.read()\n"
         "with open('call-sequence', 'a') as stream:\n"
         "    stream.write('curl\\n')\n"
@@ -1350,7 +1356,7 @@ def fake_curl(directory: Path) -> Path:
         "    print(config, flush=True)\n"
         "    print('curl: (22) ' + config, file=sys.stderr, flush=True)\n"
         "    sys.exit(22)\n"
-        "if mode == 'hang':\n"
+        "if mode in ('hang', 'stubborn'):\n"
         f"    time.sleep({HUNG_SECONDS})\n",
         encoding="utf-8",
     )
@@ -1434,6 +1440,8 @@ def test_a_firing_that_failed_but_completed_still_pings(tmp_path, two_clones):
         ("pre-sync", state_sync.UNGUARDED_TREE_EXIT),
         ("watcher", state_sync.UNCONFIRMED_TREE_EXIT),
         ("post-sync", state_sync.UNGUARDED_TREE_EXIT),
+        # The ref vanished between the pre-run and the post-run sync (round 1).
+        ("post-sync", BOOTSTRAP_REQUIRED_EXIT),
     ],
 )
 def test_a_hard_stop_sends_no_ping(tmp_path, two_clones, stop, code):
@@ -1469,13 +1477,14 @@ def state_snapshot(origin: Path, local: Path) -> tuple:
     )
 
 
-@pytest.mark.parametrize("mode", ["fail", "hang"])
+@pytest.mark.parametrize("mode", ["fail", "hang", "stubborn"])
 def test_a_failing_or_hanging_ping_changes_neither_status_nor_state(
     tmp_path, two_clones, mode
 ):
     """A ping that fails or never answers is logged — without the URL — and
-    costs the firing at most its 10 s bound; the exit status and every state
-    store come out exactly as they do with no ping configured at all."""
+    costs the firing at most 10 s, stopping it included, even when only SIGKILL
+    stops it; the exit status and every state store come out exactly as they do
+    with no ping configured at all."""
     origin, local, _ = two_clones
     synchronize(local)
     baseline = fire_with_curl(local, tmp_path)
@@ -1492,12 +1501,14 @@ def test_a_failing_or_hanging_ping_changes_neither_status_nor_state(
     assert len(calls) == 1
     assert "WARNING: the Healthchecks.io ping failed" in fired.stderr
     assert_url_not_logged(fired)
-    if mode == "hang":
-        # The ping began after everything else; from there the firing took its
-        # bound plus the moment stopping the tree takes, and not a second more.
+    if mode != "fail":
+        # The ping began after everything else, so from there to the end of the
+        # firing is what it cost: the request's timeout, the stop, and the exit of
+        # the shell and its supervisor — all inside the 10 s ceiling.
         delay = finished - calls[0]["started"]
-        assert PING_TIMEOUT - 1 < delay < PING_TIMEOUT + 2.5, delay
-        assert_tree_stopped([calls[0]["pid"]])
+        # (Measured from the fake curl's own start, after its interpreter loaded.)
+        assert PING_REQUEST_TIMEOUT - 2 < delay < PING_CEILING, delay
+        assert not is_alive(calls[0]["pid"])
 
 
 @pytest.mark.parametrize("dotenv", ["", "export HEALTHCHECK_PING_URL=\n"])
