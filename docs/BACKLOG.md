@@ -108,15 +108,15 @@ takeover (OTW-41) is done by 2026-11-15. If either date is missed, v2 is
 abandoned for this watch: OTW-32 lands on v1, OTW-39 stays, and the items closed
 below as superseded by OTW-37 or OTW-41 are reassessed as new items.
 
-**Owner involvement:** create the Healthchecks.io check, link Telegram and put
-the ping URL in `~/.ticket-watch/.env`; approve the `scripts/local-check.sh`
-change in OTW-39; approve the launchd and workflow steps of the takeover; from
-2026-12-01 keep the Mac awake and tighten the Healthchecks grace to 60 minutes.
-Already in place: the `onsale-watch` repository (private, created 2026-09-30,
-cloned at `~/Documents/Projects/onsale-watch`) and the shadow's test bot, whose
-credentials are in `~/.onsale-watch-shadow.env` and delivered a test message
-on 2026-09-30. Everything else is built and merged by the review loops under
-the approval list in AGENTS.md.
+**Owner involvement:** approve the `scripts/local-check.sh` change in OTW-39;
+approve the launchd and workflow steps of the takeover; from 2026-12-01 keep
+the Mac awake and tighten the Healthchecks grace to 60 minutes. Already in
+place since 2026-09-30: the `onsale-watch` repository (private, cloned at
+`~/Documents/Projects/onsale-watch`); the shadow's test bot, whose credentials
+are in `~/.onsale-watch-shadow.env` and delivered a test message; the
+Healthchecks.io check with Telegram linked (its test notification arrived) and
+`HEALTHCHECK_PING_URL` in `~/.ticket-watch/.env`. Everything else is built and
+merged by the review loops under the approval list in AGENTS.md.
 
 **Loop safety:** in `serioznuh/cross-llm-review`, CR-112 and CR-113 (merged
 2026-09-24) removed the failure behind OTW-28's merge, which passed its approval,
@@ -1415,9 +1415,13 @@ own bot and carry only the check's name, so the check is named after the watch
 so each dark episode also ends with one "is now UP" message; README says so.
 The same URL moves to v2 at the takeover (OTW-41); v2 in shadow never pings this
 check.
-**Owner actions:** create the account and the check, link Telegram, put the URL
-in `~/.ticket-watch/.env`, approve the script change (docs/verification.md,
-scheduling checks).
+**Owner actions:** done on 2026-09-30: the account, the check, the Telegram link
+(test notification received) and `HEALTHCHECK_PING_URL` in
+`~/.ticket-watch/.env`; the next firing sourced the file and ran normally. The
+check has never been pinged, so it stays silent until this item ships. Still
+needed: the owner's approval of the script change (docs/verification.md,
+scheduling checks), and a look at the check's period and grace, which were not
+verified from here.
 **Files:** `scripts/local-check.sh`, the wrapper tests in
 `tests/test_sync_integration.py` or `tests/test_state_sync.py`, `README.md`,
 `docs/current-state.md`.
