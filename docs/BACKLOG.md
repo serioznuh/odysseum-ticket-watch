@@ -1415,13 +1415,13 @@ own bot and carry only the check's name, so the check is named after the watch
 so each dark episode also ends with one "is now UP" message; README says so.
 The same URL moves to v2 at the takeover (OTW-41); v2 in shadow never pings this
 check.
-**Owner actions:** done on 2026-09-30: the account, the check, the Telegram link
-(test notification received) and `HEALTHCHECK_PING_URL` in
-`~/.ticket-watch/.env`; the next firing sourced the file and ran normally. The
-check has never been pinged, so it stays silent until this item ships. Still
-needed: the owner's approval of the script change (docs/verification.md,
-scheduling checks), and a look at the check's period and grace, which were not
-verified from here.
+**Owner actions:** done on 2026-09-30: the account; the check `Dune ticket watch
+(Mac)` with period 5 minutes and grace 3 hours; the Telegram link, switched on
+for that check, with its test notification received; and
+`HEALTHCHECK_PING_URL` in `~/.ticket-watch/.env`, which matches that check. The
+next firing sourced the file and ran normally. The check has never been pinged,
+so it stays silent until this item ships. Still needed: the owner's approval of
+the script change (docs/verification.md, scheduling checks).
 **Files:** `scripts/local-check.sh`, the wrapper tests in
 `tests/test_sync_integration.py` or `tests/test_state_sync.py`, `README.md`,
 `docs/current-state.md`.
