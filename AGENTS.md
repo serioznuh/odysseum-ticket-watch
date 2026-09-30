@@ -95,8 +95,8 @@ Use the lowest-risk check that proves the change — details in
   `OTW-02`, …) that are never renumbered or reused.
 - When asked to implement an ID (e.g. "implement OTW-03"), read that item first —
   it contains the problem, fix sketch, file paths, and done-when criteria.
-- After completing an item, tick its Done checkbox in the index table and
-  reference the ID in the commit message.
+- After completing an item, tick its Done checkbox in the index table and cite
+  the ID in the commit. In a cross-review loop never tick it: wrap-up does.
 - New items: append with the next unused number in the fitting section; never
   repurpose an existing ID.
 
