@@ -690,14 +690,20 @@ def install_local_check(repo: Path) -> Path:
     )
     script.chmod(0o755)
     (repo / ".env").write_text("", encoding="utf-8")
-    (repo / ".venv" / "bin").mkdir(parents=True)
+    (repo / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
     stub = repo / ".venv" / "bin" / "python"
     # OTW_FAKE_SYNC_EXIT[_ON] lets a test give one `sync` call an exit status that
     # is impractical to provoke for real (a Git group nothing could stop), while
-    # every other state_sync call stays the real thing.
+    # every other state_sync call stays the real thing. OTW_FAKE_DEPLOY_EXIT does
+    # the same for the bounded deployment pull. Every call is appended to
+    # `call-sequence`, so a test can read the order a firing ran its steps in.
     stub.write_text(
         "#!/bin/sh\n"
         'if [ "$1" = "-m" ] && [ "$2" = "watcher.state_sync" ]; then\n'
+        '  printf "state_sync %s\\n" "$3" >> call-sequence\n'
+        '  if [ "$3" = "bounded" ] && [ "$5" = "git" ] && [ -n "${OTW_FAKE_DEPLOY_EXIT:-}" ]; then\n'
+        '    exit "$OTW_FAKE_DEPLOY_EXIT"\n'
+        "  fi\n"
         '  if [ "$3" = "sync" ] && [ -n "${OTW_FAKE_SYNC_EXIT:-}" ]; then\n'
         '    calls=$(( $(cat sync-calls 2>/dev/null || echo 0) + 1 ))\n'
         '    printf %s "$calls" > sync-calls\n'
@@ -708,6 +714,7 @@ def install_local_check(repo: Path) -> Path:
         '  exec "$REAL_PYTHON" "$@"\n'
         "fi\n"
         "printf '%s\\n' \"$*\" >> watcher-invocations\n"
+        "echo watcher >> call-sequence\n"
         # OTW_FAKE_WATCHER_EXIT: the status a real pass returns when one of its
         # delivery reservations left a Git group it could not stop (OTW-28).
         'exit "${OTW_FAKE_WATCHER_EXIT:-0}"\n',
@@ -1054,8 +1061,11 @@ def test_overall_deadline_releases_the_lock_only_after_the_tree_stops(tmp_path):
     assert "next firing" in followed.stdout
 
 
-def fire_local_check(repo: Path, **extra: str) -> subprocess.CompletedProcess[str]:
+def fire_local_check(
+    repo: Path, *, dotenv: str = "", **extra: str
+) -> subprocess.CompletedProcess[str]:
     script = install_local_check(repo)
+    (repo / ".env").write_text(dotenv, encoding="utf-8")
     env = child_env()
     env["REAL_PYTHON"] = sys.executable
     env.update(extra)
@@ -1306,6 +1316,212 @@ def test_a_stop_signal_still_records_a_group_a_nested_level_announced(tmp_path):
             firing.kill()
             firing.wait()
         kill_group(survivor)
+
+
+# ---------------------------------------------------------------------------
+# OTW-39: the dead-man's switch pings once, at the end of a completed firing
+# ---------------------------------------------------------------------------
+
+PING_URL = "https://hc-ping.invalid/00000000-secret-ping-uuid"
+PING_DOTENV = f"export HEALTHCHECK_PING_URL={PING_URL}\n"
+# The whole ping's ceiling, stopping a hung request included; the script splits
+# it into a 7 s request and a 2 s cleanup (test_state_sync pins the arithmetic).
+PING_CEILING = 10.0
+PING_REQUEST_TIMEOUT = 7.0
+
+
+def fake_curl(directory: Path) -> Path:
+    """A `curl` that records each call and answers as OTW_FAKE_CURL says.
+
+    `fail` echoes the config it was given (the URL) to both streams before
+    failing, so a test can prove neither stream reaches the log; `hang` never
+    answers; `stubborn` never answers and ignores SIGTERM, so only SIGKILL stops
+    it. It runs in the firing's working directory, the repo.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    shim = directory / "curl"
+    shim.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, signal, sys, time\n"
+        "if os.environ.get('OTW_FAKE_CURL') == 'stubborn':\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "config = sys.stdin.read()\n"
+        "with open('call-sequence', 'a') as stream:\n"
+        "    stream.write('curl\\n')\n"
+        "with open('curl-calls', 'a') as stream:\n"
+        "    stream.write(json.dumps({'argv': sys.argv[1:], 'config': config,\n"
+        "        'pid': os.getpid(), 'started': time.time()}) + '\\n')\n"
+        "mode = os.environ.get('OTW_FAKE_CURL', 'ok')\n"
+        "if mode == 'fail':\n"
+        "    print(config, flush=True)\n"
+        "    print('curl: (22) ' + config, file=sys.stderr, flush=True)\n"
+        "    sys.exit(22)\n"
+        "if mode in ('hang', 'stubborn'):\n"
+        f"    time.sleep({HUNG_SECONDS})\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+def curl_calls(repo: Path) -> list[dict]:
+    calls = repo / "curl-calls"
+    if not calls.exists():
+        return []
+    return [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+
+
+def call_sequence(repo: Path) -> list[str]:
+    return (repo / "call-sequence").read_text(encoding="utf-8").splitlines()
+
+
+def fire_with_curl(
+    repo: Path, tmp_path: Path, **extra: str
+) -> subprocess.CompletedProcess[str]:
+    """One firing with the fake `curl` first on PATH; earlier records cleared."""
+    for record in ("call-sequence", "curl-calls", "sync-calls", "watcher-invocations"):
+        (repo / record).unlink(missing_ok=True)
+    shim = fake_curl(tmp_path / "fake-curl")
+    extra.setdefault("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
+    return fire_local_check(repo, **extra)
+
+
+def assert_url_not_logged(fired: subprocess.CompletedProcess[str]) -> None:
+    assert PING_URL not in fired.stdout
+    assert PING_URL not in fired.stderr
+    assert "secret-ping-uuid" not in fired.stdout + fired.stderr
+
+
+def test_a_completed_firing_pings_once_after_its_post_run_sync(tmp_path, two_clones):
+    """With the URL in `.env`, the one ping is the firing's last step: after the
+    post-run sync, through the bounded runner, with the URL on stdin only."""
+    _, local, _ = two_clones
+    synchronize(local)
+
+    fired = fire_with_curl(local, tmp_path, dotenv=PING_DOTENV)
+
+    assert fired.returncode == 0, fired.stderr
+    calls = curl_calls(local)
+    assert len(calls) == 1
+    assert calls[0]["config"] == f'url = "{PING_URL}"\n'
+    assert all("secret-ping-uuid" not in arg for arg in calls[0]["argv"])  # not in `ps`
+    assert call_sequence(local)[-6:] == [
+        "state_sync bounded",  # the deployment pull, which then re-execs
+        "state_sync sync",
+        "watcher",
+        "state_sync sync",
+        "state_sync bounded",  # the ping's boundary…
+        "curl",  # …and the ping itself, nothing after it
+    ]
+    assert "Healthchecks.io" not in fired.stderr
+    assert_url_not_logged(fired)
+
+
+def test_a_firing_that_failed_but_completed_still_pings(tmp_path, two_clones):
+    """The ping says "the job ran", not "the job is healthy": an ordinary failure
+    (here a failed deployment) keeps its status and still pings once."""
+    _, local, _ = two_clones
+    synchronize(local)
+    git(local, "remote", "set-url", "origin", str(local.parent / "vanished.git"))
+
+    fired = fire_with_curl(local, tmp_path, dotenv=PING_DOTENV)
+
+    assert fired.returncode == 1
+    assert "code deployment from origin/main failed" in fired.stderr
+    assert len(curl_calls(local)) == 1
+    assert call_sequence(local)[-2:] == ["state_sync bounded", "curl"]
+
+
+@pytest.mark.parametrize(
+    ("stop", "code"),
+    [
+        ("missing-ref", BOOTSTRAP_REQUIRED_EXIT),
+        ("deploy", state_sync.UNCONFIRMED_TREE_EXIT),
+        ("pre-sync", state_sync.UNGUARDED_TREE_EXIT),
+        ("watcher", state_sync.UNCONFIRMED_TREE_EXIT),
+        ("post-sync", state_sync.UNGUARDED_TREE_EXIT),
+        # The ref vanished between the pre-run and the post-run sync (round 1).
+        ("post-sync", BOOTSTRAP_REQUIRED_EXIT),
+    ],
+)
+def test_a_hard_stop_sends_no_ping(tmp_path, two_clones, stop, code):
+    """Exits 3, 5 and 6 leave before the ping at every site they can come from,
+    so a firing that cannot deliver goes quiet and the check alarms."""
+    origin, local, _ = two_clones
+    synchronize(local)
+    extra = {
+        "missing-ref": {},
+        "deploy": {"OTW_FAKE_DEPLOY_EXIT": str(code)},
+        "pre-sync": {"OTW_FAKE_SYNC_EXIT": str(code), "OTW_FAKE_SYNC_EXIT_ON": "1"},
+        "watcher": {"OTW_FAKE_WATCHER_EXIT": str(code)},
+        "post-sync": {"OTW_FAKE_SYNC_EXIT": str(code), "OTW_FAKE_SYNC_EXIT_ON": "2"},
+    }[stop]
+    if stop == "missing-ref":
+        delete_state_ref(origin)
+
+    fired = fire_with_curl(local, tmp_path, dotenv=PING_DOTENV, **extra)
+
+    assert fired.returncode == code, fired.stderr
+    assert curl_calls(local) == []
+    assert "curl" not in call_sequence(local)
+    assert_url_not_logged(fired)
+
+
+def state_snapshot(origin: Path, local: Path) -> tuple:
+    return (
+        live_path(local).read_bytes(),
+        (local / DEFAULT_STORE_PATH / "base.json").read_bytes(),
+        remote_state_commit(origin),
+        load_failure(local / DEFAULT_MARKER_PATH),
+        load_transport_failure(local / DEFAULT_STORE_PATH / TRANSPORT_FAILURE_FILE),
+    )
+
+
+@pytest.mark.parametrize("mode", ["fail", "hang", "stubborn"])
+def test_a_failing_or_hanging_ping_changes_neither_status_nor_state(
+    tmp_path, two_clones, mode
+):
+    """A ping that fails or never answers is logged — without the URL — and
+    costs the firing at most 10 s, stopping it included, even when only SIGKILL
+    stops it; the exit status and every state store come out exactly as they do
+    with no ping configured at all."""
+    origin, local, _ = two_clones
+    synchronize(local)
+    baseline = fire_with_curl(local, tmp_path)
+    assert baseline.returncode == 0, baseline.stderr
+    assert curl_calls(local) == []
+    before = state_snapshot(origin, local)
+
+    fired = fire_with_curl(local, tmp_path, dotenv=PING_DOTENV, OTW_FAKE_CURL=mode)
+    finished = time.time()
+
+    assert fired.returncode == baseline.returncode
+    assert state_snapshot(origin, local) == before
+    calls = curl_calls(local)
+    assert len(calls) == 1
+    assert "WARNING: the Healthchecks.io ping failed" in fired.stderr
+    assert_url_not_logged(fired)
+    if mode != "fail":
+        # The ping began after everything else, so from there to the end of the
+        # firing is what it cost: the request's timeout, the stop, and the exit of
+        # the shell and its supervisor — all inside the 10 s ceiling.
+        delay = finished - calls[0]["started"]
+        # (Measured from the fake curl's own start, after its interpreter loaded.)
+        assert PING_REQUEST_TIMEOUT - 2 < delay < PING_CEILING, delay
+        assert not is_alive(calls[0]["pid"])
+
+
+@pytest.mark.parametrize("dotenv", ["", "export HEALTHCHECK_PING_URL=\n"])
+def test_an_unset_or_empty_ping_url_changes_nothing(tmp_path, two_clones, dotenv):
+    _, local, _ = two_clones
+    synchronize(local)
+
+    fired = fire_with_curl(local, tmp_path, dotenv=dotenv)
+
+    assert fired.returncode == 0, fired.stderr
+    assert curl_calls(local) == []
+    assert call_sequence(local)[-2:] == ["watcher", "state_sync sync"]
+    assert "Healthchecks.io" not in fired.stderr
 
 
 # ---------------------------------------------------------------------------

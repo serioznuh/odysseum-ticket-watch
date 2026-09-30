@@ -67,7 +67,8 @@ source .env && .venv/bin/python -m watcher --test-telegram
 
 - **launchd** (plist or `scripts/local-check.sh` changes): deploy to
   `~/.ticket-watch`, then `launchctl kickstart gui/$(id -u)/com.odysseum.ticket-watch`
-  and check `logs/`.
+  and check `logs/`. With `HEALTHCHECK_PING_URL` set, the Healthchecks.io check
+  shows one ping for that completed firing and the log shows no ping warning.
 - **Actions** (`watch.yml` changes): Actions → *ticket-watch* → Run workflow with
   mode `test` (Telegram hello) or `remind` + dry-run; confirm the credential-check
   step succeeds after the watcher step.

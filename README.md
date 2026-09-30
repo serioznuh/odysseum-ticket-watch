@@ -11,6 +11,7 @@ A small Telegram watcher that tells you **in advance** when *Dune : Troisième p
 - 📍 **Listed at your cinema** (not bookable yet); without wanted dates configured, 🚨 **Tickets bookable NOW** reports new formats
 - 📰 **News lead** — early press hint via Google News (low/medium confidence, strictly filtered — see configuration)
 - 🔴 either watcher half stopped (or Pathé degraded), with bounded repeats / ✅ recovery / 💤 weekly heartbeat
+- From Healthchecks.io's own bot: the Mac stopped completing firings, then one "is now UP" when they resume — see [Dead-man's switch](#dead-mans-switch)
 
 From the second watch target (*La odisea* in IMAX at **Cinesa Diagonal Mar**,
 Barcelona — see [Cinesa target](#cinesa-target)):
@@ -49,7 +50,7 @@ event listings (the 70 mm ones) always answer `"No movie allowed !"`, and their
 bookability is read off the cinema programme. Unexpected detail/showtimes failures
 degrade health without discarding the rest of the snapshot.
 
-Safety nets: 🔴 after 3 consecutive Pathé failures (including partial failures) once the outage outlasts its cadence tier: 30 min of failed checks while a wanted date is pending or an opening is near, otherwise 6 h without a healthy check — one alert per outage, re-armed by recovery; or if the local catalogue pulse stops for 18 h (then every 24 h), or if a complete bounded Actions result contains no scheduled success in the last 18 h. The local check validates enough public API rows for every possible firing before outbox replay or heartbeat; any success proves health, while an API error, incomplete page, or contradictory result stays quiet. A cloud outage alerts once and re-arms only after positive recovery; recovery also retires a pending stale-cloud alert, while stale/unknown health withholds the “healthy” heartbeat. Each cloud run validates its bot and chat without sending after failover work, so a transient probe failure cannot cost a due reminder. No per-run liveness timestamp churns shared state. If **both halves die**, only the absence of the 7-day heartbeat remains.
+Safety nets: 🔴 after 3 consecutive Pathé failures (including partial failures) once the outage outlasts its cadence tier: 30 min of failed checks while a wanted date is pending or an opening is near, otherwise 6 h without a healthy check — one alert per outage, re-armed by recovery; or if the local catalogue pulse stops for 18 h (then every 24 h), or if a complete bounded Actions result contains no scheduled success in the last 18 h. The local check validates enough public API rows for every possible firing before outbox replay or heartbeat; any success proves health, while an API error, incomplete page, or contradictory result stays quiet. A cloud outage alerts once and re-arms only after positive recovery; recovery also retires a pending stale-cloud alert, while stale/unknown health withholds the “healthy” heartbeat. Each cloud run validates its bot and chat without sending after failover work, so a transient probe failure cannot cost a due reminder. No per-run liveness timestamp churns shared state. A dark or stuck Mac is also caught from outside, within the [dead-man's switch](#dead-mans-switch)'s grace; if **both halves die** without it, only the absence of the 7-day heartbeat remains.
 
 ### Cinesa target
 
@@ -151,6 +152,10 @@ once bookable. Wanted dates remain at 5 min until announced. Sleep pauses checks
 failures retry on wake. Both halves sync a dedicated `runtime-state` ref; code
 deployment on `main` is independent of that state history.
 
+### Dead-man's switch
+
+`local-check.sh` ends every firing that runs to its end, healthy or not, with one ping to a [Healthchecks.io](https://healthchecks.io) check. A firing that stops on exit 3, 5 or 6 (a post-run sync included), or that the watchdog kills, sends none — so a dark or stuck Mac becomes one Telegram message after the check's grace instead of 18 h of silence. Pathé health stays with the local 🔴 rule, so one block never alerts twice. Setup: a check with period 5 min and grace 3 h (60 min once the Mac stays awake), its Telegram integration, and `export HEALTHCHECK_PING_URL=…` in the clone's `.env`. The URL is a secret — never in `config.toml`, never logged; unset, nothing is pinged. The whole ping, stopping a hung request included, takes at most 10 s; a failure is logged and never changes the firing's status or state. Its messages come from Healthchecks.io's own bot and carry only the check's name, so name it after the watch ("Dune ticket watch (Mac)"). That integration cannot mute recoveries: each dark episode also ends with one "is now UP".
+
 ## Configuration reference (config.toml)
 
 | Key | Default | What it does |
@@ -197,7 +202,7 @@ deployment on `main` is independent of that state history.
 | `cinesa.chrome_path`, `cinesa.chrome_profile` | macOS Chrome, `.cache/chrome-profile` | Chrome binary for the token step, and a throwaway profile — never your own. |
 | `general.state_file` | `.cache/state-sync/state.json` | Validated live state materialized from the dedicated Git ref. |
 
-Secrets are env-only (never in config.toml): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+Secrets are env-only (never in config.toml): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and the optional, local-only `HEALTHCHECK_PING_URL`.
 
 ## Notes & limitations
 
