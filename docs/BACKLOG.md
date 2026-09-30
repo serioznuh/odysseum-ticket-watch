@@ -100,7 +100,7 @@ dead-man's switch; (B) a fork in a new repository, `onsale-watch`; (C) sends use
 an intent record before the POST and a receipt after it, so at most one
 duplicate ever and one silent note for an unknown outcome; (D) Cinesa stays in
 place, disabled, and is ported to v2 by OTW-42; (E) v2 includes the reminder
-ladder; (F) the kill dates below, a separate Telegram test chat for the shadow,
+ladder; (F) the kill dates below, a separate Telegram test bot for the shadow,
 and the Mac kept awake from 2026-12-01.
 
 **Kill dates and fallback:** the shadow (OTW-40) runs by 2026-10-15 and the
@@ -108,13 +108,15 @@ takeover (OTW-41) is done by 2026-11-15. If either date is missed, v2 is
 abandoned for this watch: OTW-32 lands on v1, OTW-39 stays, and the items closed
 below as superseded by OTW-37 or OTW-41 are reassessed as new items.
 
-**Owner involvement:** create the `onsale-watch` repository; create the
-Healthchecks.io check, link Telegram and put the ping URL in
-`~/.ticket-watch/.env`; approve the `scripts/local-check.sh` change in OTW-39;
-provide a Telegram test chat for the shadow; approve the launchd and workflow
+**Owner involvement:** create the Healthchecks.io check, link Telegram and put
+the ping URL in `~/.ticket-watch/.env`; approve the `scripts/local-check.sh`
+change in OTW-39; create a Telegram test bot for the shadow and save its
+credentials in `~/.onsale-watch-shadow.env`; approve the launchd and workflow
 steps of the takeover; from 2026-12-01 keep the Mac awake and tighten the
-Healthchecks grace to 60 minutes. Everything else is built and merged by the
-review loops under the approval list in AGENTS.md.
+Healthchecks grace to 60 minutes. The `onsale-watch` repository exists
+(private, created 2026-09-30, cloned at `~/Documents/Projects/onsale-watch`).
+Everything else is built and merged by the review loops under the approval list
+in AGENTS.md.
 
 **Loop safety:** in `serioznuh/cross-llm-review`, CR-112 and CR-113 (merged
 2026-09-24) removed the failure behind OTW-28's merge, which passed its approval,
@@ -1292,10 +1294,10 @@ Cinesa half. In 81 days all 35 Telegram messages came from the Mac, the cloud se
 none, and `outbox` and `reservations` were empty in all 2,329 state-ref commits.
 Pushing to `main` deploys within one firing, so v1 cannot be simplified in place
 in stages; the runtime is replaced in a fork while v1 stays frozen.
-**Decisions (owner, 2026-09-30):** a new repository `serioznuh/onsale-watch`,
-created by the owner; no cloud half and no shared state; an intent record before
-each send and a receipt after it; the reminder ladder is included; Cinesa is not
-part of this item (OTW-42).
+**Decisions (owner, 2026-09-30):** a new repository, `serioznuh/onsale-watch`
+(private, created 2026-09-30 with a README and a .gitignore only); no cloud half
+and no shared state; an intent record before each send and a receipt after it;
+the reminder ladder is included; Cinesa is not part of this item (OTW-42).
 **Fix sketch:**
 - *Fork unchanged, with their tests:* `watcher/pathe.py` (request headers, three
   retries with backoff, the permanent `403 "No movie allowed !"` on event
@@ -1407,10 +1409,12 @@ logged and never changes the exit status. The URL is a secret:
 `HEALTHCHECK_PING_URL` in the git-ignored `.env`, never in `config.toml` or the
 log; when it is unset the script behaves exactly as today. Owner-side settings:
 period 5 minutes; grace 3 hours until 2026-12-01, then 60 minutes, which still
-tolerates the closed-lid night above; "up" notifications muted if the
-integration allows. Its messages come from Healthchecks.io's own bot and do not
-name film or cinema; README says so. The same URL moves to v2 at the takeover
-(OTW-41); v2 in shadow never pings this check.
+tolerates the closed-lid night above. Its messages come from Healthchecks.io's
+own bot and carry only the check's name, so the check is named after the watch
+("Dune ticket watch (Mac)"). The Telegram integration cannot mute recoveries,
+so each dark episode also ends with one "is now UP" message; README says so.
+The same URL moves to v2 at the takeover (OTW-41); v2 in shadow never pings this
+check.
 **Owner actions:** create the account and the check, link Telegram, put the URL
 in `~/.ticket-watch/.env`, approve the script change (docs/verification.md,
 scheduling checks).
@@ -1431,11 +1435,13 @@ docs/verification.md.
 matters (`pathe_target:`) has never fired, so "both versions stayed silent"
 proves nothing on its own.
 **Fix sketch:** install v2 at `~/.onsale-watch` with its own LaunchAgent in
-`--shadow` mode: no access to the owner's chat, its own state file, no write to
-v1's store or to `refs/heads/runtime-state`, no ping to the production
-Healthchecks check. Inputs: a replay of the OTW-38 files, plus one live
-programme poll per hour (about 1% of v1's Pathé traffic). All gates are
-required:
+`--shadow` mode: its own state file, no write to v1's store or to
+`refs/heads/runtime-state`, no ping to the production Healthchecks check. Its
+`.env` holds only the owner's separate test bot (token and chat id from
+`~/.onsale-watch-shadow.env`), never the production bot's token, so the shadow
+cannot reach the production chat whatever its code does. Inputs: a replay of the
+OTW-38 files, plus one live programme poll per hour (about 1% of v1's Pathé
+traffic). All gates are required:
 1. *Replay:* for every tapped poll, v2's would-send keys equal what v1 sent
    (v1's log and `alerts`), including "nothing".
 2. *Fixtures:* v1's Pathé, detection, merging and notify fixtures pass against
@@ -1448,7 +1454,7 @@ required:
 4. *Health:* on a Pathé block, live or replayed from `index.log`, v2's blind and
    recovered verdicts match v1's within one firing.
 5. *Own client:* the hourly live poll succeeds with v2's headers, and one real
-   message reaches the separate Telegram test chat the owner provides.
+   message reaches the owner through the separate test bot.
 6. *Import rehearsal:* v2 loads a copy of the live state's keys and sends
    nothing on the next replay.
 **Kill date:** running by 2026-10-15; otherwise v2 is abandoned for this watch
@@ -1466,7 +1472,8 @@ finish, then unload the LaunchAgent `com.odysseum.ticket-watch`. (2) Disable
 `watch.yml`. (3) Read the final `state.json` from `refs/heads/runtime-state` and
 import its `alerts` keys, `reminders_sent` rungs and `last_heartbeat` into v2's
 state together with the `imported_from_v1` marker; a dry run must show nothing
-pending. (4) Move `HEALTHCHECK_PING_URL` to v2's `.env`, switch v2's LaunchAgent
+pending. (4) In v2's `.env`, replace the test bot's token with the production
+`TELEGRAM_BOT_TOKEN` and add `HEALTHCHECK_PING_URL`; switch v2's LaunchAgent
 from shadow to live, kickstart it, and confirm one ping and a quiet first run.
 (5) Leave v1's clone, its plist file and the state ref untouched until
 2026-12-21. Steps 1, 2 and 4 need the owner's approval (AGENTS.md: launchd and
