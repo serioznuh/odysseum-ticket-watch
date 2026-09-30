@@ -150,4 +150,38 @@ if [ "$sync_status" -ne 0 ] && [ "$status" -eq 0 ]; then
   status=$sync_status
 fi
 
+# OTW-39: an external dead-man's switch. One ping to a Healthchecks.io check says
+# "this firing ran to its end", healthy or not; Pathé health stays with the local
+# rule (OTW-31), so one block never alerts twice. It is the last thing a firing
+# does: the hard stops above (exits 3, 5, 6) and a watchdog kill leave before it,
+# so a Mac that cannot deliver goes quiet and Healthchecks.io raises the alarm.
+#
+# The URL is a secret (HEALTHCHECK_PING_URL, from the git-ignored .env). It never
+# reaches an argument list, where `ps` or the bounded runner's messages would show
+# it: the builtin `printf` hands it to curl as a config file on stdin, xtrace is
+# off in this subshell, and neither of the request's streams reaches the log —
+# only its status does. The request runs under the deployment pull's boundary,
+# and its outcome never changes this firing's status or state. Unset or empty:
+# no ping, nothing else changes.
+HEALTHCHECK_PING_TIMEOUT_SECONDS=10
+
+ping_healthcheck() (
+  set +x
+  if [ -z "${HEALTHCHECK_PING_URL:-}" ]; then
+    exit 0
+  fi
+  ping_status=0
+  printf 'url = "%s"\n' "$HEALTHCHECK_PING_URL" \
+    | .venv/bin/python -m watcher.state_sync bounded \
+        --timeout "$HEALTHCHECK_PING_TIMEOUT_SECONDS" \
+        -- curl --disable --silent --fail --output /dev/null --config - \
+        >/dev/null 2>&1 || ping_status=$?
+  if [ "$ping_status" -ne 0 ]; then
+    echo "WARNING: the Healthchecks.io ping failed or took over" \
+         "${HEALTHCHECK_PING_TIMEOUT_SECONDS}s (status $ping_status); this" \
+         "firing's own status is unchanged" >&2
+  fi
+)
+
+ping_healthcheck || true
 exit "$status"

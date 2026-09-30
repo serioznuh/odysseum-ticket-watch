@@ -53,7 +53,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-36 | Let a workflow change be verified without touching production state (superseded by OTW-41) | P3 | S | Infra, tooling & docs | [x] |
 | OTW-37 | Build v2 (`onsale-watch`): forked detection, single-writer runtime | P1 | L | Infra, tooling & docs | [ ] |
 | OTW-38 | Snapshot tap: save what each Pathé poll saw, for the v2 shadow | P1 | S | Infra, tooling & docs | [ ] |
-| OTW-39 | External dead-man's switch for a dark Mac (Healthchecks.io) | P1 | S | Infra, tooling & docs | [ ] |
+| OTW-39 | External dead-man's switch for a dark Mac (Healthchecks.io) | P1 | S | Infra, tooling & docs | [x] |
 | OTW-40 | Shadow-run v2 for 14 days and prove parity | P1 | M | Infra, tooling & docs | [ ] |
 | OTW-41 | Take over with v2 and stop v1 | P1 | S | Infra, tooling & docs | [ ] |
 | OTW-42 | Port the Cinesa source into v2 as a disabled adapter | P2 | M | Features | [ ] |
@@ -108,7 +108,7 @@ takeover (OTW-41) is done by 2026-11-15. If either date is missed, v2 is
 abandoned for this watch: OTW-32 lands on v1, OTW-39 stays, and the items closed
 below as superseded by OTW-37 or OTW-41 are reassessed as new items.
 
-**Owner involvement:** approve the `scripts/local-check.sh` change in OTW-39;
+**Owner involvement:** run OTW-39's deploy check and deliberate-stop test;
 approve the launchd and workflow steps of the takeover; from 2026-12-01 keep
 the Mac awake and tighten the Healthchecks grace to 60 minutes. Already in
 place since 2026-09-30: the `onsale-watch` repository (private, cloned at
@@ -1419,9 +1419,10 @@ check.
 (Mac)` with period 5 minutes and grace 3 hours; the Telegram link, switched on
 for that check, with its test notification received; and
 `HEALTHCHECK_PING_URL` in `~/.ticket-watch/.env`, which matches that check. The
-next firing sourced the file and ran normally. The check has never been pinged,
-so it stays silent until this item ships. Still needed: the owner's approval of
-the script change (docs/verification.md, scheduling checks).
+next firing sourced the file and ran normally. The owner approved the script
+change by asking for this item on 2026-09-30. Still needed once it is deployed:
+the deploy check (docs/verification.md, scheduling checks), which shows the
+check's first ping, and the deliberate-stop test in Done when.
 **Files:** `scripts/local-check.sh`, the wrapper tests in
 `tests/test_sync_integration.py` or `tests/test_state_sync.py`, `README.md`,
 `docs/current-state.md`.

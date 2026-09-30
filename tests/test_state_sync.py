@@ -480,6 +480,37 @@ def test_local_check_bounds_the_deployment_pull_and_the_whole_firing():
     assert post_sync < stops[3] < line_of('"$status" -eq 0')
 
 
+def test_local_check_pings_the_dead_mans_switch_last():
+    """OTW-39: the ping is the firing's last step, so every hard stop and a
+    watchdog kill leave before it. It runs under the same bounded runner as the
+    deployment pull, gets 10 s, and cannot change the status the firing exits
+    with (`|| true`, in a subshell that never touches `status`)."""
+    root = Path(__file__).resolve().parent.parent
+    lines = (root / "scripts" / "local-check.sh").read_text(encoding="utf-8").splitlines()
+    code = [
+        (index, line.strip())
+        for index, line in enumerate(lines)
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert [line for _, line in code[-2:]] == ['ping_healthcheck || true', 'exit "$status"']
+    ping = code[-2][0]
+    post_sync = next(i for i, line in enumerate(lines) if "sync_state || sync_status" in line)
+    last_stop = max(i for i, line in enumerate(lines) if line.startswith("if surviving_group"))
+    assert post_sync < last_stop < ping
+    assert sum("ping_healthcheck" in line for _, line in code) == 2  # defined, called once
+
+    script = "\n".join(lines)
+    assert re.search(r"^HEALTHCHECK_PING_TIMEOUT_SECONDS=10$", script, re.MULTILINE)
+    body = script[script.index("ping_healthcheck() (") : script.index("\nping_healthcheck ||")]
+    assert "state_sync bounded" in body
+    assert '--timeout "$HEALTHCHECK_PING_TIMEOUT_SECONDS"' in body
+    assert "status=" not in body.replace("ping_status=", "")
+    # The URL only ever reaches the builtin printf, never an argument list.
+    assert body.count("HEALTHCHECK_PING_URL") == 2
+    assert 'printf \'url = "%s"\\n\' "$HEALTHCHECK_PING_URL"' in body
+    assert "--config -" in body and ">/dev/null 2>&1" in body
+
+
 def test_termination_stays_forwarded_while_the_tree_is_cleaned_up():
     """A signal arriving during timeout cleanup must still be forwarded to the
     owned tree. If the handlers were uninstalled before cleanup, that signal
