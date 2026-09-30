@@ -15,7 +15,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 
 | ID | Title | Priority | Effort | Section | Done |
 |----|-------|----------|--------|---------|------|
-| OTW-01 | Docs-contract test in CI | P2 | S | Infra, tooling & docs | [ ] |
+| OTW-01 | Docs-contract test in CI (superseded by OTW-37) | P2 | S | Infra, tooling & docs | [x] |
 | OTW-02 | Add a linter (ruff) | P2 | S | Infra, tooling & docs | [x] |
 | OTW-03 | 403 alert VPN wording wrong on manual CI dispatch | P3 | S | Bugs | [x] |
 | OTW-04 | Cinesa alert: include session times + booking link | P2 | S | Features | [ ] |
@@ -26,78 +26,112 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-09 | Supervision is one-directional — nothing watches the cloud half | P2 | M | Features | [x] |
 | OTW-10 | Cinesa VPN 403 repeatedly launches headed Chrome | P1 | S | Bugs | [x] |
 | OTW-11 | Make Cinesa Chrome refresh normally imperceptible | P2 | S | UX & design | [x] |
-| OTW-12 | Keep reminder promises aligned with current observations | P3 | S | Bugs | [ ] |
+| OTW-12 | Keep reminder promises aligned with current observations (superseded by OTW-37) | P3 | S | Bugs | [x] |
 | OTW-13 | A persistent per-listing Pathé failure is reported as healthy | P2 | S | Bugs | [x] |
 | OTW-14 | An aborted state rebase can wedge the push until a human intervenes | P3 | S | Bugs | [x] |
 | OTW-15 | Reminders ride a cloud cron that fires ~11% of its schedule | P0 | M | Bugs | [x] |
 | OTW-16 | One run fans out a burst of near-identical alerts | P1 | S | Bugs | [x] |
-| OTW-17 | A merged sale message mixing new and moved openings reads oddly | P3 | S | UX & design | [ ] |
+| OTW-17 | A merged sale message mixing new and moved openings reads oddly (superseded by OTW-37) | P3 | S | UX & design | [x] |
 | OTW-18 | Validate state and make recovery explicit | P1 | M | Infra, tooling & docs | [x] |
 | OTW-19 | Split orchestration into bounded jobs | P2 | M | Infra, tooling & docs | [x] |
 | OTW-20 | Persist a notification outbox and delivery receipts | P1 | L | Infra, tooling & docs | [x] |
 | OTW-21 | Separate deployment from runtime-state synchronization | P1 | L | Infra, tooling & docs | [x] |
-| OTW-22 | Move the local owner to an always-on residential host (parked) | P2 | L | Infra, tooling & docs | [ ] |
+| OTW-22 | Move the local owner to an always-on residential host (superseded by OTW-39) | P2 | L | Infra, tooling & docs | [x] |
 | OTW-23 | Validate source timestamps and handle final state-save failures | P2 | S | Bugs | [x] |
 | OTW-24 | Guarantee Cinesa leak tracking when outcome-building raises | P3 | S | Bugs | [ ] |
 | OTW-25 | Test legacy rebase recovery (superseded by OTW-21) | P3 | S | Infra, tooling & docs | [x] |
-| OTW-26 | Bound runtime-state history fetched by ephemeral runners | P3 | M | Infra, tooling & docs | [ ] |
+| OTW-26 | Bound runtime-state history fetched by ephemeral runners (superseded by OTW-41) | P3 | M | Infra, tooling & docs | [x] |
 | OTW-27 | Cloud supervision trusts an unstable one-row Actions response and false-alerts | P0 | S | Bugs | [x] |
 | OTW-28 | Coordinate Mac/cloud delivery before sending shared notifications | P1 | L | Infra, tooling & docs | [x] |
 | OTW-29 | Bound Git operations and the local run's lifetime | P1 | M | Infra, tooling & docs | [x] |
 | OTW-30 | Require explicit bootstrap when the shared runtime-state ref is missing | P2 | M | Infra, tooling & docs | [x] |
 | OTW-31 | A blocked Pathé check stays silent for 6 h while a wanted date is pending | P1 | S | Bugs | [x] |
-| OTW-32 | A GitHub outage holds back alerts only the Mac can produce | P2 | M | Infra, tooling & docs | [ ] |
-| OTW-33 | Cloud supervision polls GitHub every firing and is rate-limited a third of the day | P2 | S | Bugs | [ ] |
-| OTW-34 | Per-firing liveness timestamps commit to the shared ref ~280 times a day | P3 | S | Infra, tooling & docs | [ ] |
-| OTW-35 | Plan the end of the watch: stop after 20 December, decide Cinesa's future | P2 | S | Infra, tooling & docs | [ ] |
-| OTW-36 | Let a workflow change be verified without touching production state | P3 | S | Infra, tooling & docs | [ ] |
+| OTW-32 | A GitHub outage holds back alerts only the Mac can produce (hedge if v2 slips) | P2 | S | Infra, tooling & docs | [ ] |
+| OTW-33 | Cloud supervision polls GitHub every firing and is rate-limited a third of the day (superseded by OTW-39) | P2 | S | Bugs | [x] |
+| OTW-34 | Per-firing liveness timestamps commit to the shared ref ~280 times a day (superseded by OTW-41) | P3 | S | Infra, tooling & docs | [x] |
+| OTW-35 | Write the v1 switch-off checklist; Cinesa stays, disabled | P2 | S | Infra, tooling & docs | [ ] |
+| OTW-36 | Let a workflow change be verified without touching production state (superseded by OTW-41) | P3 | S | Infra, tooling & docs | [x] |
+| OTW-37 | Build v2 (`onsale-watch`): forked detection, single-writer runtime | P1 | L | Infra, tooling & docs | [ ] |
+| OTW-38 | Snapshot tap: save what each Pathé poll saw, for the v2 shadow | P1 | S | Infra, tooling & docs | [ ] |
+| OTW-39 | External dead-man's switch for a dark Mac (Healthchecks.io) | P1 | S | Infra, tooling & docs | [ ] |
+| OTW-40 | Shadow-run v2 for 14 days and prove parity | P1 | M | Infra, tooling & docs | [ ] |
+| OTW-41 | Take over with v2 and stop v1 | P1 | S | Infra, tooling & docs | [ ] |
+| OTW-42 | Port the Cinesa source into v2 as a disabled adapter | P2 | M | Features | [ ] |
 
-## Recommended next work (reviewed 2026-09-24)
+## Recommended next work (reviewed 2026-09-30)
 
-OTW-28 closed the last planned architecture item. What the watch still has to
-deliver is the IMAX 70 mm alert for the wanted dates, 19–20 December; on
-2026-09-24 the 70 mm programme was bookable for 15 December only, so that alert
-can come any day. The order below protects it first, then lowers operating noise,
-then prepares the end of the watch. The index above is the completion record;
-estimates include implementation and verification.
+The 2026-09-25 review found the live system healthy for its one remaining job,
+the IMAX 70 mm alert for 19–20 December, and far larger than that job needs. On
+2026-09-30 the owner decided to replace the runtime with a fork, v2
+(`onsale-watch`), and to freeze v1 meanwhile. The order below protects the alert
+first, then builds and proves v2, then hands over. The index above is the
+completion record; estimates include implementation and verification.
 
 | Order | ID | Work and reason for this position | Effort estimate |
 | --- | --- | --- | --- |
-| 1 | OTW-31 | A blocked Pathé check must be reported within about 30 minutes while a wanted date is pending, not after 6 h; this silence recurred on 2026-09-18. | S · 2–4 h |
-| 2 | OTW-33 | Cloud supervision has been blind on roughly a third of firings since 2026-09-21; throttling fixes it without a new secret. | S · 2–3 h |
-| 3 | OTW-32 | Decided by default (implement, premise enforced in code) so a GitHub outage cannot delay the wanted-date alert; land it before December. | M · about 1 day |
-| 4 | OTW-34 | Bring ~280 daily state-ref commits down to a bounded liveness resolution; this also reduces reservation contention and OTW-26's growth. | S · 3–4 h |
-| 5 | OTW-35 | Ready by 2026-12-15; the watch then goes quiet on its own after 2026-12-20, and Cinesa retires with it unless a new target is named. | S · 3–4 h |
-| 6 | OTW-12 | Reminder wording versus the effective ladder; less valuable since the national sale opened on 2026-09-09, but still reproducible. | S · 3–4 h |
-| 7 | OTW-01 | Documentation checks; `docs/current-state.md` is at 179 of its 180-line budget and items 1–5 all touch it. | S · 2–4 h |
-| 8 | OTW-17 | Merged new/moved sale wording; low value after the sale opened. | S · 2–4 h |
-| 9 | OTW-36 | Lets loops verify a workflow change without the owner; needed before the next `watch.yml` change, not sooner. | S · 2–4 h |
+| 1 | OTW-39 | Dead-man's switch on v1 now, inherited by v2: a dark Mac becomes loud within hours, and within the hour in December, instead of after 18 h. | S · about 2 h |
+| 2 | OTW-38 | Snapshot tap on v1, so the v2 shadow replays real polls without adding Pathé traffic; it must run before the shadow starts. | S · about 3 h |
+| 3 | OTW-37 | Build v2 in its own repository: forked Pathé and detection code, a new single-writer runtime. | L · 16–24 h |
+| 4 | OTW-40 | Shadow-run v2 for 14 days against the parity gates; running by 2026-10-15. | M · about 6 h, plus 14 days |
+| 5 | OTW-41 | Take over with v2 and stop v1; done by 2026-11-15. | S · about 4 h |
+| 6 | OTW-35 | The v1 switch-off checklist that OTW-41 is run from; written while the shadow runs. | S · about 1 h |
+| 7 | OTW-42 | Port the Cinesa source into v2 once a film is named, or after 2026-12-20. | M · 8–12 h |
+| 8 | OTW-32 | Hedge only: built if a kill date is missed, so a GitHub outage cannot hold the wanted-date alert on v1. | S · about 4 h |
 
-**Owner involvement:** items here are built and merged by the review loops; the
-owner is needed only for the approval list in AGENTS.md: real Telegram sends,
-production state edits, launchd/plist or cron changes, repository visibility,
-force-pushes, loosening news matching. The defaults recorded in OTW-31, OTW-32
-and OTW-35 stand unless the owner objects; no sign-off is needed to start them.
+**Two tracks:** v1, this repository, protects the Dune alert until it is
+delivered or v2 takes over. It receives only OTW-38 and OTW-39, plus OTW-32 if a
+kill date is missed. v2 is tracked here until its repository exists (OTW-37);
+from its first commit its work is tracked in its own backlog, and this one keeps
+the v1 side and the hand-over.
+
+**Why a fork:** measured on 2026-09-25, `watcher/` had 10,381 lines and `tests/`
+12,809. About 4,170 code and 5,170 test lines keep the Mac and the cloud from
+double-sending and move state through Git; 1,262 lines are the disabled Cinesa
+half. All 35 Telegram messages in 81 days came from the Mac and the cloud sent
+none; `outbox` and `reservations` were empty in all 2,329 state-ref commits. The
+Actions cron fired 5–8 times a day, with a median gap of 177–277 minutes in its
+last four weeks. Pushing to `main` deploys within one firing, so v1 cannot be
+simplified in place in stages. Since then OTW-31 raised its first alert on
+2026-09-29 (block from 15:57, alert at 16:29, recovery at 16:35), and the OTW-28
+reservation path ran three times without a fault.
+
+**Owner decisions (2026-09-30):** (A) Healthchecks.io's free plan as the
+dead-man's switch; (B) a fork in a new repository, `onsale-watch`; (C) sends use
+an intent record before the POST and a receipt after it, so at most one
+duplicate ever and one silent note for an unknown outcome; (D) Cinesa stays in
+place, disabled, and is ported to v2 by OTW-42; (E) v2 includes the reminder
+ladder; (F) the kill dates below, a separate Telegram test chat for the shadow,
+and the Mac kept awake from 2026-12-01.
+
+**Kill dates and fallback:** the shadow (OTW-40) runs by 2026-10-15 and the
+takeover (OTW-41) is done by 2026-11-15. If either date is missed, v2 is
+abandoned for this watch: OTW-32 lands on v1, OTW-39 stays, and the items closed
+below as superseded by OTW-37 or OTW-41 are reassessed as new items.
+
+**Owner involvement:** create the `onsale-watch` repository; create the
+Healthchecks.io check, link Telegram and put the ping URL in
+`~/.ticket-watch/.env`; approve the `scripts/local-check.sh` change in OTW-39;
+provide a Telegram test chat for the shadow; approve the launchd and workflow
+steps of the takeover; from 2026-12-01 keep the Mac awake and tighten the
+Healthchecks grace to 60 minutes. Everything else is built and merged by the
+review loops under the approval list in AGENTS.md.
 
 **Loop safety:** in `serioznuh/cross-llm-review`, CR-112 and CR-113 (merged
 2026-09-24) removed the failure behind OTW-28's merge, which passed its approval,
-merge and backlog gates with an uncommitted review-log edit. OTW-36 lets a loop
-test a workflow change without touching production.
+merge and backlog gates with an uncommitted review-log edit. No `watch.yml`
+change is planned before the workflow is disabled at the takeover, so OTW-36 is
+closed.
 
 **Change freeze:** pushing to `main` deploys to the Mac. From 2026-12-10 until
-both wanted dates have passed, merge only P0 fixes.
+both wanted dates have passed, merge only P0 fixes, on whichever version owns
+the alert.
 
-**Lower urgency:** OTW-26 — a fresh runner fetched the whole state ref in about
-1 s (688 KiB) on 2026-09-24, and OTW-34 cuts its growth about tenfold. Revisit if
-that fetch exceeds a few megabytes or the watch continues past December.
+**Deferred:** OTW-04 and OTW-24 stay open until the Cinesa port (OTW-42). They
+are built on v1 only if a Cinesa film is named while v1 still owns the watch.
 
-**Deferred:** OTW-04 and OTW-24 wait for OTW-35's Cinesa decision: retiring
-Cinesa closes them as superseded (owner approval), re-targeting it makes both
-prerequisites. **Parked by owner:** OTW-22 has no available host beyond the
-current MacBook; revisit only when another approved host exists and re-estimate
-then. It is not a dependency of any item in the active queue.
-
-**Closed as superseded:** OTW-25's legacy rebase path no longer exists; OTW-21
+**Closed as superseded (2026-09-30):** OTW-01, OTW-12 and OTW-17 by OTW-37;
+OTW-22 and OTW-33 by OTW-39; OTW-26, OTW-34 and OTW-36 by OTW-41. Each item
+states why. Earlier: OTW-25's legacy rebase path no longer exists; OTW-21
 already covers the replacement synchronization mechanism with real-Git tests.
 
 ## 1. Critical — security & breakage
@@ -136,6 +170,10 @@ re-arms the next outage; API uncertainty stays silent; ruff and pytest pass.
 
 ### OTW-17 · A merged sale message mixing new and moved openings reads oddly
 **Priority:** P3 · **Effort:** S
+**Disposition:** closed as superseded by OTW-37 on 2026-09-30. This watch's sale
+openings passed on 2026-09-09, so the wording is not worth a v1 change. v2 forks
+the merging code unchanged, so the quirk moves to v2's backlog as a known
+low-priority item. The scope below is historical.
 **Problem:** When one listing's opening is announced for the first time and
 another listing *moves* to that same minute, `coalesce` merges them (same
 `sale_datetime`). The title says CHANGED, and the body carries both
@@ -457,6 +495,12 @@ wanted-date alerts are unchanged. Ruff, pytest and an affected-flow dry-run pass
 
 ### OTW-33 · Cloud supervision polls GitHub every firing and is rate-limited a third of the day
 **Priority:** P2 · **Effort:** S
+**Disposition:** closed as superseded by OTW-39 on 2026-09-30. The external
+dead-man's switch replaces Actions-based supervision, and v2 has no cloud half.
+A rate-limited firing answers "unknown" and the next answering firing settles
+it, so this was noise rather than a blind spell: 279 warnings from 2026-09-21 to
+09-25, 3 from 09-26 to 09-30. v1 keeps polling until it is switched off
+(OTW-41). The scope below is historical.
 **Problem:** `jobs.run_cloud_supervision_job` calls
 `cloud.has_successful_scheduled_run` on every 5-min firing — 12 unauthenticated
 GitHub API requests an hour, by design without a credential. The unauthenticated
@@ -485,8 +529,10 @@ pytest and an affected-flow dry-run pass.
 
 ### OTW-04 · Cinesa alert: include session times + booking link
 **Priority:** P2 · **Effort:** S
-**Scheduling:** deferred while Cinesa is disabled; revisit when enabling it
-for an active watch (current estimate: 3–4 h including verification).
+**Scheduling:** deferred. Cinesa stays in place, disabled (owner decision
+2026-09-30), and this item is built as part of the v2 port (OTW-42). Build it
+here only if a Cinesa film is named while v1 still owns the watch (estimate:
+3–4 h including verification).
 **Problem:** The 🎫 "watched date opened in IMAX" alert
 (`detect.analyze_cinesa`) says the date is bookable and links to the film page,
 but not *which* IMAX sessions exist or their times — for a popular film the
@@ -562,6 +608,34 @@ local reminders can still run. Distinguish process completion, source health
 and notification delivery health: a quiet successful workflow does not prove
 its Telegram credentials work. OTW-22 should retain this reverse supervision.
 
+### OTW-42 · Port the Cinesa source into v2 as a disabled adapter
+**Priority:** P2 · **Effort:** M (8–12 h including a live verification)
+**Scheduling:** deferred. Start when the owner names a Cinesa film, or after
+2026-12-20, whichever comes first. If a film is named before the takeover
+(OTW-41), this item moves ahead of it.
+**Problem:** the owner will watch future releases at Cinesa Diagonal Mar
+(decision 2026-09-30: Cinesa stays in place, disabled, and is not retired). v1
+can do that today from `[cinesa]` in `config.toml`. After the takeover v1 is off
+and v2 has no Cinesa source, so until this port Cinesa cannot be enabled by
+configuration alone.
+**Fix sketch:** port `watcher/cinesa.py`, `watcher/cdp.py` and their tests
+(`tests/test_cinesa.py`, `tests/test_cdp.py`) into v2 as one adapter behind the
+OTW-37 contract: the `cinesa_target:<site>:<film>:<date>` facts and the silent
+no-IMAX note, IMAX gone and back with the two-check confirmation, and its own
+health states (blind, token step stuck). Keep every boundary in AGENTS.md: a
+real headed Chrome on a throwaway profile, never headless; no stealth, TLS
+impersonation, cookie replay or CAPTCHA solving; the 12 h token is a credential
+in a git-ignored 0600 cache and never reaches state, logs or commits; an empty
+snapshot is a blip, never evidence; no per-run timestamp in state. Fold in
+OTW-24 (leak reconciliation runs even when outcome-building raises) and OTW-04
+(session times and a booking link in the target-date alert). A new film is then
+one `[[targets]]` table: film id, title, page URL and dates.
+**Files:** the v2 repository; here only the closing notes on OTW-04 and OTW-24.
+**Done when:** with a real film on sale, an enabled target mints a token through
+headed Chrome, reads the calendar and raises the expected findings in a dry
+run; disabled, the adapter makes no request and launches no browser; the ported
+tests pass; OTW-04 and OTW-24 are closed here with their v2 references.
+
 ## 4. UX & design
 
 ### OTW-11 · Make Cinesa Chrome refresh normally imperceptible
@@ -613,6 +687,10 @@ and if it fails there, the ⚠️ guidance text names "unlock the Mac" explicitl
 
 ### OTW-01 · Docs-contract test in CI
 **Priority:** P2 · **Effort:** S
+**Disposition:** closed as superseded by OTW-37 on 2026-09-30. v1 is frozen until
+it is switched off (OTW-41) and v2 starts with its own small docs, so a
+docs-contract test here no longer pays for itself. The scope below is
+historical.
 **Problem:** The docs standard (AGENTS.md "Documentation maintenance") defines line
 budgets and required sections, but nothing enforces them — docs can silently drift.
 **Fix:** Add `tests/test_docs_contract.py` (pytest, runs in the existing
@@ -633,6 +711,10 @@ and update AGENTS.md + docs/verification.md commands.
 
 ### OTW-12 · Keep reminder promises aligned with current observations
 **Priority:** P3 · **Effort:** S
+**Disposition:** closed as superseded by OTW-37 on 2026-09-30. The ladder is
+dormant for this watch: `formats_seen` already holds the wanted format, so
+`due_reminders` returns nothing even for a new opening. v2 derives the promise
+and the ladder from one rule. The scope below is historical.
 **Problem:** `detect.reminders_cover()` reads delivered format evidence from
 the state before the current snapshot advances it. On 2026-09-21 a synthetic
 snapshot with a future opening and newly bookable IMAX 70mm reproduced a
@@ -780,6 +862,10 @@ local-run lifetime, and OTW-30 makes missing-ref bootstrap explicit.
 
 ### OTW-22 · Move the local owner to an always-on residential host
 **Priority:** P2 · **Effort:** L
+**Disposition:** closed as superseded by OTW-39 on 2026-09-30. Hosting stays the
+owner's MacBook (constraint restated 2026-09-25: no new hardware), and the
+dead-man's switch makes a dark laptop loud instead. File a new item if another
+host becomes available. The scope below is historical.
 **Scheduling:** parked by the owner on 2026-09-21. The current MacBook is the
 only available host. Resume only after another approved host becomes available;
 this item does not block the active queue. Re-estimate effort for that host.
@@ -839,6 +925,9 @@ a valid existing reminder. Ruff, pytest and an affected-flow dry-run pass.
 
 ### OTW-24 · Guarantee Cinesa leak tracking when outcome-building raises
 **Priority:** P3 · **Effort:** S
+**Scheduling:** deferred. Cinesa stays in place, disabled (owner decision
+2026-09-30), and this guarantee is built into the v2 port (OTW-42). Build it
+here first if Cinesa is re-enabled on v1 before the takeover.
 **Problem:** `jobs.run_cinesa_job` calls `track_profile_leak` after the
 `try/except/else` that builds `CinesaOutcome`. If `detect.analyze_cinesa` or an
 alert builder raises, `_guard` discards the outcome and that run skips leak
@@ -890,6 +979,9 @@ new mechanism.
 
 ### OTW-26 · Bound runtime-state history fetched by ephemeral runners
 **Priority:** P3 · **Effort:** M
+**Disposition:** closed as superseded by OTW-41 on 2026-09-30. The state ref is
+retired at the takeover; it held 3,552 commits on 2026-09-30 and every runner
+still fetches it whole. The scope below is historical.
 **Problem:** Raised in dual review (Claude + Codex) of OTW-21. The dedicated
 `refs/heads/runtime-state` ref carries `state.json`, synchronized locally to
 `.cache/state-sync/state.json`. `watcher/state_sync.py` fetches it without a
@@ -1046,7 +1138,7 @@ fallback is preserved. Ruff, pytest and isolated dry-runs pass; production
 state edits remain subject to the existing explicit-approval rule.
 
 ### OTW-32 · A GitHub outage holds back alerts only the Mac can produce
-**Priority:** P2 · **Effort:** M
+**Priority:** P2 · **Effort:** S (narrowed on 2026-09-30, about 4 h)
 **Problem:** since OTW-28 every Telegram send first wins a reservation pushed to
 `refs/heads/runtime-state`: no confirmed reservation, no send. While GitHub — or
 only the Mac's route to it — is unavailable, nothing goes out. That includes
@@ -1058,6 +1150,19 @@ delay the one alert the watch exists for, while preventing no possible duplicate
 **Decision (2026-09-24, by default):** implement. It narrows OTW-28's rule for
 one provable class of work only. If the tests cannot prove the premise below,
 close this item as won't-do rather than weaken OTW-28.
+**Decision (2026-09-30):** narrowed and demoted to a hedge. v2 (OTW-37) has no
+reservation and so no GitHub dependency before a send. Build this item only if
+the v2 shadow (OTW-40) is not running by 2026-10-15 or the takeover (OTW-41) has
+not happened by 2026-11-15. Narrowed scope: the local owner sends a delivery
+whose member keys are all wanted-date keys (`pathe_target:`) without a
+reservation, keeping today's outbox, `sending`/`uncertain` transitions and
+receipts; a cloud pass refuses to deliver a `pathe_target:` key, in fresh
+findings and in outbox recovery alike. No publication marking. Narrowed done
+when: with the state ref unreachable, a fresh wanted-date finding is sent once
+on its first attempt and its receipt is kept; every other key still needs a
+reservation; a cloud pass never sends a `pathe_target:` key; OTW-28's two-clone
+tests still make at most one mocked Telegram call per logical notification. The
+wider sketch and done-when below are historical.
 **Fix sketch:** let a delivery skip the reservation only when all of these hold:
 (a) this pass is the local owner; (b) every member key is Mac-origin (Pathé- or
 Cinesa-derived); (c) its outbox record has never been part of a push attempt.
@@ -1079,6 +1184,9 @@ call per logical notification. Ruff, pytest and dry-runs pass.
 
 ### OTW-34 · Per-firing liveness timestamps commit to the shared ref ~280 times a day
 **Priority:** P3 · **Effort:** S
+**Disposition:** closed as superseded by OTW-41 on 2026-09-30. The commits are
+harmless for the weeks v1 has left, and the ref is retired at the takeover. The
+scope below is historical.
 **Problem:** while a wanted date is pending, every 5-min firing runs a Pathé
 check, so `last_check_ok` and `last_catalogue_ok` change on every firing and the
 post-run sync commits and pushes them. `refs/heads/runtime-state` received 1,933
@@ -1102,8 +1210,28 @@ staleness check sees liveness no older than N; the Mac's cadence guard and
 OTW-28's reservation tests are unchanged. Ruff, pytest and an affected-flow
 dry-run pass. Cuts OTW-26's growth about tenfold.
 
-### OTW-35 · Plan the end of the watch: stop after 20 December, decide Cinesa's future
+### OTW-35 · Write the v1 switch-off checklist; Cinesa stays, disabled
 **Priority:** P2 · **Effort:** S
+**Decision (2026-09-30):** rescoped by the owner's decisions. (1) Cinesa is not
+retired: it stays in place and disabled in v1 and is ported into v2 by OTW-42;
+OTW-04 and OTW-24 stay open until then. (2) The end-of-watch behaviour moves to
+v2 (`watch_until`, OTW-37). (3) What remains here is the v1 side of the
+takeover: a checklist in README for stopping v1, reviewed before OTW-41 runs.
+**Fix sketch:** document, in order: unload the LaunchAgent
+`com.odysseum.ticket-watch`; disable `watch.yml`; what stays untouched until
+2026-12-21 for rollback (the `~/.ticket-watch` clone, the plist file, the
+`runtime-state` ref); the rollback steps and their caveat (once v2 has sent a
+real alert, its sent keys must be merged into v1's state first, or v1 repeats
+them); the Cinesa note above. The unload and the workflow change need the
+owner's approval (AGENTS.md).
+**Fallback:** if v2 is abandoned at a kill date, the watch ends on v1 in the
+simplest form: on 2026-12-21 the owner unloads the LaunchAgent and disables
+`watch.yml` by hand. No dormancy code is added to v1 during the freeze.
+**Files:** `README.md`, `docs/current-state.md`.
+**Done when:** the checklist is in README within its line budget and names every
+owner-approved step, and OTW-41 has been run from it or the fallback has been
+executed.
+**Original scope (2026-09-24), kept for reference:**
 **Problem:** the watch has a fixed end. Its remaining Pathé purpose is the IMAX
 70 mm alert for `target_dates` 2026-12-19/20. The Cinesa target (*La odisea* at
 Diagonal Mar) passed in August, and `cinesa.enabled = false` since. Nothing ends
@@ -1132,6 +1260,9 @@ and reviewed; the Cinesa disposition is recorded in this backlog. Ready by
 
 ### OTW-36 · Let a workflow change be verified without touching production state
 **Priority:** P3 · **Effort:** S
+**Disposition:** closed as superseded by OTW-41 on 2026-09-30. No `watch.yml`
+change is planned before the workflow is disabled at the takeover; OTW-39
+changes only the local script. The scope below is historical.
 **Problem:** a change to `.github/workflows/watch.yml` can only be exercised by a
 live run, which synchronizes — and may push — the shared `refs/heads/runtime-state`
 ref and may send Telegram messages. So a workflow change ends with a request for
@@ -1150,3 +1281,203 @@ override), `tests/test_state_sync.py`, `README.md`.
 Telegram call and no write to `refs/heads/runtime-state`; the scratch ref is
 removed afterwards; scheduled runs are unchanged. Ruff, pytest and one sandbox
 dispatch pass.
+
+### OTW-37 · Build v2 (`onsale-watch`): forked detection, single-writer runtime
+**Priority:** P1 · **Effort:** L (16–24 h including verification)
+**Problem:** the watch has one job left, the IMAX 70 mm alert for 2026-12-19/20,
+which needs under 600 lines of logic. On 2026-09-25 v1 was 10,381 code and 12,809
+test lines: about 4,170 code and 5,170 test lines keep the Mac and the cloud from
+double-sending and move state through a Git ref, and 1,262 lines are the disabled
+Cinesa half. In 81 days all 35 Telegram messages came from the Mac, the cloud sent
+none, and `outbox` and `reservations` were empty in all 2,329 state-ref commits.
+Pushing to `main` deploys within one firing, so v1 cannot be simplified in place
+in stages; the runtime is replaced in a fork while v1 stays frozen.
+**Decisions (owner, 2026-09-30):** a new repository `serioznuh/onsale-watch`,
+created by the owner; no cloud half and no shared state; an intent record before
+each send and a receipt after it; the reminder ladder is included; Cinesa is not
+part of this item (OTW-42).
+**Fix sketch:**
+- *Fork unchanged, with their tests:* `watcher/pathe.py` (request headers, three
+  retries with backoff, the permanent `403 "No movie allowed !"` on event
+  listings as a healthy refusal, the Akamai `{"error":"Error from IP …"}` body as
+  a block, slug-pattern discovery of extra listings on the cinema programme);
+  from `watcher/detect.py` `classify_format`, `target_date_findings`,
+  `usable_source_timestamp` and the sale-date, new-listing and news matching;
+  `watcher/coalesce.py`; from `watcher/notify.py` the send (429 `retry_after`,
+  HTML escaping without quotes, `disable_notification`) and the renderers; the
+  cause wording in `watcher/alerts.py` (`summarize_pathe_error`, `pathe_cause`).
+  The wanted-date alert has never fired in production, so these rules are proven
+  only by v1's fixtures (`tests/test_pathe_targets.py`, `tests/test_pathe.py`,
+  `tests/test_detect.py`, `tests/test_coalesce.py`, `tests/test_notify.py`): do
+  not rewrite them.
+- *New runtime, about 500 lines:* one process per launchd firing, every 5
+  minutes; one flock; one local JSON state file; no Git at run time.
+- *Facts, not baselines:* every run recomputes all facts from the snapshot; an
+  alert is a fact whose key is not in `sent`. Key strings stay byte-identical to
+  v1's (`pathe_target:…`, `sale:…`, `new_show:…`, `tickets:…`, `cinema_listed:…`,
+  `news:…`), and same-run findings that are one piece of news stay one message.
+- *Sending:* write an intent, POST, write the receipt; a merged message covers
+  every member key or none. An intent without a receipt found on a later run is
+  never re-sent automatically and raises one silent note naming its keys. A
+  definite failure clears the intent, so the next firing retries.
+- *Health:* per target, OTW-31's rule (30 minutes of consecutive failed polls
+  while a wanted date is pending or an opening is near, 6 h otherwise), one loud
+  alert per episode, silent recovery. A liveness ping to the OTW-39 check after
+  every completed firing, whatever the poll result; each ping's HTTP result is
+  recorded and six consecutive ping failures raise one silent note. A weekly
+  silent heartbeat names the last acknowledged ping.
+- *Reminders:* 24 h, 2 h, 15 min and an opening-time ping from the observed
+  opening of the selected format; single owner, no failover.
+- *End of watch:* `watch_until = "2026-12-20"`; after it, one silent summary,
+  then no network call and no message.
+- *Modes:* `--dry-run`; `--replay DIR` over OTW-38 files; `--shadow`, which never
+  calls Telegram for the owner's chat and logs would-send lines. Live mode
+  refuses to start without the `imported_from_v1` marker in its state, or while
+  the v1 LaunchAgent `com.odysseum.ticket-watch` is loaded.
+- *Targets:* `[[targets]]` tables in `config.toml`. A source type is one adapter
+  returning keyed facts and a health result, with one fixture test. The contract
+  must fit a source with its own credential step (Cinesa, OTW-42) without being
+  built for it.
+- *Request pattern:* keep v1's unless parity is proven. The wanted-date flag is
+  in the 74 KB `/api/cinema/{slug}/shows`, while each poll also downloads the
+  785 KB `/api/shows`; caching the catalogue for up to an hour is adopted only
+  if the shadow shows identical decisions.
+- *Carried over:* the production clone lives outside `~/Documents` (macOS TCC),
+  at `~/.onsale-watch`; secrets are env-only; every alert names film and cinema
+  on its first line; times are Paris time; no stealth, TLS impersonation, cookie
+  replay or CAPTCHA solving, ever.
+**Files:** the new repository, with its own AGENTS.md, README and backlog; v2
+work is tracked there from its first commit. Nothing in this repository changes.
+**Done when:** the forked fixtures pass unchanged in v2; a replay of captured v1
+snapshots sends nothing; a snapshot mutated so that `2026-12-19` is bookable on
+the IMAX 70 mm listing yields exactly one loud message with key
+`pathe_target:cinema-pathe-odysseum:dune-troisieme-partie-50828:imax70:2026-12-19`;
+fault-injection tests cover a crash after the POST (no resend, one note), a
+definite failure (retry on the next firing) and a failed state write; the import
+guard and the v1-agent guard refuse live mode; a dry run dated after
+`watch_until` makes no request; ruff and pytest pass on Python 3.9. About 2,400
+code lines in total, about 1,900 of them forked; a build far above that comes
+back to the owner.
+
+### OTW-38 · Snapshot tap: save what each Pathé poll saw, for the v2 shadow
+**Priority:** P1 · **Effort:** S (about 3 h)
+**Problem:** the v2 shadow (OTW-40) must compare its decisions with v1's on the
+same inputs without adding Pathé traffic, which would raise the risk of an
+Akamai block. v1 keeps no record of what a poll returned: `run_pathe_job` builds
+a `detect.Snapshot` in memory and drops it (`watcher/jobs.py`). Saving the raw
+catalogue on every poll would cost about 220 MB a day (785 KB, about 280 polls).
+**Fix sketch:** after each Pathé poll of a real run, record it under the
+git-ignored `.cache/pathe-snapshots/`. A healthy or degraded poll writes one
+gzipped JSON file with the poll time, the matched catalogue entries, the cinema
+programme payload (74 KB) and each per-listing result (health, diagnostic,
+showtimes body), but only when that content differs from the previous file. An
+unchanged poll and a failed poll each append one line to `index.log` (time, and
+"same" or the error summary), so a replay can reproduce every decision,
+including blind spells. Delete files older than 30 days and stop writing above
+200 MB. The tap must never affect the alert path: any error in it is logged as a
+warning and swallowed, it touches no state, and dry runs write nothing.
+**Files:** `watcher/jobs.py` or a small `watcher/tap.py`, `tests/test_main.py` or
+a new `tests/test_tap.py`, `docs/current-state.md`.
+**Done when:** a healthy poll writes one file; an identical next poll writes none
+and appends "same"; a failed poll appends its error; an unwritable or full
+directory leaves alerts, state and the exit status unchanged; rotation and the
+size cap work; a saved file rebuilds a `detect.Snapshot` that yields the same
+findings as the original; dry runs write nothing. Ruff, pytest and an
+affected-flow dry-run pass.
+
+### OTW-39 · External dead-man's switch for a dark Mac (Healthchecks.io)
+**Priority:** P1 · **Effort:** S (about 2 h, plus the owner's setup)
+**Problem:** the wanted-date alert can only come from the Mac. When the Mac
+sleeps or the job dies, the only signal today is the cloud's stale alert after
+18 h without a catalogue check, sent by an Actions cron that fired 5–8 times a
+day with gaps up to 11.5 h (measured to 2026-09-25). On the night of
+2026-09-29/30 the lid was closed from 22:45; Power Nap still ran 41 healthy
+checks, 10–38 minutes apart, and nothing was due to alert. A night without
+those dark wakes would have stayed silent for 18 h.
+**Decision (owner, 2026-09-30):** use Healthchecks.io's free plan with its
+Telegram integration.
+**Fix sketch:** ping a Healthchecks.io check at the end of every completed
+firing, healthy or not: the ping says "the job ran", and Pathé health stays with
+the local rule (OTW-31), so one block does not alert twice. In
+`scripts/local-check.sh`, send the ping just before the final `exit "$status"`,
+after the post-run sync; the hard stops (exits 3, 5 and 6) and a watchdog kill
+leave before that line and so do not ping, which turns a firing that cannot
+deliver into a loud condition. The request is bounded (10 s); its failure is
+logged and never changes the exit status. The URL is a secret:
+`HEALTHCHECK_PING_URL` in the git-ignored `.env`, never in `config.toml` or the
+log; when it is unset the script behaves exactly as today. Owner-side settings:
+period 5 minutes; grace 3 hours until 2026-12-01, then 60 minutes, which still
+tolerates the closed-lid night above; "up" notifications muted if the
+integration allows. Its messages come from Healthchecks.io's own bot and do not
+name film or cinema; README says so. The same URL moves to v2 at the takeover
+(OTW-41); v2 in shadow never pings this check.
+**Owner actions:** create the account and the check, link Telegram, put the URL
+in `~/.ticket-watch/.env`, approve the script change (docs/verification.md,
+scheduling checks).
+**Files:** `scripts/local-check.sh`, the wrapper tests in
+`tests/test_sync_integration.py` or `tests/test_state_sync.py`, `README.md`,
+`docs/current-state.md`.
+**Done when:** with the variable set, a completed firing sends exactly one ping;
+a firing that stops on exit 3, 5 or 6 sends none; a failing or hanging ping
+delays the firing by at most 10 s and changes neither its exit status nor state;
+with the variable unset nothing changes; the URL never reaches the log; a test
+pins the ping's position. Owner-side: a deliberately stopped job produces one
+Telegram message after the grace. Ruff and pytest pass; the deploy check follows
+docs/verification.md.
+
+### OTW-40 · Shadow-run v2 for 14 days and prove parity
+**Priority:** P1 · **Effort:** M (about 6 h, plus 14 days elapsed)
+**Problem:** v2 must not own the alert before it is proven, and the alert that
+matters (`pathe_target:`) has never fired, so "both versions stayed silent"
+proves nothing on its own.
+**Fix sketch:** install v2 at `~/.onsale-watch` with its own LaunchAgent in
+`--shadow` mode: no access to the owner's chat, its own state file, no write to
+v1's store or to `refs/heads/runtime-state`, no ping to the production
+Healthchecks check. Inputs: a replay of the OTW-38 files, plus one live
+programme poll per hour (about 1% of v1's Pathé traffic). All gates are
+required:
+1. *Replay:* for every tapped poll, v2's would-send keys equal what v1 sent
+   (v1's log and `alerts`), including "nothing".
+2. *Fixtures:* v1's Pathé, detection, merging and notify fixtures pass against
+   the forked code in v2's repository.
+3. *Injection:* a tapped snapshot mutated so that `days["2026-12-19"].bookable`
+   is true on the IMAX 70 mm listing goes through v2 end to end with Telegram
+   mocked and yields exactly one loud message with v1's key; the same for
+   2026-12-20, and for both dates at once (one merged message); a snapshot with
+   only 2026-12-15 yields none.
+4. *Health:* on a Pathé block, live or replayed from `index.log`, v2's blind and
+   recovered verdicts match v1's within one firing.
+5. *Own client:* the hourly live poll succeeds with v2's headers, and one real
+   message reaches the separate Telegram test chat the owner provides.
+6. *Import rehearsal:* v2 loads a copy of the live state's keys and sends
+   nothing on the next replay.
+**Kill date:** running by 2026-10-15; otherwise v2 is abandoned for this watch
+and OTW-32 lands on v1.
+**Done when:** 14 consecutive days with every gate green and no unexplained
+divergence, recorded in a short parity report in v2's repository. A fix to
+forked detection or to sending restarts the 14 days.
+
+### OTW-41 · Take over with v2 and stop v1
+**Priority:** P1 · **Effort:** S (about 4 h)
+**Problem:** exactly one sender may exist at any time, and nothing v1 already
+sent may be sent again.
+**Fix sketch:** one sitting, from the OTW-35 checklist. (1) Let a v1 firing
+finish, then unload the LaunchAgent `com.odysseum.ticket-watch`. (2) Disable
+`watch.yml`. (3) Read the final `state.json` from `refs/heads/runtime-state` and
+import its `alerts` keys, `reminders_sent` rungs and `last_heartbeat` into v2's
+state together with the `imported_from_v1` marker; a dry run must show nothing
+pending. (4) Move `HEALTHCHECK_PING_URL` to v2's `.env`, switch v2's LaunchAgent
+from shadow to live, kickstart it, and confirm one ping and a quiet first run.
+(5) Leave v1's clone, its plist file and the state ref untouched until
+2026-12-21. Steps 1, 2 and 4 need the owner's approval (AGENTS.md: launchd and
+workflow changes). Rollback: unload v2, reload v1, re-enable the workflow. It is
+clean until v2 has sent a real alert; after that, v2's sent keys must first be
+merged into v1's state, an owner-approved state edit, or v1 repeats them.
+**Kill date:** done by 2026-11-15; otherwise v2 is abandoned for this watch and
+OTW-32 lands on v1. From 2026-12-10 only P0 fixes, on whichever version owns the
+alert. From 2026-12-01 the owner keeps the Mac awake and sets the Healthchecks
+grace to 60 minutes.
+**Done when:** v1's agent is not loaded and `watch.yml` is disabled; v2 is live,
+its state holds the marker and every v1 key, and its first live run sends
+nothing; the dead-man's check shows v2's pings; the rollback steps are in v2's
+README; this backlog's remaining open items are closed or moved to v2's backlog.
