@@ -36,6 +36,7 @@ from . import (
     news,
     pathe,
     state_sync,
+    tap,
 )
 from . import state as state_mod
 from .budget import Budget
@@ -157,6 +158,19 @@ def run_state_sync_failure_job(ctx: RunContext, now: datetime) -> bool:
 
 # ------------------------------------------------------------- source jobs
 
+def _tap_pathe_poll(ctx: RunContext, record: Callable[..., Any], *args: Any) -> None:
+    """Hand one poll to the snapshot tap (OTW-38), which never touches the
+    alert path: a dry run records nothing, and any error in the tap is logged
+    as a warning and swallowed, so findings, state and exit status are the
+    same whether or not it worked."""
+    if ctx.dry_run:
+        return
+    try:
+        record(*args)
+    except Exception:
+        log.warning("Pathé snapshot tap failed (ignored, alerts unaffected)", exc_info=True)
+
+
 def run_pathe_job(
     ctx: RunContext, client: Any, now: datetime, budget: Budget | None
 ) -> PatheOutcome:
@@ -172,6 +186,7 @@ def run_pathe_job(
         snap = pathe.fetch_snapshot(client, ctx.cfg, budget=budget)
     except Exception as e:
         log.exception("Pathé check failed")
+        _tap_pathe_poll(ctx, tap.record_failure, e, now)
         out.health = "blind"
         finding = alerts.record_pathe_failure(ctx.cfg, ctx.state, str(e), now)
         if finding is not None:
@@ -180,6 +195,8 @@ def run_pathe_job(
         return out
 
     out.snapshot = snap
+    # Recorded before analysis, so the file holds the poll exactly as fetched.
+    _tap_pathe_poll(ctx, tap.record_poll, snap, now)
     # Analyse BEFORE the health bookkeeping below, deliberately. `analyze_pathe`
     # reads only the observation baselines (`shows_seen`, `sales`,
     # `formats_seen`, and `tickets_available` via `reminders_cover`), never the

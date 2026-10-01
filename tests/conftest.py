@@ -27,3 +27,16 @@ def _no_real_healthcheck_ping(monkeypatch):
     Tests that exercise the ping set the variable themselves, with a fake `curl`.
     """
     monkeypatch.delenv("HEALTHCHECK_PING_URL", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _snapshot_tap_in_tmp(monkeypatch, tmp_path_factory):
+    """Keep the Pathé snapshot tap (OTW-38) out of the working copy's `.cache/`.
+
+    Check-mode tests run real (non-dry) passes from the repository root, and
+    the tap's directory is relative to it, like every other `.cache/` path.
+    A directory of its own, so tests listing `tmp_path` see nothing new.
+    """
+    from watcher import tap
+
+    monkeypatch.setattr(tap, "SNAPSHOT_DIR", tmp_path_factory.mktemp("pathe-snapshots"))

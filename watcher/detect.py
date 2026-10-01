@@ -262,6 +262,10 @@ class Snapshot:
     # listing itself was fetched, so it stays on the watch list; only its
     # unreadable metadata is downgraded to unknown.
     unreadable_metadata: dict[str, list[str]] = field(default_factory=dict)
+    # The whole `/cinema/{slug}/shows` payload as fetched, kept only for the
+    # snapshot tap (OTW-38) so a replay sees what this poll saw. Analysis never
+    # reads it; `cinema_entries` above is the part that drives decisions.
+    cinema_programme: Any = field(default=None, repr=False, compare=False)
 
     @property
     def degraded_results(self) -> list[tuple[str, str, FetchResult]]:
