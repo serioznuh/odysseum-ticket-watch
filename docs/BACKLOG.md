@@ -52,7 +52,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-35 | Write the v1 switch-off checklist; Cinesa stays, disabled | P2 | S | Infra, tooling & docs | [ ] |
 | OTW-36 | Let a workflow change be verified without touching production state (superseded by OTW-41) | P3 | S | Infra, tooling & docs | [x] |
 | OTW-37 | Build v2 (`onsale-watch`): forked detection, single-writer runtime | P1 | L | Infra, tooling & docs | [ ] |
-| OTW-38 | Snapshot tap: save what each Pathé poll saw, for the v2 shadow | P1 | S | Infra, tooling & docs | [ ] |
+| OTW-38 | Snapshot tap: save what each Pathé poll saw, for the v2 shadow | P1 | S | Infra, tooling & docs | [x] |
 | OTW-39 | External dead-man's switch for a dark Mac (Healthchecks.io) | P1 | S | Infra, tooling & docs | [x] |
 | OTW-40 | Shadow-run v2 for 14 days and prove parity | P1 | M | Infra, tooling & docs | [ ] |
 | OTW-41 | Take over with v2 and stop v1 | P1 | S | Infra, tooling & docs | [ ] |
