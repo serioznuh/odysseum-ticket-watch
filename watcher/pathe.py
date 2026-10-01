@@ -261,6 +261,7 @@ def fetch_snapshot(
         showtimes=showtimes,
         listing_results=listing_results,
         unreadable_metadata=unreadable,
+        cinema_programme=cinema_payload,
     )
     log.info(
         "snapshot: %d matched listing(s) %s | at %s: %d listed, %d with sessions%s",

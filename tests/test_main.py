@@ -1049,6 +1049,7 @@ def test_fresh_opening_supersedes_pending_alert_before_outbox_recovery(
     """A failed old alert must not be replayed before polling discovers that
     Pathé moved the opening and enqueues the corrected message."""
     runner = PatheCheckRunner(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "datetime", _scripted_clock(NOW, NOW))
     slug = "dune-troisieme-partie"
     old = "2026-10-01T09:00:00+02:00"
     moved = "2026-10-02T09:00:00+02:00"
