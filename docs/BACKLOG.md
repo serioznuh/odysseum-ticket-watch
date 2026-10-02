@@ -57,7 +57,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-40 | Shadow-run v2 for 14 days and prove parity | P1 | M | Infra, tooling & docs | [ ] |
 | OTW-41 | Take over with v2 and stop v1 | P1 | S | Infra, tooling & docs | [ ] |
 | OTW-42 | Port the Cinesa source into v2 as a disabled adapter | P2 | M | Features | [ ] |
-| OTW-43 | One empty Actions page raises a false "Cloud checks have stopped" | P1 | S | Bugs | [ ] |
+| OTW-43 | One empty Actions page raises a false "Cloud checks have stopped" | P1 | S | Bugs | [x] |
 
 ## Recommended next work (reviewed 2026-09-30)
 
