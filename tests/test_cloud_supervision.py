@@ -236,6 +236,59 @@ def test_untrustworthy_sighting_record_restarts_confirmation(content, monkeypatc
     assert delivered == []
 
 
+def _dry_context():
+    ctx = _context()
+    ctx.dry_run = True
+    return ctx
+
+
+def test_stale_dry_run_leaves_no_evidence_for_a_later_real_alert(monkeypatch):
+    dry = _dry_context()
+    _capture_delivery(monkeypatch, dry)
+    monkeypatch.setattr(
+        cloud, "has_successful_scheduled_run", lambda *args, **kwargs: False
+    )
+
+    assert jobs.run_cloud_supervision_job(dry, NOW) == "unknown"
+    assert not cloud.STALE_SUSPICION_PATH.exists()
+
+    # The rehearsal cannot serve as the first sighting of a real firing.
+    real = _context()
+    delivered = _capture_delivery(monkeypatch, real)
+    later = NOW + cloud.STALE_CONFIRMATION
+    assert jobs.run_cloud_supervision_job(real, later) == "unknown"
+    assert delivered == []
+
+
+def test_healthy_dry_run_keeps_an_existing_sighting(monkeypatch):
+    cloud.record_stale_sighting(NOW)
+    before = cloud.STALE_SUSPICION_PATH.read_text(encoding="utf-8")
+    dry = _dry_context()
+    _capture_delivery(monkeypatch, dry)
+    monkeypatch.setattr(
+        cloud, "has_successful_scheduled_run", lambda *args, **kwargs: True
+    )
+
+    assert jobs.run_cloud_supervision_job(dry, NOW + timedelta(minutes=5)) == "healthy"
+    assert cloud.STALE_SUSPICION_PATH.read_text(encoding="utf-8") == before
+
+
+def test_dry_run_reports_the_verdict_a_real_firing_would_without_writing(
+    monkeypatch,
+):
+    _seen_stale_before(NOW)
+    before = cloud.STALE_SUSPICION_PATH.read_text(encoding="utf-8")
+    dry = _dry_context()
+    delivered = _capture_delivery(monkeypatch, dry)
+    monkeypatch.setattr(
+        cloud, "has_successful_scheduled_run", lambda *args, **kwargs: False
+    )
+
+    assert jobs.run_cloud_supervision_job(dry, NOW) == "stale"
+    assert [finding.key for finding in delivered] == ["cloud_stale:episode:1"]
+    assert cloud.STALE_SUSPICION_PATH.read_text(encoding="utf-8") == before
+
+
 def test_api_blip_binds_and_defers_a_legacy_pending_heartbeat(tmp_path, monkeypatch):
     ctx = _durable_context(tmp_path)
     attempts = []

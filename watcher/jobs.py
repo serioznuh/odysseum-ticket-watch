@@ -592,14 +592,20 @@ def run_cloud_supervision_job(ctx: RunContext, now: datetime) -> str:
     except cloud.CloudStatusError as exc:
         log.warning("cloud supervision unavailable (no alert): %s", exc)
         return "unknown"
+    # A dry run is read-only: it reaches the verdict a real firing would, but
+    # must neither create nor erase the evidence later real firings rely on.
     if has_recent_success:
-        cloud.clear_stale_suspicion()
+        if not ctx.dry_run:
+            cloud.clear_stale_suspicion()
         delivery.reconcile_cloud_health(ctx, "healthy")
         _rearm_cloud_outage(ctx.state, now)
         return "healthy"
     # One empty page has already been seen to be wrong; an unconfirmed stale
     # verdict is uncertainty, and uncertainty stays quiet.
-    first_seen = cloud.record_stale_sighting(now)
+    if ctx.dry_run:
+        first_seen = cloud.stale_run_start(now)
+    else:
+        first_seen = cloud.record_stale_sighting(now)
     if now - first_seen < cloud.STALE_CONFIRMATION:
         log.info(
             "cloud supervision: no recent success since first sighting at %s; "

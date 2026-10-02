@@ -70,22 +70,33 @@ def _load_stale_suspicion(path: Path) -> tuple[datetime, datetime] | None:
     return detect.as_aware(first), detect.as_aware(last)
 
 
-def record_stale_sighting(now: datetime) -> datetime:
-    """Record one stale observation and return when the unbroken run began.
+def stale_run_start(now: datetime) -> datetime:
+    """Return when the unbroken stale run that ``now`` would extend began.
 
-    The returned time is ``now`` itself for a first sighting, and also when the
-    previous sighting is missing, invalid, in the future or too old to be
-    continuous evidence. Only callers that saw a validated stale verdict call
-    this; a healthy verdict clears the record, an unavailable API leaves it.
+    Read-only: dry runs use this to reach the same verdict a real firing would
+    without touching the evidence. The result is ``now`` itself for a first
+    sighting, and also when the previous sighting is missing, invalid, in the
+    future or too old to be continuous evidence.
     """
     now = detect.as_aware(now)
-    path = STALE_SUSPICION_PATH
-    previous = _load_stale_suspicion(path)
-    first_seen = now
+    previous = _load_stale_suspicion(STALE_SUSPICION_PATH)
     if previous is not None:
         first, last = previous
         if last <= now and now - last <= STALE_SIGHTING_MAX_GAP:
-            first_seen = first
+            return first
+    return now
+
+
+def record_stale_sighting(now: datetime) -> datetime:
+    """Record one stale observation and return when the unbroken run began.
+
+    Same result as `stale_run_start`. Only callers that saw a validated stale
+    verdict call this; a healthy verdict clears the record, an unavailable API
+    leaves it.
+    """
+    now = detect.as_aware(now)
+    path = STALE_SUSPICION_PATH
+    first_seen = stale_run_start(now)
     record = {"first_seen": first_seen.isoformat(), "last_seen": now.isoformat()}
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(f"{path.suffix}.tmp")
