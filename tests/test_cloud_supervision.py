@@ -46,6 +46,11 @@ def _durable_context(tmp_path):
     return ctx
 
 
+def _seen_stale_before(when):
+    """Pretend an earlier firing already saw the stale verdict a window ago."""
+    cloud.record_stale_sighting(when - cloud.STALE_CONFIRMATION)
+
+
 def _capture_delivery(monkeypatch, ctx):
     delivered = []
 
@@ -65,6 +70,7 @@ def test_dead_cloud_raises_one_loud_well_labelled_alert(monkeypatch):
     monkeypatch.setattr(
         cloud, "has_successful_scheduled_run", lambda *args, **kwargs: False
     )
+    _seen_stale_before(NOW)
 
     jobs.run_cloud_supervision_job(ctx, NOW)
 
@@ -115,6 +121,121 @@ def test_github_api_blip_fails_quietly(monkeypatch):
     assert ctx.state == before
 
 
+def test_one_empty_page_is_unconfirmed_and_stays_quiet(monkeypatch):
+    """2026-10-02: one firing got an empty page for a window holding four
+    successes, and the next firing saw them again. One page is not an outage.
+    """
+    ctx = _context()
+    before = deepcopy(ctx.state)
+    delivered = _capture_delivery(monkeypatch, ctx)
+    healthy = [False]
+    monkeypatch.setattr(
+        cloud, "has_successful_scheduled_run", lambda *args, **kwargs: healthy[0]
+    )
+
+    assert jobs.run_cloud_supervision_job(ctx, NOW) == "unknown"
+    assert delivered == []
+    assert ctx.state == before
+    assert cloud.STALE_SUSPICION_PATH.exists()
+
+    healthy[0] = True
+    assert jobs.run_cloud_supervision_job(ctx, NOW + timedelta(minutes=5)) == "healthy"
+    assert not cloud.STALE_SUSPICION_PATH.exists()
+
+    # The cleared sighting cannot confirm a later stale verdict.
+    healthy[0] = False
+    later = NOW + timedelta(minutes=40)
+    assert jobs.run_cloud_supervision_job(ctx, later) == "unknown"
+    assert delivered == []
+
+
+def test_stale_verdict_alerts_only_once_confirmed_a_window_later(monkeypatch):
+    ctx = _context()
+    delivered = _capture_delivery(monkeypatch, ctx)
+    monkeypatch.setattr(
+        cloud, "has_successful_scheduled_run", lambda *args, **kwargs: False
+    )
+
+    window = cloud.STALE_CONFIRMATION
+    for minutes in range(0, int(window.total_seconds() // 60), 5):
+        now = NOW + timedelta(minutes=minutes)
+        assert jobs.run_cloud_supervision_job(ctx, now) == "unknown"
+    assert delivered == []
+
+    assert jobs.run_cloud_supervision_job(ctx, NOW + window) == "stale"
+    assert [finding.key for finding in delivered] == ["cloud_stale:episode:1"]
+
+
+def test_api_blip_between_sightings_neither_confirms_nor_resets(monkeypatch):
+    ctx = _context()
+    delivered = _capture_delivery(monkeypatch, ctx)
+    verdicts = iter([False, cloud.CloudStatusError("blip"), False])
+
+    def probe(*args, **kwargs):
+        verdict = next(verdicts)
+        if isinstance(verdict, Exception):
+            raise verdict
+        return verdict
+
+    monkeypatch.setattr(cloud, "has_successful_scheduled_run", probe)
+
+    assert jobs.run_cloud_supervision_job(ctx, NOW) == "unknown"
+    assert jobs.run_cloud_supervision_job(
+        ctx, NOW + timedelta(minutes=15)
+    ) == "unknown"
+    assert jobs.run_cloud_supervision_job(
+        ctx, NOW + cloud.STALE_CONFIRMATION
+    ) == "stale"
+    assert [finding.key for finding in delivered] == ["cloud_stale:episode:1"]
+
+
+def test_sighting_after_a_long_gap_restarts_confirmation(monkeypatch):
+    ctx = _context()
+    delivered = _capture_delivery(monkeypatch, ctx)
+    monkeypatch.setattr(
+        cloud, "has_successful_scheduled_run", lambda *args, **kwargs: False
+    )
+
+    assert jobs.run_cloud_supervision_job(ctx, NOW) == "unknown"
+    # The Mac slept: the next sighting is not continuous with the first.
+    woke = NOW + cloud.STALE_SIGHTING_MAX_GAP + timedelta(minutes=5)
+    assert jobs.run_cloud_supervision_job(ctx, woke) == "unknown"
+    assert delivered == []
+    assert jobs.run_cloud_supervision_job(
+        ctx, woke + cloud.STALE_CONFIRMATION
+    ) == "stale"
+    assert len(delivered) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "not json",
+        "[]",
+        '{"first_seen": "2026-09-20T11:00:00+02:00"}',
+        (
+            '{"first_seen": "2026-09-20T11:50:00+02:00",'
+            ' "last_seen": "2026-09-20T11:00:00+02:00"}'
+        ),
+        (
+            '{"first_seen": "2026-09-20T13:00:00+02:00",'
+            ' "last_seen": "2026-09-20T13:00:00+02:00"}'
+        ),
+    ],
+    ids=["malformed", "not-object", "missing-field", "inverted", "future"],
+)
+def test_untrustworthy_sighting_record_restarts_confirmation(content, monkeypatch):
+    ctx = _context()
+    delivered = _capture_delivery(monkeypatch, ctx)
+    monkeypatch.setattr(
+        cloud, "has_successful_scheduled_run", lambda *args, **kwargs: False
+    )
+    cloud.STALE_SUSPICION_PATH.write_text(content, encoding="utf-8")
+
+    assert jobs.run_cloud_supervision_job(ctx, NOW) == "unknown"
+    assert delivered == []
+
+
 def test_api_blip_binds_and_defers_a_legacy_pending_heartbeat(tmp_path, monkeypatch):
     ctx = _durable_context(tmp_path)
     attempts = []
@@ -161,6 +282,7 @@ def test_cloud_alert_dedups_per_outage_and_rearms_after_a_later_success(monkeypa
     monkeypatch.setattr(
         cloud, "has_successful_scheduled_run", lambda *args, **kwargs: healthy[0]
     )
+    _seen_stale_before(NOW)
 
     jobs.run_cloud_supervision_job(ctx, NOW)
     jobs.run_cloud_supervision_job(ctx, NOW)
@@ -174,6 +296,7 @@ def test_cloud_alert_dedups_per_outage_and_rearms_after_a_later_success(monkeypa
 
     healthy[0] = False
     later_now = NOW + timedelta(days=1)
+    _seen_stale_before(later_now)
     jobs.run_cloud_supervision_job(ctx, later_now)
     assert [finding.key for finding in delivered] == [
         "cloud_stale:episode:1",
@@ -194,6 +317,7 @@ def test_legacy_timestamp_keys_wait_for_positive_recovery_before_rearming(monkey
     monkeypatch.setattr(
         cloud, "has_successful_scheduled_run", lambda *args, **kwargs: healthy[0]
     )
+    _seen_stale_before(NOW)
 
     assert jobs.run_cloud_supervision_job(ctx, NOW) == "stale"
     assert delivered == []
@@ -208,6 +332,7 @@ def test_legacy_timestamp_keys_wait_for_positive_recovery_before_rearming(monkey
     }
 
     healthy[0] = False
+    _seen_stale_before(NOW + timedelta(days=1))
     assert jobs.run_cloud_supervision_job(ctx, NOW + timedelta(days=1)) == "stale"
     assert [finding.key for finding in delivered] == ["cloud_stale:episode:1"]
 
@@ -225,6 +350,7 @@ def test_fresh_cloud_retires_failed_stale_alert_before_recovery(tmp_path, monkey
         lambda cfg, text, **kwargs: attempts.append(text)
         or notify.SendResult("failed"),
     )
+    _seen_stale_before(NOW)
 
     assert jobs.run_cloud_supervision_job(ctx, NOW) == "stale"
     assert len(attempts) == 1
@@ -291,6 +417,7 @@ def test_pending_healthy_heartbeat_is_retired_when_cloud_turns_stale(
         "has_successful_scheduled_run",
         lambda *args, **kwargs: False,
     )
+    _seen_stale_before(NOW + timedelta(minutes=5))
     assert jobs.run_cloud_supervision_job(ctx, NOW + timedelta(minutes=5)) == "stale"
     assert all(
         record["kinds"] != ["HEARTBEAT"]
@@ -316,6 +443,7 @@ def test_cloud_recovery_binds_but_never_replays_pending_cloud_health_work(
         lambda cfg, text, **kwargs: attempts.append(text)
         or notify.SendResult("failed"),
     )
+    _seen_stale_before(NOW)
     assert jobs.run_cloud_supervision_job(ctx, NOW) == "stale"
     pending = next(iter(ctx.state["outbox"].values()))
     pending["topics"] = []
@@ -510,6 +638,7 @@ def test_alternating_old_rows_during_real_outage_stay_one_episode(monkeypatch):
         "get",
         lambda *args, **kwargs: _response(next(bodies)),
     )
+    _seen_stale_before(NOW)
 
     assert jobs.run_cloud_supervision_job(ctx, NOW) == "stale"
     assert jobs.run_cloud_supervision_job(ctx, NOW + timedelta(minutes=5)) == "stale"
@@ -550,6 +679,7 @@ def test_partial_page_with_recent_success_is_healthy_and_rearms(monkeypatch):
     monkeypatch.setattr(
         cloud, "has_successful_scheduled_run", lambda *args, **kwargs: False
     )
+    _seen_stale_before(NOW + timedelta(days=1))
     assert jobs.run_cloud_supervision_job(ctx, NOW + timedelta(days=1)) == "stale"
     assert [finding.key for finding in delivered] == ["cloud_stale:episode:2"]
 

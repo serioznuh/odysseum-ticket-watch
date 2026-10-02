@@ -2,17 +2,35 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import math
+import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import quote
 
 import httpx
 
 from . import detect
 
+log = logging.getLogger(__name__)
+
 GITHUB_API_ROOT = "https://api.github.com"
 SCHEDULE_INTERVAL = timedelta(minutes=15)
 MAX_RUNS_PER_PAGE = 100
+
+# A single well-formed but empty run page is not proof of an outage: on
+# 2026-10-02 one firing got zero successes for a window that held four, and the
+# next firing saw them again. A stale verdict must therefore be observed again
+# this long after the first sighting, with no healthy result in between, before
+# it is believed. Local-only evidence: supervision never runs in the cloud, so
+# this lives in git-ignored `.cache/` rather than in the shared state ref.
+STALE_CONFIRMATION = timedelta(minutes=30)
+# A sighting older than this (the Mac slept, or the API was unavailable) is no
+# longer continuous evidence; the confirmation window starts again.
+STALE_SIGHTING_MAX_GAP = timedelta(hours=1)
+STALE_SUSPICION_PATH = Path(".cache/cloud-stale-suspicion.json")
 
 
 class CloudStatusError(RuntimeError):
@@ -34,6 +52,53 @@ def _github_timestamp(value: object, field: str) -> datetime:
 def _query_timestamp(value: datetime) -> str:
     utc = detect.as_aware(value).astimezone(timezone.utc)
     return utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _load_stale_suspicion(path: Path) -> tuple[datetime, datetime] | None:
+    if not path.exists():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        first = detect.parse_iso(record["first_seen"])
+        last = detect.parse_iso(record["last_seen"])
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        log.warning("ignoring invalid cloud stale suspicion %s: %s", path, exc)
+        return None
+    if first is None or last is None or first > last:
+        log.warning("ignoring invalid cloud stale suspicion %s", path)
+        return None
+    return detect.as_aware(first), detect.as_aware(last)
+
+
+def record_stale_sighting(now: datetime) -> datetime:
+    """Record one stale observation and return when the unbroken run began.
+
+    The returned time is ``now`` itself for a first sighting, and also when the
+    previous sighting is missing, invalid, in the future or too old to be
+    continuous evidence. Only callers that saw a validated stale verdict call
+    this; a healthy verdict clears the record, an unavailable API leaves it.
+    """
+    now = detect.as_aware(now)
+    path = STALE_SUSPICION_PATH
+    previous = _load_stale_suspicion(path)
+    first_seen = now
+    if previous is not None:
+        first, last = previous
+        if last <= now and now - last <= STALE_SIGHTING_MAX_GAP:
+            first_seen = first
+    record = {"first_seen": first_seen.isoformat(), "last_seen": now.isoformat()}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+    return first_seen
+
+
+def clear_stale_suspicion() -> None:
+    try:
+        STALE_SUSPICION_PATH.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def has_successful_scheduled_run(

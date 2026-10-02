@@ -563,8 +563,9 @@ def _cloud_outage_key(state: dict) -> str | None:
 def run_cloud_supervision_job(ctx: RunContext, now: datetime) -> str:
     """Alert locally when successful scheduled cloud runs have gone stale.
 
-    The public API is evidence, not a watched source: only a validated complete
-    window with no recent success proves an outage; uncertainty stays quiet.
+    The public API is evidence, not a watched source: only validated complete
+    windows with no recent success, seen on firings at least
+    `cloud.STALE_CONFIRMATION` apart, prove an outage; uncertainty stays quiet.
     """
     stale_hours = getattr(ctx.cfg, "cloud_stale_hours", 0)
     repository = getattr(ctx.cfg, "cloud_repository", "")
@@ -592,9 +593,20 @@ def run_cloud_supervision_job(ctx: RunContext, now: datetime) -> str:
         log.warning("cloud supervision unavailable (no alert): %s", exc)
         return "unknown"
     if has_recent_success:
+        cloud.clear_stale_suspicion()
         delivery.reconcile_cloud_health(ctx, "healthy")
         _rearm_cloud_outage(ctx.state, now)
         return "healthy"
+    # One empty page has already been seen to be wrong; an unconfirmed stale
+    # verdict is uncertainty, and uncertainty stays quiet.
+    first_seen = cloud.record_stale_sighting(now)
+    if now - first_seen < cloud.STALE_CONFIRMATION:
+        log.info(
+            "cloud supervision: no recent success since first sighting at %s; "
+            "awaiting confirmation (no alert)",
+            first_seen.isoformat(timespec="minutes"),
+        )
+        return "unknown"
     delivery.reconcile_cloud_health(ctx, "stale")
     key = _cloud_outage_key(ctx.state)
     if key is None:
