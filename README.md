@@ -177,7 +177,7 @@ deployment on `main` is independent of that state history.
 | `news.max_alerts_per_run` | `3` | Cap on news alerts per check. |
 | `news.google_news_queries` | *(see file)* | Google News RSS search URLs to scan. |
 | `news.extra_pages`, `news.cloud_extra_pages` | `[]`, `[]` | Extra URLs scanned locally, and the separate explicit allow-list scanned from the cloud. Cloud mode otherwise reads only `news.google.com` RSS and always refuses `pathe.fr`/`cinesa.es` hosts. |
-| `cloud.repository`, `cloud.workflow`, `cloud.stale_hours` | `""`, `"watch.yml"`, `0` | Public GitHub repository/workflow and bounded window in which any successful scheduled run proves health. `0` disables reverse supervision; shipped config uses 18 h. Successful runs include a read-only Telegram bot/chat check. |
+| `cloud.repository`, `cloud.workflow`, `cloud.stale_hours` | `""`, `"watch.yml"`, `0` | Public GitHub repository/workflow and bounded window in which any successful scheduled run proves health. `0` disables reverse supervision; shipped config uses 18 h. Successful runs include a read-only Telegram bot/chat check. An absence alerts only once re-seen ≥30 min later with no success in between. |
 | `alerts.heartbeat_days` | `7` | 💤 "alive" summary when nothing was alerted for N days. `0` = off. |
 | `alerts.failure_streak_threshold` | `3` | ⚠️ after N consecutive failed Pathé checks. |
 | `alerts.war_room_blind_minutes` | `30` | While a wanted date is pending or the opening window is live (Pathé checked every firing), that ⚠️ waits only this long without a healthy check, seen as that many minutes of consecutive failed firings (7 for 30 min; firings the Mac slept through only delay it). Slower tiers wait for 6 h without a healthy check. |

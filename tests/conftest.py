@@ -40,3 +40,15 @@ def _snapshot_tap_in_tmp(monkeypatch, tmp_path_factory):
     from watcher import tap
 
     monkeypatch.setattr(tap, "SNAPSHOT_DIR", tmp_path_factory.mktemp("pathe-snapshots"))
+
+
+@pytest.fixture(autouse=True)
+def _cloud_stale_suspicion_in_tmp(monkeypatch, tmp_path_factory):
+    """Keep the cloud stale-confirmation marker out of the working copy's `.cache/`."""
+    from watcher import cloud
+
+    monkeypatch.setattr(
+        cloud,
+        "STALE_SUSPICION_PATH",
+        tmp_path_factory.mktemp("cloud-suspicion") / "cloud-stale-suspicion.json",
+    )

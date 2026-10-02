@@ -57,6 +57,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-40 | Shadow-run v2 for 14 days and prove parity | P1 | M | Infra, tooling & docs | [ ] |
 | OTW-41 | Take over with v2 and stop v1 | P1 | S | Infra, tooling & docs | [ ] |
 | OTW-42 | Port the Cinesa source into v2 as a disabled adapter | P2 | M | Features | [ ] |
+| OTW-43 | One empty Actions page raises a false "Cloud checks have stopped" | P1 | S | Bugs | [ ] |
 
 ## Recommended next work (reviewed 2026-09-30)
 
@@ -526,6 +527,26 @@ interval; a rate-limited answer defers the next request until its reset; the
 alert/recovery decisions in the existing supervision tests are unchanged; a
 simulated shared-IP exhaustion no longer blinds more than one interval. Ruff,
 pytest and an affected-flow dry-run pass.
+
+### OTW-43 · One empty Actions page raises a false "Cloud checks have stopped"
+**Priority:** P1 · **Effort:** S
+**Problem:** On 2026-10-02 at 09:51 Paris the local firing sent a loud "Cloud
+checks have stopped — no success in 18 h" alert. Actions was healthy: four
+scheduled runs had succeeded in that window, the latest at 08:14 Paris. The
+filtered runs request returned a well-formed, complete-looking page with no
+qualifying success; the next firing, five minutes later, saw them again and
+closed the episode silently. OTW-27 treats one such page as proof of absence.
+**Fix sketch:** an absence is only believed when firings at least 30 min apart
+both saw it, with no healthy verdict in between and no sighting gap over 1 h.
+Until then the job reports `unknown` (quiet, heartbeat deferred). The sighting
+is local evidence (supervision never runs in the cloud), so it lives in
+git-ignored `.cache/cloud-stale-suspicion.json`, not in the shared state ref.
+**Files:** `watcher/cloud.py`, `watcher/jobs.py`, `tests/conftest.py`,
+`tests/test_cloud_supervision.py`, `README.md`, `docs/current-state.md`.
+**Done when:** one empty page followed by a healthy one raises nothing; a real
+absence alerts once it has been re-seen 30 min later; an API blip neither
+confirms nor resets; a long gap or an untrustworthy marker restarts the
+window; existing OTW-09/OTW-27 decisions are unchanged; ruff and pytest pass.
 
 ## 3. Features
 
