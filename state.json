@@ -13,6 +13,7 @@
     "cloud_stale:episode:1": "2026-10-02T09:51:38.629862+02:00",
     "error:2026-09-29": "2026-09-29T16:29:28.549939+02:00",
     "error:2026-09-30": "2026-09-30T19:06:21.787879+02:00",
+    "error:2026-10-03": "2026-10-03T12:03:00.668962+02:00",
     "new_show:dune-troisieme-partie-projection-imax-70mm-55289": "2026-09-03T21:46:42.176159+02:00",
     "new_show:la-seance-70mm-dune-troisieme-partie-55319": "2026-09-03T21:46:42.176159+02:00",
     "news:2cd51b28ab127985": "2026-07-07T09:30:05.307379+02:00",
@@ -78,6 +79,14 @@
       ],
       "telegram_message_id": 43
     },
+    "80419a643aaf4ae4b33d49bbb1cf1218": {
+      "delivered_at": "2026-10-03T12:03:00.668962+02:00",
+      "delivery_id": "telegram:b9a40a04e60ad8bab6290282",
+      "keys": [
+        "error:2026-10-03"
+      ],
+      "telegram_message_id": 52
+    },
     "b5033af686ee4717899a7008b2797e0a": {
       "delivered_at": "2026-09-22T00:03:41.315560+02:00",
       "delivery_id": "telegram:2ef310b1bbfa3b421e1424c1",
@@ -111,8 +120,8 @@
       "telegram_message_id": 47
     }
   },
-  "error_alerted": false,
-  "failure_streak": 6,
+  "error_alerted": true,
+  "failure_streak": 7,
   "formats_seen": {
     "dune-troisieme-partie-50828": [
       "other"
@@ -131,24 +140,7 @@
       "1440"
     ]
   },
-  "reservations": {
-    "telegram:b9a40a04e60ad8bab6290282": {
-      "ack": {
-        "keys": [
-          "error:2026-10-03"
-        ],
-        "type": "alerts"
-      },
-      "delivery_id": "telegram:b9a40a04e60ad8bab6290282",
-      "force": true,
-      "generation": 1,
-      "holder": "local:d4670810a1244cab",
-      "lease_expires_at": "2026-10-03T12:13:14.143004+02:00",
-      "reserved_at": "2026-10-03T12:03:14.143004+02:00",
-      "status": "held",
-      "token": "80419a643aaf4ae4b33d49bbb1cf1218"
-    }
-  },
+  "reservations": {},
   "sale_target": null,
   "sales": {
     "dune-troisieme-partie-50828": "2026-09-09T09:00:00+02:00",
