@@ -58,6 +58,7 @@ Effort: S (≤ half day) · M (a day-ish) · L (multi-day).
 | OTW-41 | Take over with v2 and stop v1 | P1 | S | Infra, tooling & docs | [ ] |
 | OTW-42 | Port the Cinesa source into v2 as a disabled adapter | P2 | M | Features | [ ] |
 | OTW-43 | One empty Actions page raises a false "Cloud checks have stopped" | P1 | S | Bugs | [x] |
+| OTW-44 | Move CI's actions off Node 20; keep v1 on Python 3.9 until it retires | P3 | S | Infra, tooling & docs | [ ] |
 
 ## Recommended next work (reviewed 2026-09-30)
 
@@ -1514,3 +1515,29 @@ grace to 60 minutes.
 its state holds the marker and every v1 key, and its first live run sends
 nothing; the dead-man's check shows v2's pings; the rollback steps are in v2's
 README; this backlog's remaining open items are closed or moved to v2's backlog.
+
+### OTW-44 · Move CI's actions off Node 20; keep v1 on Python 3.9 until it retires
+**Priority:** P3 · **Effort:** S
+**Problem:** both workflows pin `actions/checkout@v4` and `actions/setup-python@v5`,
+built for Node 20. GitHub removed Node 20 from its runners on 2026-09-23; the
+actions still work only because the runner now forces them onto Node 24, and the
+`watch` job logs a `punycode` `DEP0040` warning from the old action code. The
+current majors (checked 2026-10-13) are `checkout` v7 and `setup-python` v7, both
+on Node 24. Separately, the production venv at `~/.ticket-watch/.venv` and this
+working copy's `.venv` were built from the macOS Command Line Tools Python 3.9.6,
+which has been out of upstream support since October 2025. That is why
+`ruff.toml` targets `py39` and `requirements.txt` keeps the `tomli` line, while
+CI tests on 3.12.
+**Fix sketch:** (1) bump both pins in `.github/workflows/tests.yml` and
+`.github/workflows/watch.yml` to `@v7`, nothing else. `watch.yml` is the
+production cloud half, so the owner approves that edit, and a `dry_run` dispatch
+proves it before the next scheduled run. (2) Leave v1's Python alone: rebuilding
+the production venv is a launchd-side change on a version due to switch off
+under OTW-41, and the py39 target and `tomli` line stay with it. Instead, v2
+(OTW-37, `onsale-watch`) starts on a supported uv-managed Python (3.13 or 3.14)
+and pins it in its own repository.
+**Close condition:** if OTW-41 lands first, close this as superseded; only the
+Python point carries over to v2. From 2026-12-10 it is out of scope (P0 only).
+**Done when:** `tests.yml` passes and a `watch.yml` `dry_run` dispatch succeeds on
+the v7 pins with no Node 20 notice in the log, and v2's repository records its
+Python version.
