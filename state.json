@@ -182,7 +182,42 @@
       "1440"
     ]
   },
-  "reservations": {},
+  "reservations": {
+    "telegram:731f866c8ad7f516cf17c1e9": {
+      "ack": {
+        "keys": [
+          "pathe_target:cinema-pathe-odysseum:dune-troisieme-partie-50828:imax70:2026-12-20"
+        ],
+        "type": "alerts"
+      },
+      "delivery_id": "telegram:045418a4288f2bed9f4bf9ee",
+      "expires_at": "2026-12-21T00:00:00+01:00",
+      "force": false,
+      "generation": 1,
+      "holder": "local:d4670810a1244cab",
+      "lease_expires_at": "2026-10-20T09:28:49.836662+02:00",
+      "reserved_at": "2026-10-20T09:18:49.836662+02:00",
+      "status": "held",
+      "token": "cca56f1a90914034b21c32130cc2261c"
+    },
+    "telegram:9b4bf12f88cd66dac9410d85": {
+      "ack": {
+        "keys": [
+          "pathe_target:cinema-pathe-odysseum:dune-troisieme-partie-50828:imax70:2026-12-19"
+        ],
+        "type": "alerts"
+      },
+      "delivery_id": "telegram:045418a4288f2bed9f4bf9ee",
+      "expires_at": "2026-12-20T00:00:00+01:00",
+      "force": false,
+      "generation": 1,
+      "holder": "local:d4670810a1244cab",
+      "lease_expires_at": "2026-10-20T09:28:49.836662+02:00",
+      "reserved_at": "2026-10-20T09:18:49.836662+02:00",
+      "status": "held",
+      "token": "cca56f1a90914034b21c32130cc2261c"
+    }
+  },
   "sale_target": null,
   "sales": {
     "dune-troisieme-partie-50828": "2026-09-09T09:00:00+02:00",
